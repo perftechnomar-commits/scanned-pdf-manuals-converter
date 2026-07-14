@@ -1,11 +1,11 @@
 # Spare Parts OCR Import Builder
 
-This Streamlit project converts scanned spare-parts manuals into reviewed rows and then writes the approved records into the supplied Benefit Excel import template.
+This Streamlit project converts scanned spare-parts manuals into reviewed rows and then writes the approved records into the supplied Excel import template.
 
 ## Included files
 
 - `app.py` — Streamlit interface.
-- `benefit_tools.py` — OCR, structured extraction, validation, and Excel-generation functions.
+- `tools.py` — OCR, structured extraction, validation, and Excel-generation functions.
 - `Spare parts template last version.xlsx` — the original template supplied for this project.
 - `requirements.txt` — Python dependencies.
 - `.streamlit/secrets.toml.example` — API-key example.
