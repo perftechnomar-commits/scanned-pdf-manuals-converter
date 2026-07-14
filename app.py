@@ -6,7 +6,7 @@ import streamlit as st
 from docx import Document
 from py_mistral_helper.MistralHelper import MistralHelper
 
-st.set_page_config(page_title="OCR Verse", layout="centered")
+st.set_page_config(page_title="Convert PDFs via OCR", layout="centered")
 
 st.title("📄 Convert PDFs via OCR")
 
