@@ -9,10 +9,12 @@ import streamlit as st
 from tools import (
     MACHINERY_COLUMNS,
     MACHINERY_TYPES,
+    PAGE_FILTER_MODES,
     REVIEW_COLUMNS,
     UNIT_OPTIONS,
     build_audit_workbook,
     build_workbook,
+    classify_ocr_pages,
     empty_additional_machinery_dataframe,
     empty_review_dataframe,
     extract_spare_parts_from_markdown_tables,
@@ -50,6 +52,8 @@ st.set_page_config(
 def initialize_state() -> None:
     defaults = {
         "extracted_pages": [],
+        "page_classification": pd.DataFrame(),
+        "extraction_log": [],
         "spare_review": empty_review_dataframe(),
         "additional_machinery": empty_additional_machinery_dataframe(),
         "output": None,
@@ -62,6 +66,7 @@ def initialize_state() -> None:
         "main_type": "",
         "main_instruction_book": "",
         "main_specifications": "",
+        "auto_instruction_book_source": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -79,8 +84,8 @@ initialize_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
 st.caption(
-    "OCR scanned manuals, review the extracted spare-parts rows, and write only "
-    "approved records into the original Excel import template."
+    "OCR scanned manuals, skip obvious non-parts pages, recover malformed AI "
+    "batches automatically, review the rows, and populate the original Benefit template."
 )
 
 
@@ -140,6 +145,16 @@ with st.sidebar:
         ["AI JSON extraction (recommended)", "Local markdown-table parser"],
         index=0,
     )
+    page_filter_mode = st.selectbox(
+        "Page filtering before AI extraction",
+        PAGE_FILTER_MODES,
+        index=0,
+        help=(
+            "Conservative skips only obvious contents/revision/prose pages. Strict "
+            "processes only strong parts-table candidates. Off processes every OCR page. "
+            "This filter is local and makes no extra API calls."
+        ),
+    )
     extraction_model = st.text_input(
         "Structured-extraction model",
         value="mistral-small-latest",
@@ -156,9 +171,21 @@ with st.sidebar:
         "OCR pages per structuring batch",
         min_value=1,
         max_value=20,
-        value=4,
+        value=3,
         step=1,
         disabled=structure_mode != "AI JSON extraction (recommended)",
+    )
+    extraction_max_chars = st.number_input(
+        "Maximum OCR characters per AI batch",
+        min_value=2000,
+        max_value=30000,
+        value=12000,
+        step=1000,
+        disabled=structure_mode != "AI JSON extraction (recommended)",
+        help=(
+            "Smaller batches reduce malformed/truncated JSON. If a response still "
+            "fails, the app automatically divides it into smaller requests."
+        ),
     )
     default_unit = st.selectbox("Default spare-part unit", ["PCS", "SET", ""], index=0)
     extra_prompt = st.text_area(
@@ -194,6 +221,8 @@ with st.sidebar:
 
     if st.button("Reset OCR and review data", use_container_width=True):
         st.session_state.extracted_pages = []
+        st.session_state.page_classification = pd.DataFrame()
+        st.session_state.extraction_log = []
         st.session_state.spare_review = empty_review_dataframe()
         st.session_state.output = None
         st.session_state.editor_version += 1
@@ -203,6 +232,18 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main machinery and optional sub-units
 # ---------------------------------------------------------------------------
+
+# Use the uploaded PDF name as the initial instruction-book value, without
+# overwriting a value the user has already entered.
+if (
+    input_type == "PDF"
+    and source_file is not None
+    and not st.session_state.main_instruction_book
+    and st.session_state.auto_instruction_book_source != source_file.name
+):
+    st.session_state.main_instruction_book = source_file.name
+    st.session_state.auto_instruction_book_source = source_file.name
+
 
 input_tab, machinery_tab, review_tab, export_tab = st.tabs(
     ["1. OCR", "2. Machinery", "3. Review spare parts", "4. Export"]
@@ -336,24 +377,43 @@ with input_tab:
                 if not extracted_pages:
                     raise RuntimeError("OCR completed but returned no pages.")
 
-                progress_bar.progress(0.0, text="Converting OCR text into spare-parts rows...")
-                extraction_errors: list[str] = []
+                candidate_pages, classification_frame = classify_ocr_pages(
+                    extracted_pages,
+                    mode=page_filter_mode,
+                )
+                skipped_count = len(extracted_pages) - len(candidate_pages)
+                if not candidate_pages:
+                    raise RuntimeError(
+                        "The page filter did not find any pages to structure. "
+                        "Try Conservative or Off in the sidebar."
+                    )
+
+                progress_bar.progress(
+                    0.0,
+                    text=(
+                        f"Converting {len(candidate_pages)} candidate page(s) into "
+                        "spare-parts rows..."
+                    ),
+                )
+                extraction_messages: list[str] = []
                 if structure_mode == "AI JSON extraction (recommended)":
-                    rows, extraction_errors = extract_spare_parts_with_ai(
+                    rows, extraction_messages = extract_spare_parts_with_ai(
                         api_key=api_key,
                         model=extraction_model.strip() or "mistral-small-latest",
-                        extracted_pages=extracted_pages,
+                        extracted_pages=candidate_pages,
                         pages_per_batch=int(extraction_pages_per_batch),
+                        max_chars_per_batch=int(extraction_max_chars),
                         additional_instructions=extra_prompt,
                         progress=show_progress,
                     )
                     if not rows:
-                        extraction_errors.append(
-                            "AI extraction returned no rows; the local markdown-table parser was used."
+                        extraction_messages.append(
+                            "AI extraction returned no rows; the local markdown-table "
+                            "parser was used on the candidate pages."
                         )
-                        rows = extract_spare_parts_from_markdown_tables(extracted_pages)
+                        rows = extract_spare_parts_from_markdown_tables(candidate_pages)
                 else:
-                    rows = extract_spare_parts_from_markdown_tables(extracted_pages)
+                    rows = extract_spare_parts_from_markdown_tables(candidate_pages)
 
                 new_review = rows_to_review_dataframe(
                     rows,
@@ -373,38 +433,84 @@ with input_tab:
                         merged_pages.items(),
                         key=lambda value: value[0],
                     )
+
+                    previous_classification = st.session_state.page_classification
+                    if previous_classification is None or previous_classification.empty:
+                        combined_classification = classification_frame
+                    else:
+                        combined_classification = pd.concat(
+                            [previous_classification, classification_frame],
+                            ignore_index=True,
+                        )
+                        combined_classification = combined_classification.drop_duplicates(
+                            subset=["SOURCE PAGE"],
+                            keep="last",
+                        ).sort_values("SOURCE PAGE")
+                    st.session_state.page_classification = combined_classification.reset_index(drop=True)
+                    st.session_state.extraction_log = list(
+                        dict.fromkeys(
+                            list(st.session_state.extraction_log) + extraction_messages
+                        )
+                    )
                     st.session_state.spare_review = merge_review_dataframes(
                         st.session_state.spare_review,
                         new_review,
                     )
                 else:
                     st.session_state.extracted_pages = list(extracted_pages)
+                    st.session_state.page_classification = classification_frame
+                    st.session_state.extraction_log = extraction_messages
                     st.session_state.spare_review = new_review
 
                 st.session_state.editor_version += 1
                 st.session_state.output = None
                 progress_bar.progress(1.0, text="OCR and extraction complete")
                 st.success(
-                    f"Processed {len(extracted_pages)} page(s) and created "
-                    f"{len(new_review)} candidate spare-part row(s)."
+                    f"OCR processed {len(extracted_pages)} page(s); "
+                    f"{len(candidate_pages)} were structured, {skipped_count} were skipped, "
+                    f"and {len(new_review)} candidate spare-part row(s) were created."
                 )
-                for message in extraction_errors:
-                    st.warning(message)
+                for message in extraction_messages:
+                    if message.startswith("Recovered") or "recovered" in message.lower():
+                        st.info(message)
+                    else:
+                        st.warning(message)
             except Exception as exc:
                 progress_bar.empty()
                 st.error(f"Processing failed: {exc}")
 
     if st.session_state.extracted_pages:
         st.subheader("Raw OCR output")
+        classification_lookup = {}
+        if (
+            st.session_state.page_classification is not None
+            and not st.session_state.page_classification.empty
+        ):
+            classification_lookup = {
+                int(row["SOURCE PAGE"]): row
+                for _, row in st.session_state.page_classification.iterrows()
+            }
+
         page_summary = pd.DataFrame(
             [
                 {
                     "Page": page,
+                    "Process": bool(classification_lookup.get(int(page), {}).get("PROCESS", True)),
+                    "Classification": classification_lookup.get(int(page), {}).get(
+                        "CLASSIFICATION", "Not classified"
+                    ),
                     "Characters": len(markdown),
                     "Preview": markdown[:180].replace("\n", " "),
                 }
                 for page, markdown in st.session_state.extracted_pages
             ]
+        )
+        summary_metrics = st.columns(3)
+        summary_metrics[0].metric("OCR pages", len(page_summary))
+        summary_metrics[1].metric("Pages structured", int(page_summary["Process"].sum()))
+        summary_metrics[2].metric(
+            "Pages skipped",
+            int((~page_summary["Process"]).sum()),
         )
         st.dataframe(page_summary, use_container_width=True, hide_index=True)
 
@@ -420,6 +526,11 @@ with input_tab:
         )
         with st.expander("View raw OCR markdown"):
             st.markdown(raw_markdown)
+
+        if st.session_state.extraction_log:
+            with st.expander("Extraction recovery log"):
+                for message in st.session_state.extraction_log:
+                    st.write(f"- {message}")
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +755,7 @@ with export_tab:
                 or st.session_state.main_name
                 or "spare_parts"
             )
-            output_name = safe_filename(name_source) + "import.xlsx"
+            output_name = safe_filename(name_source) + "_import.xlsx"
             st.session_state.output = output_bytes
             st.session_state.output_name = output_name
             st.success("Workbook created. Download it below and test a small import first.")
@@ -666,6 +777,8 @@ with export_tab:
             st.session_state.extracted_pages,
             machinery_frame,
             export_review,
+            page_classification=st.session_state.page_classification,
+            extraction_log=st.session_state.extraction_log,
         )
         st.download_button(
             "Download OCR audit/review workbook",
