@@ -29,7 +29,7 @@ MACHINERY_COLUMNS = [
     "MCH_TP(M/S/U)",
 ]
 
-BENEFIT_SPARE_COLUMNS = [
+SPARE_COLUMNS = [
     "MACHINERY",
     "PART NO",
     "DESCRIPTION",
@@ -59,7 +59,7 @@ MACHINERY_TYPES = ["Main Machinery", "SubMachinery", "Unit (Book Chapter)"]
 UNIT_OPTIONS = ["", "PCS", "SET"]
 
 MAX_MACHINERY_ROWS = 605  # B5:B609 is the template's named machinery range.
-MAX_SPARE_ROWS = 1438  # Rows 4:1441 in the Benefit spare-parts sheet.
+MAX_SPARE_ROWS = 1438  # Rows 4:1441 in spare-parts sheet.
 
 ProgressCallback = Callable[[int, int, str], None]
 
@@ -835,7 +835,7 @@ def recalculate_review_status(
 
 
 # ---------------------------------------------------------------------------
-# Benefit template and audit workbook generation
+# Template and audit workbook generation
 # ---------------------------------------------------------------------------
 
 
@@ -850,7 +850,7 @@ def _clear_values(worksheet: Any, min_row: int, max_row: int, min_col: int, max_
             cell.value = None
 
 
-def build_benefit_workbook(
+def build_workbook(
     template_bytes: bytes,
     machinery_frame: pd.DataFrame,
     review_frame: pd.DataFrame,
@@ -871,7 +871,7 @@ def build_benefit_workbook(
     ]
     if missing_sheets:
         raise ValueError(
-            "The selected workbook is not the expected Benefit template. Missing sheets: "
+            "The selected workbook is not the expected template. Missing sheets: "
             + ", ".join(missing_sheets)
         )
 
@@ -963,7 +963,7 @@ def build_audit_workbook(
     return output.getvalue()
 
 
-def safe_filename(value: str, fallback: str = "benefit_spare_parts") -> str:
+def safe_filename(value: str, fallback: str = "spare_parts") -> str:
     stem = Path(clean_text(value)).stem
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
     return stem or fallback
