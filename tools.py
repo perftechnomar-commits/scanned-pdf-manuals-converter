@@ -29,7 +29,7 @@ MACHINERY_COLUMNS = [
     "MCH_TP(M/S/U)",
 ]
 
-SPARE_COLUMNS = [
+BENEFIT_SPARE_COLUMNS = [
     "MACHINERY",
     "PART NO",
     "DESCRIPTION",
@@ -59,9 +59,24 @@ MACHINERY_TYPES = ["Main Machinery", "SubMachinery", "Unit (Book Chapter)"]
 UNIT_OPTIONS = ["", "PCS", "SET"]
 
 MAX_MACHINERY_ROWS = 605  # B5:B609 is the template's named machinery range.
-MAX_SPARE_ROWS = 1438  # Rows 4:1441 in spare-parts sheet.
+MAX_SPARE_ROWS = 1438  # Rows 4:1441 in the Benefit spare-parts sheet.
 
 ProgressCallback = Callable[[int, int, str], None]
+
+PAGE_CLASSIFICATION_COLUMNS = [
+    "SOURCE PAGE",
+    "CLASSIFICATION",
+    "PROCESS",
+    "SCORE",
+    "REASON",
+    "CHARACTERS",
+]
+
+PAGE_FILTER_MODES = [
+    "Conservative (recommended)",
+    "Strict",
+    "Off",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +345,156 @@ def clean_markdown(value: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Local page classification / pre-filtering
+# ---------------------------------------------------------------------------
+
+
+_POSITIVE_PAGE_PHRASES: tuple[tuple[str, int], ...] = (
+    ("spare parts", 5),
+    ("list of parts", 5),
+    ("parts list", 5),
+    ("part no", 4),
+    ("part number", 4),
+    ("item no", 3),
+    ("item number", 3),
+    ("position no", 3),
+    ("description", 2),
+    ("designation", 2),
+    ("denomination", 2),
+    ("quantity", 2),
+    (" qty", 2),
+    (" qnt", 2),
+)
+
+_NEGATIVE_PAGE_PHRASES: tuple[tuple[str, int], ...] = (
+    ("table of contents", 7),
+    ("revision history", 6),
+    ("list of revisions", 6),
+    ("document revisions", 6),
+    ("foreword", 4),
+    ("preface", 4),
+    ("general description", 3),
+    ("operating instructions", 3),
+    ("safety instructions", 3),
+    ("maintenance instructions", 2),
+)
+
+_PART_IDENTIFIER_PATTERN = re.compile(
+    r"(?<![A-Z0-9])[A-Z0-9][A-Z0-9./_-]{3,}(?![A-Z0-9])",
+    flags=re.IGNORECASE,
+)
+
+
+def _markdown_table_signal(markdown: str) -> tuple[int, int]:
+    """Return (table rows, relevant-header hits) for OCR markdown."""
+    lines = markdown.splitlines()
+    table_rows = sum(1 for line in lines if line.count("|") >= 2)
+    header_hits = 0
+    for line in lines:
+        if "|" not in line:
+            continue
+        lowered = line.lower()
+        if any(
+            phrase in lowered
+            for phrase in (
+                "part no",
+                "part number",
+                "item no",
+                "item number",
+                "description",
+                "designation",
+                "quantity",
+                "qty",
+                "qnt",
+            )
+        ):
+            header_hits += 1
+    return table_rows, header_hits
+
+
+def classify_ocr_pages(
+    extracted_pages: Sequence[tuple[int, str]],
+    mode: str = "Conservative (recommended)",
+) -> tuple[list[tuple[int, str]], pd.DataFrame]:
+    """
+    Classify OCR pages locally before paid structured extraction.
+
+    Conservative mode skips only pages that are very clearly front matter or prose.
+    Strict mode processes only strong spare-parts candidates. Off processes everything.
+    No extra API calls are made.
+    """
+    if mode not in PAGE_FILTER_MODES:
+        mode = "Conservative (recommended)"
+
+    selected: list[tuple[int, str]] = []
+    records: list[dict[str, Any]] = []
+
+    for page_number, markdown in extracted_pages:
+        text = clean_markdown(markdown)
+        lowered = text.lower()
+        characters = len(text)
+        table_rows, header_hits = _markdown_table_signal(text)
+        identifier_hits = len(_PART_IDENTIFIER_PATTERN.findall(text))
+
+        positive_score = sum(weight for phrase, weight in _POSITIVE_PAGE_PHRASES if phrase in lowered)
+        negative_score = sum(weight for phrase, weight in _NEGATIVE_PAGE_PHRASES if phrase in lowered)
+        score = positive_score + min(table_rows, 8) + (header_hits * 3) + min(identifier_hits // 4, 5) - negative_score
+
+        strong_candidate = (
+            positive_score >= 5
+            or header_hits >= 1
+            or (table_rows >= 4 and identifier_hits >= 3)
+        )
+        obvious_non_parts = (
+            characters < 40
+            or (negative_score >= 5 and not strong_candidate)
+            or (table_rows == 0 and positive_score == 0 and identifier_hits < 2 and characters < 1800)
+        )
+
+        if mode == "Off":
+            classification = "All pages"
+            process_page = True
+            reason = "Filtering disabled"
+        elif strong_candidate:
+            classification = "Spare-parts candidate"
+            process_page = True
+            reason = (
+                f"parts signals={positive_score}; table rows={table_rows}; "
+                f"header hits={header_hits}; identifiers={identifier_hits}"
+            )
+        elif obvious_non_parts:
+            classification = "Skipped obvious non-parts page"
+            process_page = False
+            reason = (
+                f"negative signals={negative_score}; table rows={table_rows}; "
+                f"parts signals={positive_score}; identifiers={identifier_hits}"
+            )
+        else:
+            classification = "Ambiguous"
+            process_page = mode == "Conservative (recommended)"
+            reason = (
+                f"score={score}; table rows={table_rows}; "
+                f"parts signals={positive_score}; identifiers={identifier_hits}"
+            )
+
+        if process_page:
+            selected.append((page_number, text))
+
+        records.append(
+            {
+                "SOURCE PAGE": int(page_number),
+                "CLASSIFICATION": classification,
+                "PROCESS": bool(process_page),
+                "SCORE": int(score),
+                "REASON": reason,
+                "CHARACTERS": int(characters),
+            }
+        )
+
+    return selected, pd.DataFrame(records, columns=PAGE_CLASSIFICATION_COLUMNS)
+
+
+# ---------------------------------------------------------------------------
 # Structured spare-parts extraction
 # ---------------------------------------------------------------------------
 
@@ -400,12 +565,53 @@ def _page_batches(
     return batches
 
 
+def _parse_json_object(content: Any) -> dict[str, Any]:
+    """Parse a JSON object while tolerating fences or harmless surrounding text."""
+    if isinstance(content, list):
+        content = "".join(
+            str(chunk.get("text", ""))
+            for chunk in content
+            if isinstance(chunk, dict)
+        )
+    text = str(content or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*```$", "", text)
+
+    candidates: list[str] = [text]
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace >= 0 and last_brace > first_brace:
+        candidates.append(text[first_brace : last_brace + 1])
+
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for normalized in (
+            candidate,
+            re.sub(r",\s*([}\]])", r"\1", candidate),
+        ):
+            try:
+                parsed = json.loads(normalized, strict=False)
+            except json.JSONDecodeError:
+                try:
+                    parsed, _ = decoder.raw_decode(normalized)
+                except json.JSONDecodeError:
+                    continue
+            if isinstance(parsed, list):
+                return {"spare_parts": parsed}
+            if isinstance(parsed, dict):
+                return parsed
+
+    raise json.JSONDecodeError("Could not parse a complete JSON object", text, 0)
+
+
 def _mistral_json_request(
     api_key: str,
     model: str,
     messages: list[dict[str, str]],
     timeout_seconds: int = 300,
-    max_retries: int = 3,
+    max_retries: int = 2,
 ) -> dict[str, Any]:
     endpoint = os.getenv(
         "MISTRAL_CHAT_COMPLETIONS_URL",
@@ -438,90 +644,154 @@ def _mistral_json_request(
                 continue
             response.raise_for_status()
             body = response.json()
-            content = body["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(
-                    str(chunk.get("text", ""))
-                    for chunk in content
-                    if isinstance(chunk, dict)
-                )
-            text = str(content).strip()
-            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-            text = re.sub(r"\s*```$", "", text)
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return {"spare_parts": parsed}
-            if not isinstance(parsed, dict):
-                raise ValueError("The structured-extraction response was not a JSON object.")
-            return parsed
-        except (requests.RequestException, KeyError, IndexError, TypeError, json.JSONDecodeError, ValueError) as exc:
+            return _parse_json_object(body["choices"][0]["message"]["content"])
+        except (
+            requests.RequestException,
+            KeyError,
+            IndexError,
+            TypeError,
+            json.JSONDecodeError,
+            ValueError,
+        ) as exc:
             last_error = exc
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(1 + attempt)
 
     raise RuntimeError(f"Mistral structured extraction failed: {last_error}")
+
+
+def _build_extraction_prompt(
+    batch: Sequence[tuple[int, str]],
+    additional_instructions: str,
+) -> str:
+    page_text = "\n\n".join(
+        f"===== PAGE {page_number} =====\n{markdown}"
+        for page_number, markdown in batch
+    )
+    prompt = (
+        "Extract all genuine spare-parts rows from the following OCR markdown. "
+        "Return only the required JSON object. If the pages contain no spare-parts "
+        "rows, return {\"spare_parts\": []}.\n\n"
+    )
+    if clean_text(additional_instructions):
+        prompt += (
+            "Manual-specific instructions:\n"
+            f"{clean_text(additional_instructions)}\n\n"
+        )
+    return prompt + page_text
+
+
+def _normalize_batch_source_pages(
+    batch_rows: Sequence[dict[str, Any]],
+    batch: Sequence[tuple[int, str]],
+) -> list[dict[str, Any]]:
+    valid_pages = {int(page) for page, _ in batch}
+    only_page = next(iter(valid_pages)) if len(valid_pages) == 1 else None
+    normalized: list[dict[str, Any]] = []
+    for item in batch_rows:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        parsed_page = quantity_to_number(row.get("source_page"))
+        page_number = int(parsed_page) if parsed_page is not None else None
+        if page_number not in valid_pages and only_page is not None:
+            row["source_page"] = only_page
+        normalized.append(row)
+    return normalized
 
 
 def extract_spare_parts_with_ai(
     api_key: str,
     model: str,
     extracted_pages: Sequence[tuple[int, str]],
-    pages_per_batch: int = 4,
+    pages_per_batch: int = 3,
+    max_chars_per_batch: int = 12000,
     additional_instructions: str = "",
     progress: ProgressCallback | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    batches = _page_batches(extracted_pages, pages_per_batch)
+    """
+    Extract rows with automatic divide-and-retry recovery.
+
+    If a multi-page response is malformed, the batch is split in half recursively.
+    If a single page still fails, the local markdown-table parser is used for that
+    page so one bad response does not discard the remainder of a large manual.
+    """
+    batches = _page_batches(
+        extracted_pages,
+        pages_per_batch=max(1, int(pages_per_batch)),
+        max_chars=max(2000, int(max_chars_per_batch)),
+    )
     rows: list[dict[str, Any]] = []
-    errors: list[str] = []
+    messages: list[str] = []
 
-    for batch_index, batch in enumerate(batches, start=1):
-        if progress:
-            progress(
-                batch_index - 1,
-                len(batches),
-                f"Structuring OCR batch {batch_index}/{len(batches)}",
-            )
-
-        page_text = "\n\n".join(
-            f"===== PAGE {page_number} =====\n{markdown}"
-            for page_number, markdown in batch
-        )
-        user_prompt = (
-            "Extract all spare-parts rows from the following OCR markdown. "
-            "Return only the required JSON object.\n\n"
-        )
-        if clean_text(additional_instructions):
-            user_prompt += (
-                "Manual-specific instructions:\n"
-                f"{clean_text(additional_instructions)}\n\n"
-            )
-        user_prompt += page_text
-
+    def process_batch(
+        batch: list[tuple[int, str]],
+        label: str,
+        depth: int = 0,
+    ) -> None:
         try:
             result = _mistral_json_request(
                 api_key=api_key,
                 model=model,
                 messages=[
                     {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
+                    {
+                        "role": "user",
+                        "content": _build_extraction_prompt(batch, additional_instructions),
+                    },
                 ],
             )
             batch_rows = result.get("spare_parts", [])
-            if isinstance(batch_rows, list):
-                rows.extend(item for item in batch_rows if isinstance(item, dict))
-            else:
-                errors.append(f"Batch {batch_index}: JSON did not contain a spare_parts list.")
-        except Exception as exc:  # Keep remaining batches usable.
-            errors.append(f"Batch {batch_index}: {exc}")
+            if not isinstance(batch_rows, list):
+                raise ValueError("JSON did not contain a spare_parts list")
+            rows.extend(_normalize_batch_source_pages(batch_rows, batch))
+            return
+        except Exception as exc:
+            if len(batch) > 1:
+                midpoint = max(1, len(batch) // 2)
+                left = batch[:midpoint]
+                right = batch[midpoint:]
+                page_range = f"{batch[0][0]}-{batch[-1][0]}"
+                messages.append(
+                    f"Recovered {label} (pages {page_range}) by automatically splitting "
+                    "the malformed/oversized response into smaller requests."
+                )
+                process_batch(left, f"{label}.1", depth + 1)
+                process_batch(right, f"{label}.2", depth + 1)
+                return
 
+            page_number = batch[0][0]
+            fallback_rows = extract_spare_parts_from_markdown_tables(batch)
+            rows.extend(fallback_rows)
+            if fallback_rows:
+                messages.append(
+                    f"Page {page_number}: AI JSON remained invalid; the local table "
+                    f"parser recovered {len(fallback_rows)} row(s)."
+                )
+            else:
+                messages.append(
+                    f"Page {page_number}: structured extraction failed and no local "
+                    f"table rows were recoverable. Details: {exc}"
+                )
+
+    for batch_index, batch in enumerate(batches, start=1):
+        if progress:
+            progress(
+                batch_index - 1,
+                len(batches),
+                f"Structuring candidate batch {batch_index}/{len(batches)}",
+            )
+        process_batch(list(batch), f"batch {batch_index}")
         if progress:
             progress(
                 batch_index,
                 len(batches),
-                f"Structuring OCR batch {batch_index}/{len(batches)} complete",
+                f"Structuring candidate batch {batch_index}/{len(batches)} complete",
             )
 
-    return rows, errors
+    # Avoid duplicate recovery messages when recursive splitting happened repeatedly.
+    deduplicated_messages = list(dict.fromkeys(messages))
+    return rows, deduplicated_messages
 
 
 # ---------------------------------------------------------------------------
@@ -835,7 +1105,7 @@ def recalculate_review_status(
 
 
 # ---------------------------------------------------------------------------
-# Template and audit workbook generation
+# Benefit template and audit workbook generation
 # ---------------------------------------------------------------------------
 
 
@@ -850,7 +1120,7 @@ def _clear_values(worksheet: Any, min_row: int, max_row: int, min_col: int, max_
             cell.value = None
 
 
-def build_workbook(
+def build_benefit_workbook(
     template_bytes: bytes,
     machinery_frame: pd.DataFrame,
     review_frame: pd.DataFrame,
@@ -871,7 +1141,7 @@ def build_workbook(
     ]
     if missing_sheets:
         raise ValueError(
-            "The selected workbook is not the expected template. Missing sheets: "
+            "The selected workbook is not the expected Benefit template. Missing sheets: "
             + ", ".join(missing_sheets)
         )
 
@@ -917,14 +1187,26 @@ def build_audit_workbook(
     extracted_pages: Sequence[tuple[int, str]],
     machinery_frame: pd.DataFrame,
     review_frame: pd.DataFrame,
+    page_classification: pd.DataFrame | None = None,
+    extraction_log: Sequence[str] | None = None,
 ) -> bytes:
     output = io.BytesIO()
     pages_frame = pd.DataFrame(extracted_pages, columns=["SOURCE PAGE", "OCR MARKDOWN"])
+    classification_frame = (
+        page_classification.copy()
+        if page_classification is not None and not page_classification.empty
+        else pd.DataFrame(columns=PAGE_CLASSIFICATION_COLUMNS)
+    )
+    log_frame = pd.DataFrame(
+        {"MESSAGE": list(extraction_log or [])}
+    )
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         pages_frame.to_excel(writer, index=False, sheet_name="OCR Pages")
+        classification_frame.to_excel(writer, index=False, sheet_name="Page Classification")
         machinery_frame.to_excel(writer, index=False, sheet_name="Machinery Review")
         review_frame.to_excel(writer, index=False, sheet_name="Spare Parts Review")
+        log_frame.to_excel(writer, index=False, sheet_name="Extraction Log")
 
         workbook = writer.book
         header_format = workbook.add_format(
@@ -934,8 +1216,10 @@ def build_audit_workbook(
 
         for sheet_name, frame in (
             ("OCR Pages", pages_frame),
+            ("Page Classification", classification_frame),
             ("Machinery Review", machinery_frame),
             ("Spare Parts Review", review_frame),
+            ("Extraction Log", log_frame),
         ):
             sheet = writer.sheets[sheet_name]
             for column_index, column_name in enumerate(frame.columns):
@@ -945,6 +1229,8 @@ def build_audit_workbook(
 
         writer.sheets["OCR Pages"].set_column(0, 0, 12)
         writer.sheets["OCR Pages"].set_column(1, 1, 100, wrap_format)
+        writer.sheets["Page Classification"].set_column(0, 3, 18)
+        writer.sheets["Page Classification"].set_column(4, 4, 70, wrap_format)
         writer.sheets["Machinery Review"].set_column(0, len(MACHINERY_COLUMNS) - 1, 22)
         writer.sheets["Spare Parts Review"].set_column(0, len(REVIEW_COLUMNS) - 1, 20)
         writer.sheets["Spare Parts Review"].set_column(
@@ -959,11 +1245,27 @@ def build_audit_workbook(
             45,
             wrap_format,
         )
+        writer.sheets["Extraction Log"].set_column(0, 0, 100, wrap_format)
 
     return output.getvalue()
 
 
-def safe_filename(value: str, fallback: str = "spare_parts") -> str:
+# Backward-compatible name used by app.py.
+def build_workbook(
+    template_bytes: bytes,
+    machinery_frame: pd.DataFrame,
+    review_frame: pd.DataFrame,
+    clear_existing: bool = True,
+) -> bytes:
+    return build_benefit_workbook(
+        template_bytes=template_bytes,
+        machinery_frame=machinery_frame,
+        review_frame=review_frame,
+        clear_existing=clear_existing,
+    )
+
+
+def safe_filename(value: str, fallback: str = "benefit_spare_parts") -> str:
     stem = Path(clean_text(value)).stem
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
     return stem or fallback
