@@ -1,4 +1,4 @@
-# Benefit Spare Parts OCR Import Builder
+# Spare Parts OCR Import Builder
 
 This Streamlit project converts scanned spare-parts manuals into reviewed rows and then writes the approved records into the supplied Benefit Excel import template.
 
@@ -6,7 +6,7 @@ This Streamlit project converts scanned spare-parts manuals into reviewed rows a
 
 - `app.py` — Streamlit interface.
 - `benefit_tools.py` — OCR, structured extraction, validation, and Excel-generation functions.
-- `Spare parts template last version.xlsx` — the original Benefit template supplied for this project.
+- `Spare parts template last version.xlsx` — the original template supplied for this project.
 - `requirements.txt` — Python dependencies.
 - `.streamlit/secrets.toml.example` — API-key example.
 
@@ -50,9 +50,9 @@ streamlit run app.py
 4. The recommended mode sends the OCR markdown to a Mistral text model using JSON mode to produce structured spare-parts rows. A local markdown-table parser is available as a fallback.
 5. Correct identifiers, descriptions, machinery names, units, and quantities in the **Review spare parts** tab.
 6. Rows must be both `INCLUDE = True` and `READY = True` before export.
-7. Create and download the Benefit workbook from the **Export** tab.
+7. Create and download the workbook from the **Export** tab.
 
-## Benefit mapping
+## Mapping
 
 ### Sheet `1.Machineries|Sub|Units`, starting at row 5
 
@@ -72,6 +72,6 @@ The first column of the spare-parts sheet has a blank visible header in the supp
 - A spare-part machinery value must exactly match a `NAME` on the machinery sheet.
 - Possible duplicates are blocked by default.
 - Low-confidence OCR rows are not automatically blocked, but they are clearly flagged for manual verification.
-- Use the separate audit workbook to retain source page numbers and OCR text; those audit fields are not added to the Benefit import workbook.
+- Use the separate audit workbook to retain source page numbers and OCR text; those audit fields are not added to import workbook.
 
-Always test a small Benefit import batch before processing a complete manual.
+Always test a small import batch before processing a complete manual.
