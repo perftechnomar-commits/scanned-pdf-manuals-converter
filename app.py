@@ -36,6 +36,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
+APP_VERSION = "2.1"
 
 st.set_page_config(
     page_title="Spare Parts OCR Import Builder",
@@ -94,11 +95,80 @@ st.caption(
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
+    with st.expander("📖 Instructions & Help", expanded=False):
+        st.markdown(
+            """
+### Quick start
+
+1. Open **2. Machinery** and complete the required main-machinery fields.
+2. Upload the scanned manual under **Source**. Start with a small page range such as `1-20`.
+3. Keep the recommended Mistral settings unless the manual is difficult.
+4. Open **1. OCR** and select **Run OCR and extract spare-parts rows**.
+5. Open **3. Review spare parts**, correct warnings and exclude unwanted rows.
+6. Open **4. Export**, create the workbook and test a small import first.
+
+### Recommended settings
+
+- **Page filtering:** Conservative
+- **Structured-extraction model:** `mistral-small-latest`
+- **PDF pages per OCR request:** `25`
+- **OCR pages per structuring batch:** `3`
+- **Maximum OCR characters per AI batch:** `12000`
+- **Default unit:** `PCS`
+
+### What the settings mean
+
+**Pages to process**  
+Use `all`, `1-20`, `25`, or `30-45`. For large books, process ranges and enable **Append to current review table**.
+
+**Page filtering**  
+- **Conservative:** recommended; skips only obvious non-parts pages.
+- **Strict:** use when many contents, narrative, or drawing-only pages create false rows.
+- **Off:** processes every OCR page; useful if valid tables are being skipped.
+
+**PDF pages per OCR request**  
+Controls OCR upload size. Use `25` normally, `10-15` for poor scans or failed OCR requests.
+
+**OCR pages per structuring batch**  
+Controls how much OCR text is converted to JSON at once. Use `3` normally and `1-2` for difficult layouts or repeated JSON recovery messages.
+
+**Maximum OCR characters per AI batch**  
+Use `12000` normally. Reduce to `8000` if responses are truncated or malformed.
+
+**Optional extraction instructions**  
+Use only for rules specific to the current manual, for example:  
+`Preserve leading zeros and hyphens. The first column is ITEM NO and the second is PART NO. Ignore prices and drawing dimensions.`
+
+### Review-table guide
+
+- **INCLUDE:** checked rows are considered for export.
+- **READY:** calculated automatically after validation.
+- **MACHINERY:** must exactly match a machinery name entered in tab 2.
+- **CONFIDENCE:** low values should be checked against the source page.
+- **WARNING:** explains what must be corrected before export.
+- **SOURCE PAGE:** audit reference; it is not written to the import template.
+
+### Troubleshooting
+
+- **No candidate pages:** change page filtering to Conservative or Off.
+- **Repeated JSON recovery messages:** reduce structuring batch to `1-2` and maximum characters to `8000`.
+- **Missing OCR pages:** reduce PDF pages per OCR request to `10-15`.
+- **Too many false spare parts:** use Strict filtering and add a short manual-specific instruction.
+- **Part numbers changed:** instruct the model to preserve leading zeros, spaces, slashes and hyphens exactly.
+- **Large job:** process the manual in ranges and download the audit workbook regularly. A redeploy or session reset clears in-memory results.
+
+### Data handling
+
+Uploaded pages are sent to the configured Mistral service when OCR or AI extraction runs. Use the tool only for documents approved for that processing.
+            """
+        )
+
     st.header("Source")
     input_type = st.radio(
         "Choose input type",
         ["PDF", "Document URL", "Image", "Image URL"],
         index=0,  # PDF is deliberately the default.
+        help="PDF is recommended for scanned manuals. URL options require an accessible direct file URL.",
     )
 
     source_file = None
@@ -107,18 +177,32 @@ with st.sidebar:
     page_spec = ""
 
     if input_type == "PDF":
-        source_file = st.file_uploader("Upload a scanned PDF", type=["pdf"])
+        source_file = st.file_uploader(
+            "Upload a scanned PDF",
+            type=["pdf"],
+            help="Upload the original scanned manual. For very large books, process selected page ranges.",
+        )
         page_spec = st.text_input(
             "Pages to process",
             value="all",
             help="Examples: all, 1-20, 25, 30-35. Process large books in batches.",
         )
     elif input_type == "Document URL":
-        document_url = st.text_input("Document URL")
+        document_url = st.text_input(
+            "Document URL",
+            help="Enter a direct, publicly accessible PDF URL. Use file upload for internal documents.",
+        )
     elif input_type == "Image":
-        source_file = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
+        source_file = st.file_uploader(
+            "Upload an image",
+            type=["png", "jpg", "jpeg"],
+            help="Use this for a single scanned page or photograph.",
+        )
     else:
-        image_url = st.text_input("Image URL")
+        image_url = st.text_input(
+            "Image URL",
+            help="Enter a direct, publicly accessible image URL.",
+        )
 
     append_results = st.checkbox(
         "Append to current review table",
@@ -144,6 +228,10 @@ with st.sidebar:
         "Convert OCR text into rows",
         ["AI JSON extraction (recommended)", "Local markdown-table parser"],
         index=0,
+        help=(
+            "AI JSON extraction handles irregular tables and wrapped descriptions. "
+            "The local parser is faster but works best only when OCR already produced clean Markdown tables."
+        ),
     )
     page_filter_mode = st.selectbox(
         "Page filtering before AI extraction",
@@ -159,6 +247,7 @@ with st.sidebar:
         "Structured-extraction model",
         value="mistral-small-latest",
         disabled=structure_mode != "AI JSON extraction (recommended)",
+        help="Recommended default: mistral-small-latest. Change only after testing another supported Mistral model.",
     )
     ocr_pages_per_request = st.number_input(
         "PDF pages per OCR request",
@@ -166,6 +255,7 @@ with st.sidebar:
         max_value=100,
         value=25,
         step=1,
+        help="Recommended: 25. Use 10-15 for poor scans, missing pages, timeouts, or failed OCR requests.",
     )
     extraction_pages_per_batch = st.number_input(
         "OCR pages per structuring batch",
@@ -174,6 +264,7 @@ with st.sidebar:
         value=3,
         step=1,
         disabled=structure_mode != "AI JSON extraction (recommended)",
+        help="Recommended: 3. Use 1-2 for complex layouts or repeated malformed/truncated JSON responses.",
     )
     extraction_max_chars = st.number_input(
         "Maximum OCR characters per AI batch",
@@ -187,7 +278,12 @@ with st.sidebar:
             "fails, the app automatically divides it into smaller requests."
         ),
     )
-    default_unit = st.selectbox("Default spare-part unit", ["PCS", "SET", ""], index=0)
+    default_unit = st.selectbox(
+        "Default spare-part unit",
+        ["PCS", "SET", ""],
+        index=0,
+        help="PCS is the normal default. Use SET for kits/sets, or blank when every unit must be reviewed manually.",
+    )
     extra_prompt = st.text_area(
         "Optional manual-specific extraction instructions",
         placeholder=(
@@ -196,6 +292,10 @@ with st.sidebar:
         ),
         height=100,
         disabled=structure_mode != "AI JSON extraction (recommended)",
+        help=(
+            "Add only manual-specific rules. Example: Preserve leading zeros and hyphens; "
+            "the first column is ITEM NO; ignore prices and drawing dimensions."
+        ),
     )
 
     st.divider()
@@ -219,7 +319,11 @@ with st.sidebar:
         template_name = ""
         st.error("Place the template beside app.py or upload it here.")
 
-    if st.button("Reset OCR and review data", use_container_width=True):
+    if st.button(
+        "Reset OCR and review data",
+        use_container_width=True,
+        help="Clears extracted pages, classifications, candidate rows and the generated workbook from this session.",
+    ):
         st.session_state.extracted_pages = []
         st.session_state.page_classification = pd.DataFrame()
         st.session_state.extraction_log = []
@@ -227,6 +331,23 @@ with st.sidebar:
         st.session_state.output = None
         st.session_state.editor_version += 1
         st.rerun()
+
+    st.divider()
+    with st.expander("ℹ️ About", expanded=False):
+        st.markdown(
+            f"""
+**Spare Parts OCR Import Builder — v{APP_VERSION}**
+
+**Workflow**  
+Upload → OCR → Page filtering → AI extraction → Review → Excel export
+
+**Supported sources**  
+Scanned PDFs, document URLs, images and image URLs.
+
+**Important**  
+The generated workbook should be tested with a small import batch before production use.
+            """
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -258,21 +379,21 @@ with machinery_tab:
 
     row1 = st.columns(4)
     with row1[0]:
-        st.text_input("CODE *", key="main_code", placeholder="M/E")
+        st.text_input("CODE *", key="main_code", placeholder="M/E", help="Required machinery code written to sheet 1.")
     with row1[1]:
-        st.text_input("NAME *", key="main_name", placeholder="Main Engine")
+        st.text_input("NAME *", key="main_name", placeholder="Main Engine", help="Required. Spare-part MACHINERY values must match this name exactly.")
     with row1[2]:
-        st.text_input("MAKER *", key="main_maker", placeholder="Sulzer")
+        st.text_input("MAKER *", key="main_maker", placeholder="Sulzer", help="Required machinery manufacturer.")
     with row1[3]:
-        st.text_input("MODEL *", key="main_model", placeholder="RTA 56")
+        st.text_input("MODEL *", key="main_model", placeholder="RTA 56", help="Required machinery model.")
 
     row2 = st.columns(3)
     with row2[0]:
-        st.text_input("TYPE", key="main_type")
+        st.text_input("TYPE", key="main_type", help="Optional type or variant from the manual/nameplate.")
     with row2[1]:
-        st.text_input("INSTR.BOOK", key="main_instruction_book")
+        st.text_input("INSTR.BOOK", key="main_instruction_book", help="Instruction-book/manual reference. The uploaded PDF filename is filled automatically when empty.")
     with row2[2]:
-        st.text_input("SPECIFICATIONS", key="main_specifications")
+        st.text_input("SPECIFICATIONS", key="main_specifications", help="Optional technical specifications or distinguishing information.")
 
     st.text_input(
         "MCH_TP(M/S/U)",
@@ -688,6 +809,7 @@ with export_tab:
     clear_existing = st.checkbox(
         "Clear existing data rows in the template before writing",
         value=True,
+        help="Recommended when creating a new import file. Turn off only when intentionally adding to data already stored in the uploaded template.",
     )
     allow_duplicates = st.checkbox(
         "Allow possible duplicate spare-part rows",
