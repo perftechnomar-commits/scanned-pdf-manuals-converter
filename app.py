@@ -8,7 +8,7 @@ from py_mistral_helper.MistralHelper import MistralHelper
 
 st.set_page_config(page_title="OCR Verse", layout="centered")
 
-st.title("📄 OCR Verse")
+st.title("📄 Convert PDFs via OCR")
 
 # Model selection
 target_model = st.selectbox("Select OCR model", ["Mistral"], index=0)
