@@ -210,7 +210,6 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
     st.header("Mistral settings")
     secret_api_key = get_secret("MISTRAL_API_KEY")
     if secret_api_key:
-        st.success("MISTRAL_API_KEY loaded from Streamlit secrets.")
         entered_api_key = ""
     else:
         entered_api_key = st.text_input(
