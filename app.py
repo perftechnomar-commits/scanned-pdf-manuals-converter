@@ -6,13 +6,13 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from benefit_tools import (
+from tools import (
     MACHINERY_COLUMNS,
     MACHINERY_TYPES,
     REVIEW_COLUMNS,
     UNIT_OPTIONS,
     build_audit_workbook,
-    build_benefit_workbook,
+    build_workbook,
     empty_additional_machinery_dataframe,
     empty_review_dataframe,
     extract_spare_parts_from_markdown_tables,
@@ -36,7 +36,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
 
 st.set_page_config(
-    page_title="Benefit Spare Parts OCR Import Builder",
+    page_title="Spare Parts OCR Import Builder",
     page_icon="📄",
     layout="wide",
 )
@@ -52,8 +52,8 @@ def initialize_state() -> None:
         "extracted_pages": [],
         "spare_review": empty_review_dataframe(),
         "additional_machinery": empty_additional_machinery_dataframe(),
-        "benefit_output": None,
-        "benefit_output_name": "benefit_spare_parts.xlsx",
+        "output": None,
+        "output_name": "spare_parts.xlsx",
         "editor_version": 0,
         "main_code": "",
         "main_name": "",
@@ -77,10 +77,10 @@ def get_secret(name: str) -> str:
 
 initialize_state()
 
-st.title("📄 Benefit Spare Parts OCR Import Builder")
+st.title("📄 Spare Parts OCR Import Builder")
 st.caption(
     "OCR scanned manuals, review the extracted spare-parts rows, and write only "
-    "approved records into the original Benefit Excel import template."
+    "approved records into the original Excel import template."
 )
 
 
@@ -172,7 +172,7 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("Benefit template")
+    st.header("Template")
     custom_template = st.file_uploader(
         "Optional replacement template",
         type=["xlsx"],
@@ -190,12 +190,12 @@ with st.sidebar:
     else:
         template_bytes = None
         template_name = ""
-        st.error("Place the Benefit template beside app.py or upload it here.")
+        st.error("Place the template beside app.py or upload it here.")
 
     if st.button("Reset OCR and review data", use_container_width=True):
         st.session_state.extracted_pages = []
         st.session_state.spare_review = empty_review_dataframe()
-        st.session_state.benefit_output = None
+        st.session_state.output = None
         st.session_state.editor_version += 1
         st.rerun()
 
@@ -211,7 +211,7 @@ input_tab, machinery_tab, review_tab, export_tab = st.tabs(
 with machinery_tab:
     st.subheader("Main machinery — written to row 5 of sheet 1")
     st.info(
-        "Benefit requires CODE, NAME, MAKER, MODEL and MCH_TP. The app fixes the "
+        "Requires CODE, NAME, MAKER, MODEL and MCH_TP. The app fixes the "
         "main row's MCH_TP to 'Main Machinery'."
     )
 
@@ -382,7 +382,7 @@ with input_tab:
                     st.session_state.spare_review = new_review
 
                 st.session_state.editor_version += 1
-                st.session_state.benefit_output = None
+                st.session_state.output = None
                 progress_bar.progress(1.0, text="OCR and extraction complete")
                 st.success(
                     f"Processed {len(extracted_pages)} page(s) and created "
@@ -450,9 +450,9 @@ def current_machinery_frame() -> pd.DataFrame:
 with review_tab:
     st.subheader("Review and correct the candidate rows")
     st.caption(
-        "Benefit will receive only rows where INCLUDE and READY are both checked. "
+        "Will receive only rows where INCLUDE and READY are both checked. "
         "SOURCE PAGE, CONFIDENCE, DETECTED MACHINERY, and WARNING are audit fields and "
-        "are not written to the Benefit template."
+        "are not written to the template."
     )
 
     if st.session_state.spare_review.empty:
@@ -561,11 +561,11 @@ with review_tab:
 
 
 # ---------------------------------------------------------------------------
-# Benefit template export
+# Template export
 # ---------------------------------------------------------------------------
 
 with export_tab:
-    st.subheader("Build the Benefit import workbook")
+    st.subheader("Build import workbook")
     st.markdown(
         "The app writes the reviewed data into the existing template as follows:\n\n"
         "- **1.Machineries|Sub|Units**, starting at row 5: CODE, NAME, MAKER, MODEL, "
@@ -601,7 +601,7 @@ with export_tab:
         for error in machinery_errors:
             st.error(error)
     if blocked.empty and not included.empty:
-        st.success(f"{len(included)} included spare-part row(s) are ready for Benefit.")
+        st.success(f"{len(included)} included spare-part row(s) are ready.")
     elif included.empty:
         st.warning("No spare-part rows are currently included.")
     else:
@@ -627,13 +627,13 @@ with export_tab:
     )
 
     if st.button(
-        "Create Benefit Excel",
+        "Create Excel",
         type="primary",
         disabled=not can_build,
         use_container_width=True,
     ):
         try:
-            output_bytes = build_benefit_workbook(
+            output_bytes = build_workbook(
                 template_bytes=template_bytes,
                 machinery_frame=machinery_frame,
                 review_frame=export_review,
@@ -642,20 +642,20 @@ with export_tab:
             name_source = (
                 st.session_state.main_code
                 or st.session_state.main_name
-                or "benefit_spare_parts"
+                or "spare_parts"
             )
-            output_name = safe_filename(name_source) + "_Benefit_import.xlsx"
-            st.session_state.benefit_output = output_bytes
-            st.session_state.benefit_output_name = output_name
-            st.success("Benefit workbook created. Download it below and test a small import first.")
+            output_name = safe_filename(name_source) + "import.xlsx"
+            st.session_state.output = output_bytes
+            st.session_state.output_name = output_name
+            st.success("Workbook created. Download it below and test a small import first.")
         except Exception as exc:
-            st.error(f"Could not create the Benefit workbook: {exc}")
+            st.error(f"Could not create the workbook: {exc}")
 
-    if st.session_state.benefit_output:
+    if st.session_state.output:
         st.download_button(
-            "Download Benefit import workbook",
-            data=st.session_state.benefit_output,
-            file_name=st.session_state.benefit_output_name,
+            "Download import workbook",
+            data=st.session_state.output,
+            file_name=st.session_state.output_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
