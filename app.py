@@ -84,10 +84,6 @@ def get_secret(name: str) -> str:
 initialize_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption(
-    "OCR scanned manuals, skip obvious non-parts pages, recover malformed AI "
-    "batches automatically, review the rows, and populate the original template."
-)
 
 
 # ---------------------------------------------------------------------------
