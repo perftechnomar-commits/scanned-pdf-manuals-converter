@@ -36,7 +36,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 
 DEFAULT_PAGE_FILTER = next(
     (mode for mode in PAGE_FILTER_MODES if "conservative" in mode.lower()),
@@ -125,6 +125,9 @@ def initialize_state() -> None:
         "setting_default_unit": PROCESSING_PRESETS["Balanced"]["default_unit"],
         "setting_extra_prompt": "",
         "submachinery_editor_version": 0,
+        "review_filter": "Needs correction",
+        "review_sort": "Issues first",
+        "review_confidence_threshold": 0.75,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -202,13 +205,17 @@ Selecting a processing mode resets the advanced numeric settings to that mode's 
 **Pages to process**  
 Use `all`, `1-20`, `25`, or `30-45`. For large books, process ranges and enable **Append to current review table** after the first range.
 
-### Review-table guide
+### Review dashboard
 
+The Review tab opens on **Needs correction** by default, so users see only blocked rows first.
+
+- Use **View** to switch between Needs correction, Low confidence, Ready, Excluded, and All rows.
+- Use **Sort by** for issues first, lowest confidence, source page, part number, or description.
+- Correct values directly in the visible table. Changes are written back to the full review dataset automatically.
+- Use **Set visible unit** and **Set visible machinery** for quick bulk corrections.
 - **INCLUDE:** checked rows are considered for export.
 - **READY:** calculated automatically after validation.
-- **MACHINERY:** must exactly match a machinery name entered in step 1.
-- **CONFIDENCE:** low values should be checked against the source page.
-- **WARNING:** explains what must be corrected before export.
+- **WARNING:** explains what blocks export.
 - **SOURCE PAGE:** audit reference; it is not written to the import template.
 
 ### Troubleshooting
@@ -848,11 +855,10 @@ def current_machinery_frame() -> pd.DataFrame:
 
 
 with review_tab:
-    st.subheader("Review and correct the candidate rows")
+    st.subheader("Step 3 — Review and correct candidate rows")
     st.caption(
-        "Will receive only rows where INCLUDE and READY are both checked. "
-        "SOURCE PAGE, CONFIDENCE, DETECTED MACHINERY, and WARNING are audit fields and "
-        "are not written to the template."
+        "The table opens on rows that need correction. Filter and sort instantly, "
+        "edit the visible rows, and the app writes those changes back to the complete dataset."
     )
 
     if st.session_state.spare_review.empty:
@@ -861,102 +867,201 @@ with review_tab:
         machinery_frame = current_machinery_frame()
         valid_machinery_names = machinery_frame["NAME"].tolist()
 
-        top_buttons = st.columns(3)
-        with top_buttons[0]:
-            if st.button("Use main machinery for all included rows"):
-                frame = st.session_state.spare_review.copy()
-                mask = frame["INCLUDE"].astype(bool)
-                frame.loc[mask, "MACHINERY"] = st.session_state.main_name
-                st.session_state.spare_review = frame
-                st.session_state.editor_version += 1
-                st.rerun()
-        with top_buttons[1]:
-            if st.button("Select all candidate rows"):
-                frame = st.session_state.spare_review.copy()
-                frame["INCLUDE"] = True
-                st.session_state.spare_review = frame
-                st.session_state.editor_version += 1
-                st.rerun()
-        with top_buttons[2]:
-            if st.button("Exclude all rows"):
-                frame = st.session_state.spare_review.copy()
-                frame["INCLUDE"] = False
-                st.session_state.spare_review = frame
-                st.session_state.editor_version += 1
-                st.rerun()
-
-        status_frame = recalculate_review_status(
+        full_status = recalculate_review_status(
             st.session_state.spare_review,
             valid_machinery_names=valid_machinery_names,
             allow_duplicates=False,
         )
+        st.session_state.spare_review = full_status.copy()
 
-        edited = st.data_editor(
-            status_frame,
-            key=f"spare_editor_{st.session_state.editor_version}",
-            num_rows="dynamic",
-            use_container_width=True,
-            hide_index=True,
-            height=620,
-            disabled=[
-                "READY",
-                "SOURCE PAGE",
-                "CONFIDENCE",
-                "DETECTED MACHINERY",
-                "WARNING",
-            ],
-            column_config={
-                "INCLUDE": st.column_config.CheckboxColumn("INCLUDE", default=True),
-                "READY": st.column_config.CheckboxColumn("READY", disabled=True),
-                "MACHINERY": st.column_config.TextColumn(
-                    "MACHINERY",
-                    help="Must exactly match a NAME entered on sheet 1.",
-                    width="medium",
-                ),
-                "PART NO": st.column_config.TextColumn("PART NO", width="medium"),
-                "DESCRIPTION": st.column_config.TextColumn("DESCRIPTION", width="large"),
-                "CODE": st.column_config.TextColumn("CODE", width="medium"),
-                "ITEM NO": st.column_config.TextColumn("ITEM NO", width="small"),
-                "UNIT": st.column_config.SelectboxColumn("UNIT", options=UNIT_OPTIONS),
-                "QNT": st.column_config.NumberColumn("QNT", min_value=0, step=1),
-                "SOURCE PAGE": st.column_config.NumberColumn("SOURCE PAGE", format="%d"),
-                "CONFIDENCE": st.column_config.ProgressColumn(
+        included_mask = full_status["INCLUDE"].astype(bool)
+        ready_mask = full_status["READY"].astype(bool)
+        confidence_values = pd.to_numeric(full_status["CONFIDENCE"], errors="coerce").fillna(0.0)
+        threshold = float(st.session_state.review_confidence_threshold)
+
+        counts = {
+            "Needs correction": int((included_mask & ~ready_mask).sum()),
+            "Low confidence": int((included_mask & (confidence_values < threshold)).sum()),
+            "Ready": int((included_mask & ready_mask).sum()),
+            "Excluded": int((~included_mask).sum()),
+            "All rows": len(full_status),
+        }
+
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Candidates", len(full_status))
+        metric_cols[1].metric("Included", int(included_mask.sum()))
+        metric_cols[2].metric("Ready", counts["Ready"])
+        metric_cols[3].metric("Needs correction", counts["Needs correction"])
+        metric_cols[4].metric("Low confidence", counts["Low confidence"])
+
+        toolbar = st.columns([1.5, 1.5, 1, 1])
+        with toolbar[0]:
+            review_filter = st.selectbox(
+                "View",
+                ["Needs correction", "Low confidence", "Ready", "Excluded", "All rows"],
+                key="review_filter",
+                format_func=lambda value: f"{value} ({counts[value]})",
+                help="Needs correction is the recommended default for fast quality control.",
+            )
+        with toolbar[1]:
+            review_sort = st.selectbox(
+                "Sort by",
+                ["Issues first", "Lowest confidence", "Source page", "Part number", "Description"],
+                key="review_sort",
+            )
+        with toolbar[2]:
+            st.number_input(
+                "Low-confidence threshold",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.05,
+                format="%.2f",
+                key="review_confidence_threshold",
+                help="Rows below this confidence appear in the Low confidence view.",
+            )
+        with toolbar[3]:
+            st.write("")
+            st.write("")
+            if st.button("Refresh review", use_container_width=True):
+                st.session_state.editor_version += 1
+                st.rerun()
+
+        if review_filter == "Needs correction":
+            visible = full_status.loc[included_mask & ~ready_mask].copy()
+        elif review_filter == "Low confidence":
+            visible = full_status.loc[included_mask & (confidence_values < threshold)].copy()
+        elif review_filter == "Ready":
+            visible = full_status.loc[included_mask & ready_mask].copy()
+        elif review_filter == "Excluded":
+            visible = full_status.loc[~included_mask].copy()
+        else:
+            visible = full_status.copy()
+
+        visible["_ROW_ID"] = visible.index
+        if review_sort == "Issues first":
+            visible["_ISSUE_RANK"] = visible["READY"].astype(bool).astype(int)
+            visible = visible.sort_values(
+                by=["_ISSUE_RANK", "WARNING", "CONFIDENCE", "SOURCE PAGE"],
+                ascending=[True, True, True, True],
+                na_position="last",
+            ).drop(columns=["_ISSUE_RANK"])
+        elif review_sort == "Lowest confidence":
+            visible = visible.sort_values("CONFIDENCE", ascending=True, na_position="last")
+        elif review_sort == "Source page":
+            visible = visible.sort_values("SOURCE PAGE", ascending=True, na_position="last")
+        elif review_sort == "Part number":
+            visible = visible.sort_values("PART NO", key=lambda s: s.astype(str).str.upper())
+        elif review_sort == "Description":
+            visible = visible.sort_values("DESCRIPTION", key=lambda s: s.astype(str).str.upper())
+
+        action_cols = st.columns([1.4, 1.4, 1.4, 1.2, 1.2])
+        with action_cols[0]:
+            if st.button("Use main machinery for visible", use_container_width=True, disabled=visible.empty):
+                frame = st.session_state.spare_review.copy()
+                frame.loc[visible["_ROW_ID"], "MACHINERY"] = st.session_state.main_name
+                st.session_state.spare_review = frame
+                st.session_state.editor_version += 1
+                st.rerun()
+        with action_cols[1]:
+            visible_machinery = st.selectbox(
+                "Set visible machinery",
+                [""] + [name for name in valid_machinery_names if str(name).strip()],
+                key="bulk_visible_machinery",
+                label_visibility="collapsed",
+            )
+            if st.button("Apply machinery", use_container_width=True, disabled=visible.empty or not visible_machinery):
+                frame = st.session_state.spare_review.copy()
+                frame.loc[visible["_ROW_ID"], "MACHINERY"] = visible_machinery
+                st.session_state.spare_review = frame
+                st.session_state.editor_version += 1
+                st.rerun()
+        with action_cols[2]:
+            visible_unit = st.selectbox(
+                "Set visible unit",
+                ["PCS", "SET", ""],
+                key="bulk_visible_unit",
+                label_visibility="collapsed",
+            )
+            if st.button("Apply unit", use_container_width=True, disabled=visible.empty):
+                frame = st.session_state.spare_review.copy()
+                frame.loc[visible["_ROW_ID"], "UNIT"] = visible_unit
+                st.session_state.spare_review = frame
+                st.session_state.editor_version += 1
+                st.rerun()
+        with action_cols[3]:
+            if st.button("Include visible", use_container_width=True, disabled=visible.empty):
+                frame = st.session_state.spare_review.copy()
+                frame.loc[visible["_ROW_ID"], "INCLUDE"] = True
+                st.session_state.spare_review = frame
+                st.session_state.editor_version += 1
+                st.rerun()
+        with action_cols[4]:
+            if st.button("Exclude visible", use_container_width=True, disabled=visible.empty):
+                frame = st.session_state.spare_review.copy()
+                frame.loc[visible["_ROW_ID"], "INCLUDE"] = False
+                st.session_state.spare_review = frame
+                st.session_state.editor_version += 1
+                st.rerun()
+
+        if visible.empty:
+            if review_filter == "Needs correction":
+                st.success("No included rows need correction. The review queue is clear.")
+            else:
+                st.info(f"No rows match the {review_filter.lower()} view.")
+        else:
+            st.info(f"Showing {len(visible)} of {len(full_status)} total rows.")
+            editor_source = visible.drop(columns=["_ROW_ID"])
+            edited_visible = st.data_editor(
+                editor_source,
+                key=f"spare_editor_{st.session_state.editor_version}_{review_filter}_{review_sort}",
+                num_rows="fixed",
+                use_container_width=True,
+                hide_index=True,
+                height=620,
+                disabled=[
+                    "READY",
+                    "SOURCE PAGE",
                     "CONFIDENCE",
-                    min_value=0,
-                    max_value=1,
-                    format="%.0f%%",
-                ),
-                "DETECTED MACHINERY": st.column_config.TextColumn(
-                    "DETECTED MACHINERY", width="medium"
-                ),
-                "WARNING": st.column_config.TextColumn("WARNING", width="large"),
-            },
-        )
+                    "DETECTED MACHINERY",
+                    "WARNING",
+                ],
+                column_config={
+                    "INCLUDE": st.column_config.CheckboxColumn("INCLUDE", default=True),
+                    "READY": st.column_config.CheckboxColumn("READY", disabled=True),
+                    "MACHINERY": st.column_config.SelectboxColumn(
+                        "MACHINERY",
+                        options=[name for name in valid_machinery_names if str(name).strip()],
+                        help="Must match a machinery name entered in step 1.",
+                        width="medium",
+                    ),
+                    "PART NO": st.column_config.TextColumn("PART NO", width="medium"),
+                    "DESCRIPTION": st.column_config.TextColumn("DESCRIPTION", width="large"),
+                    "CODE": st.column_config.TextColumn("CODE", width="medium"),
+                    "ITEM NO": st.column_config.TextColumn("ITEM NO", width="small"),
+                    "UNIT": st.column_config.SelectboxColumn("UNIT", options=UNIT_OPTIONS),
+                    "QNT": st.column_config.NumberColumn("QNT", min_value=0, step=1),
+                    "SOURCE PAGE": st.column_config.NumberColumn("SOURCE PAGE", format="%d"),
+                    "CONFIDENCE": st.column_config.ProgressColumn(
+                        "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
+                    ),
+                    "DETECTED MACHINERY": st.column_config.TextColumn(
+                        "DETECTED MACHINERY", width="medium"
+                    ),
+                    "WARNING": st.column_config.TextColumn("WARNING", width="large"),
+                },
+            )
 
-        # Recalculate after edits so export always uses the latest values.
-        st.session_state.spare_review = recalculate_review_status(
-            edited,
-            valid_machinery_names=valid_machinery_names,
-            allow_duplicates=False,
-        )
+            updated_full = st.session_state.spare_review.copy()
+            updated_full.loc[visible["_ROW_ID"], REVIEW_COLUMNS] = edited_visible[REVIEW_COLUMNS].to_numpy()
+            st.session_state.spare_review = recalculate_review_status(
+                updated_full,
+                valid_machinery_names=valid_machinery_names,
+                allow_duplicates=False,
+            )
 
-        frame = st.session_state.spare_review
-        included_count = int(frame["INCLUDE"].astype(bool).sum())
-        ready_count = int((frame["INCLUDE"].astype(bool) & frame["READY"].astype(bool)).sum())
-        blocked_count = included_count - ready_count
-        low_confidence_count = int(
-            (frame["INCLUDE"].astype(bool) & (frame["CONFIDENCE"] < 0.75)).sum()
-        )
-
-        metrics = st.columns(4)
-        metrics[0].metric("Candidates", len(frame))
-        metrics[1].metric("Included", included_count)
-        metrics[2].metric("Ready", ready_count)
-        metrics[3].metric("Needs correction", blocked_count)
-        if low_confidence_count:
-            st.warning(
-                f"{low_confidence_count} included row(s) have OCR confidence below 75%. "
-                "Check part and item numbers against the scanned page."
+            st.caption(
+                "Corrections are saved immediately. After editing, select Refresh review "
+                "to remove rows that are now ready from the Needs correction view."
             )
 
 
