@@ -1,18 +1,28 @@
 # Spare Parts OCR Import Builder
 
-This Streamlit project converts scanned spare-parts manuals into reviewed rows and then writes the approved records into the supplied Excel import template.
+A Streamlit application that converts scanned spare-parts manuals into reviewed machinery and spare-parts records, then writes approved data into the bundled Excel import template.
+
+## Main workflow
+
+1. Select one or more vessels.
+2. Enter the main machinery code, name, maker, and model.
+3. Upload a scanned PDF and run OCR.
+4. Review automatically detected sub-machineries and their source-page ranges.
+5. Apply the approved sub-machinery assignments to spare-part rows.
+6. Review blocked, low-confidence, or unassigned rows using source-page references.
+7. Generate the import workbook, audit workbook, and vessel-specific email draft.
 
 ## Included files
 
-- `app.py` — Streamlit interface.
-- `tools.py` — OCR, structured extraction, validation, and Excel-generation functions.
-- `Spare parts template last version.xlsx` — the original template supplied for this project.
+- `app.py` — Streamlit interface and workflow.
+- `tools.py` — OCR, extraction, sub-machinery detection, validation, and Excel generation.
+- `vessels.csv` — searchable vessel master list.
+- `Spare parts template last version.xlsx` — bundled import template.
 - `requirements.txt` — Python dependencies.
-- `.streamlit/secrets.toml.example` — API-key example.
 
-## Run locally
+## Local setup
 
-Use Python 3.12, which matches the current `py-mistral-helper` project requirement.
+Use Python 3.12.
 
 ```bash
 python -m venv .venv
@@ -26,11 +36,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Copy the example secrets file and add your key:
-
-```text
-.streamlit/secrets.toml
-```
+Create `.streamlit/secrets.toml`:
 
 ```toml
 MISTRAL_API_KEY = "your-key"
@@ -42,36 +48,30 @@ Start the app:
 streamlit run app.py
 ```
 
-## Workflow
+## Vessel master list
 
-1. Enter the main machinery details in the **Machinery** tab.
-2. Keep **PDF** selected, upload a scanned manual, and optionally choose a page range such as `1-25`.
-3. Run OCR. The app can process a large manual in page chunks.
-4. The recommended mode sends the OCR markdown to a Mistral text model using JSON mode to produce structured spare-parts rows. A local markdown-table parser is available as a fallback.
-5. Correct identifiers, descriptions, machinery names, units, and quantities in the **Review spare parts** tab.
-6. Rows must be both `INCLUDE = True` and `READY = True` before export.
-7. Create and download the workbook from the **Export** tab.
+The app loads vessel names from `vessels.csv`. Keep the first-column header as `VESSEL`. If the file is missing, the current list is also included as an internal fallback.
 
-## Mapping
+Vessel names are used in the output filename, audit workbook, and prepared email. They are not written into the import template.
 
-### Sheet `1.Machineries|Sub|Units`, starting at row 5
+## Automatic sub-machinery detection
 
-`CODE`, `NAME`, `MAKER`, `MODEL`, `TYPE`, `INSTR.BOOK`, `SPECIFICATIONS`, `MCH_TP(M/S/U)`
+The extraction model reads the heading above each spare-parts table and returns:
 
-### Sheet `2.Spare Parts`, starting at row 4
+- detected sub-machinery,
+- table title,
+- section start page,
+- exact spare-part source page, and
+- confidence.
 
-`MACHINERY`, `PART NO`, `DESCRIPTION`, `CODE`, `ITEM NO`, `UNIT`, `QNT`
+The app groups repeated headings into editable proposals. Review the proposal name, code, first/last page, part count, confidence, and detected variants before applying assignments.
 
-The first column of the spare-parts sheet has a blank visible header in the supplied template, but it is the machinery-selection column.
+## Large manuals
 
-## Important controls
+For very large PDFs, process ranges such as `1-100`, `101-200`, and `201-300`. Enable **Append to current review table** after the first range. Download the audit workbook regularly because Streamlit session data is held in memory.
 
-- The original template formatting and sheets are retained; values are written into the pre-existing data areas.
-- Part numbers, codes, and item numbers are written as text to preserve leading zeros.
-- Rows with a missing machinery, missing description, or neither a part number nor item number are blocked.
-- A spare-part machinery value must exactly match a `NAME` on the machinery sheet.
-- Possible duplicates are blocked by default.
-- Low-confidence OCR rows are not automatically blocked, but they are clearly flagged for manual verification.
-- Use the separate audit workbook to retain source page numbers and OCR text; those audit fields are not added to import workbook.
+## Validation
 
-Always test a small import batch before processing a complete manual.
+The app blocks export when required machinery or spare-part fields are missing, machinery names do not match the machinery sheet, units are invalid, quantities are nonnumeric, or possible duplicates remain unresolved.
+
+Always test a small import batch before production use.
