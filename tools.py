@@ -17,6 +17,8 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
+TOOLS_VERSION = "3.1"
+
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
 
