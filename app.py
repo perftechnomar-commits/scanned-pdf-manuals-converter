@@ -39,7 +39,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -289,7 +289,7 @@ def apply_processing_preset() -> None:
 initialize_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 3.1 — vessel assignment and automatic sub-machinery detection enabled")
+st.caption("Build 3.2 — dedicated sub-machinery review and clearer spare-parts assignment")
 
 
 # ---------------------------------------------------------------------------
@@ -305,10 +305,10 @@ with st.sidebar:
 1. Open **1. Machinery**, select the applicable vessel(s), and complete the main machinery fields.
 2. Under **Source**, upload the scanned PDF and choose the pages to process.
 3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
-4. Return to **1. Machinery** to review the automatically detected sub-machineries. Each proposal shows its first/last source page and number of linked spare parts.
-5. Apply the approved sub-machinery assignments, then open **3. Review spare parts**.
+4. Open **3. Sub-machineries** to review the automatically detected table headings. Each proposal shows its source-page range and number of linked spare parts.
+5. Apply the approved sub-machinery assignments, then open **4. Review spare parts**.
 6. Use the filters, source-page columns, and quick page lookup to correct only the rows that need attention.
-7. Open **4. Export**, create the workbook, download the audit file, and copy the prepared email text containing the selected vessel(s).
+7. Open **5. Export**, create the workbook, download the audit file, and copy the prepared email text containing the selected vessel(s).
 
 ### Vessel assignment
 
@@ -319,7 +319,7 @@ with st.sidebar:
 
 ### Automatic sub-machinery detection
 
-The AI reads the title above each spare-parts table and proposes sub-machineries automatically.
+The AI reads the title above each spare-parts table and proposes sub-machineries automatically in the dedicated **3. Sub-machineries** tab.
 
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
 - **PARTS FOUND:** number of spare-part rows linked to the proposal.
@@ -348,6 +348,7 @@ Normal users only need a processing mode. Open **Advanced Mistral settings** for
 - **Needs correction** opens by default.
 - Filter by low confidence, unassigned sub-machinery, ready, excluded, or all rows.
 - Sort by issues, confidence, source page, section start page, sub-machinery, part number, or description.
+- **SUB-MACHINERY** is the approved machinery record assigned to that spare-part row. It may show the main machinery only when no sub-machinery applies.
 - **SOURCE PAGE** is the exact page containing the spare-part row.
 - **SECTION START PAGE** is where the detected sub-machinery/table section began.
 - Use **Source page quick lookup** to display the OCR text for a page while the original PDF is open on a second monitor.
@@ -584,7 +585,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
 **Spare Parts OCR Import Builder — v{APP_VERSION}**
 
 **Workflow**  
-Vessels → Main machinery → OCR → Auto-detected sub-machineries → Review → Excel export → Email draft
+Vessels → Main machinery → OCR → Sub-machinery review → Spare-parts review → Excel export → Email draft
 
 **Supported sources**  
 Scanned PDFs, document URLs, images and image URLs.
@@ -657,8 +658,14 @@ def main_machinery_is_ready() -> bool:
     )
 
 
-machinery_tab, input_tab, review_tab, export_tab = st.tabs(
-    ["1. Machinery", "2. OCR", "3. Review spare parts", "4. Export"]
+machinery_tab, input_tab, submachinery_tab, review_tab, export_tab = st.tabs(
+    [
+        "1. Machinery",
+        "2. OCR",
+        "3. Sub-machineries",
+        "4. Review spare parts",
+        "5. Export",
+    ]
 )
 
 with machinery_tab:
@@ -749,8 +756,10 @@ with machinery_tab:
         key="fixed_main_machinery_type",
     )
 
-    st.divider()
-    st.subheader("Detected sub-machineries")
+
+
+with submachinery_tab:
+    st.subheader("Step 3 — Detected sub-machineries")
     st.caption(
         "After OCR, the app groups the titles found above spare-parts tables. Review "
         "the proposed names, codes, source-page ranges, and variants before export."
@@ -1192,10 +1201,15 @@ with input_tab:
 # ---------------------------------------------------------------------------
 
 with review_tab:
-    st.subheader("Step 3 — Review and correct candidate rows")
+    st.subheader("Step 4 — Review and correct candidate rows")
     st.caption(
         "Start with blocked rows, then inspect sub-machinery assignments and low-confidence "
         "identifiers. Source-page references are retained for quick navigation in the PDF."
+    )
+    st.info(
+        f"Main machinery: **{st.session_state.main_name or '-'}**. "
+        "In the table below, the **SUB-MACHINERY** column is the approved machinery "
+        "record assigned to each spare part."
     )
 
     if st.session_state.spare_review.empty:
@@ -1274,7 +1288,7 @@ with review_tab:
                     "Lowest confidence",
                     "Source page",
                     "Section start page",
-                    "Machinery",
+                    "Sub-machinery",
                     "Part number",
                     "Description",
                 ],
@@ -1334,7 +1348,7 @@ with review_tab:
                 ascending=True,
                 na_position="last",
             )
-        elif review_sort == "Machinery":
+        elif review_sort == "Sub-machinery":
             visible = visible.sort_values(
                 ["MACHINERY", "SOURCE PAGE"],
                 key=lambda series: series.astype(str).str.upper(),
@@ -1364,13 +1378,13 @@ with review_tab:
                 st.rerun()
         with action_cols[1]:
             visible_machinery = st.selectbox(
-                "Set visible machinery",
+                "Set visible sub-machinery",
                 [""] + valid_machinery_names,
                 key="bulk_visible_machinery",
                 label_visibility="collapsed",
             )
             if st.button(
-                "Apply machinery",
+                "Apply sub-machinery",
                 use_container_width=True,
                 disabled=visible.empty or not visible_machinery,
             ):
@@ -1493,9 +1507,12 @@ with review_tab:
                         "READY", disabled=True
                     ),
                     "MACHINERY": st.column_config.SelectboxColumn(
-                        "MACHINERY",
+                        "SUB-MACHINERY",
                         options=valid_machinery_names,
-                        help="Must match an included machinery name from step 1.",
+                        help=(
+                            "Approved sub-machinery assigned to this spare-part row. "
+                            "The main machinery appears only when no sub-machinery applies."
+                        ),
                         width="medium",
                     ),
                     "PART NO": st.column_config.TextColumn(
@@ -1611,7 +1628,7 @@ Best regards,
 
 
 with export_tab:
-    st.subheader("Step 4 — Build import workbook")
+    st.subheader("Step 5 — Build import workbook")
     vessels = selected_vessel_names()
     if vessels:
         st.info(
@@ -1625,7 +1642,7 @@ with export_tab:
         "The app writes the reviewed data into the existing template as follows:\n\n"
         "- **1.Machineries|Sub|Units**, starting at row 5: CODE, NAME, MAKER, MODEL, "
         "TYPE, INSTR.BOOK, SPECIFICATIONS, MCH_TP(M/S/U).\n"
-        "- **2.Spare Parts**, starting at row 4: MACHINERY, PART NO, DESCRIPTION, CODE, "
+        "- **2.Spare Parts**, starting at row 4: MACHINERY (approved sub-machinery), PART NO, DESCRIPTION, CODE, "
         "ITEM NO, UNIT, QNT.\n\n"
         "Source pages, detected headings, confidence values, vessels, and review notes "
         "remain in the separate audit workbook."
