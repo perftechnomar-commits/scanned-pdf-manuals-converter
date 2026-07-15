@@ -36,7 +36,54 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
+
+DEFAULT_PAGE_FILTER = next(
+    (mode for mode in PAGE_FILTER_MODES if "conservative" in mode.lower()),
+    PAGE_FILTER_MODES[0],
+)
+
+PROCESSING_PRESETS = {
+    "Balanced": {
+        "description": (
+            "Recommended for most manuals. Good balance between speed, stability, "
+            "and extraction accuracy."
+        ),
+        "structure_mode": "AI JSON extraction (recommended)",
+        "page_filter_mode": DEFAULT_PAGE_FILTER,
+        "extraction_model": "mistral-small-latest",
+        "ocr_pages_per_request": 25,
+        "extraction_pages_per_batch": 3,
+        "extraction_max_chars": 12000,
+        "default_unit": "PCS",
+    },
+    "Fast": {
+        "description": (
+            "For clean, consistent scans. Processes larger batches, so it is faster "
+            "but may need more review."
+        ),
+        "structure_mode": "AI JSON extraction (recommended)",
+        "page_filter_mode": DEFAULT_PAGE_FILTER,
+        "extraction_model": "mistral-small-latest",
+        "ocr_pages_per_request": 35,
+        "extraction_pages_per_batch": 4,
+        "extraction_max_chars": 16000,
+        "default_unit": "PCS",
+    },
+    "Careful": {
+        "description": (
+            "For poor scans, complex layouts, or repeated recovery messages. Uses "
+            "small batches for maximum stability."
+        ),
+        "structure_mode": "AI JSON extraction (recommended)",
+        "page_filter_mode": DEFAULT_PAGE_FILTER,
+        "extraction_model": "mistral-small-latest",
+        "ocr_pages_per_request": 12,
+        "extraction_pages_per_batch": 1,
+        "extraction_max_chars": 8000,
+        "default_unit": "PCS",
+    },
+}
 
 st.set_page_config(
     page_title="Spare Parts OCR Import Builder",
@@ -68,6 +115,15 @@ def initialize_state() -> None:
         "main_instruction_book": "",
         "main_specifications": "",
         "auto_instruction_book_source": "",
+        "processing_preset": "Balanced",
+        "setting_structure_mode": PROCESSING_PRESETS["Balanced"]["structure_mode"],
+        "setting_page_filter_mode": PROCESSING_PRESETS["Balanced"]["page_filter_mode"],
+        "setting_extraction_model": PROCESSING_PRESETS["Balanced"]["extraction_model"],
+        "setting_ocr_pages_per_request": PROCESSING_PRESETS["Balanced"]["ocr_pages_per_request"],
+        "setting_extraction_pages_per_batch": PROCESSING_PRESETS["Balanced"]["extraction_pages_per_batch"],
+        "setting_extraction_max_chars": PROCESSING_PRESETS["Balanced"]["extraction_max_chars"],
+        "setting_default_unit": PROCESSING_PRESETS["Balanced"]["default_unit"],
+        "setting_extra_prompt": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -79,6 +135,18 @@ def get_secret(name: str) -> str:
         return str(st.secrets[name])
     except Exception:
         return ""
+
+
+def apply_processing_preset() -> None:
+    preset_name = st.session_state.get("processing_preset", "Balanced")
+    preset = PROCESSING_PRESETS.get(preset_name, PROCESSING_PRESETS["Balanced"])
+    st.session_state.setting_structure_mode = preset["structure_mode"]
+    st.session_state.setting_page_filter_mode = preset["page_filter_mode"]
+    st.session_state.setting_extraction_model = preset["extraction_model"]
+    st.session_state.setting_ocr_pages_per_request = preset["ocr_pages_per_request"]
+    st.session_state.setting_extraction_pages_per_batch = preset["extraction_pages_per_batch"]
+    st.session_state.setting_extraction_max_chars = preset["extraction_max_chars"]
+    st.session_state.setting_default_unit = preset["default_unit"]
 
 
 initialize_state()
@@ -96,62 +164,60 @@ with st.sidebar:
             """
 ### Quick start
 
-1. Open **2. Machinery** and complete the required main-machinery fields.
-2. Upload the scanned manual under **Source**. Start with a small page range such as `1-20`.
-3. Keep the recommended Mistral settings unless the manual is difficult.
-4. Open **1. OCR** and select **Run OCR and extract spare-parts rows**.
-5. Open **3. Review spare parts**, correct warnings and exclude unwanted rows.
-6. Open **4. Export**, create the workbook and test a small import first.
+1. Open **1. Machinery** and complete `CODE`, `NAME`, `MAKER`, and `MODEL`.
+2. Under **Source**, upload the scanned PDF and choose the pages to process.
+3. Select a processing mode. **Balanced** is the recommended default.
+4. Open **2. OCR** and run the extraction.
+5. Open **3. Review spare parts**, correct warnings, and exclude unwanted rows.
+6. Open **4. Export**, create the workbook, and test a small import first.
 
-### Recommended settings
+### Processing modes
 
-- **Page filtering:** Conservative
-- **Structured-extraction model:** `mistral-small-latest`
-- **PDF pages per OCR request:** `25`
-- **OCR pages per structuring batch:** `3`
-- **Maximum OCR characters per AI batch:** `12000`
-- **Default unit:** `PCS`
+**Balanced — recommended**  
+Best for most manuals. Uses moderate OCR and AI batches for a good balance of speed and stability.
 
-### What the settings mean
+**Fast**  
+Use for clean, consistent scans and regular tables. It processes larger batches and may require more review.
+
+**Careful**  
+Use for poor scans, complex tables, missing OCR pages, or repeated JSON recovery messages. It processes smaller batches and is slower but more stable.
+
+### Advanced Mistral settings
+
+Normal users only need to select a processing mode. Open **Advanced Mistral settings** when a manual needs fine-tuning. The expander shows the exact active values for:
+
+- page filtering,
+- extraction method and model,
+- PDF pages per OCR request,
+- OCR pages per structuring batch,
+- maximum characters per AI batch,
+- default unit, and
+- manual-specific extraction instructions.
+
+Selecting a processing mode resets the advanced numeric settings to that mode's defaults. Advanced changes then apply to the current run.
+
+### Source and page ranges
 
 **Pages to process**  
-Use `all`, `1-20`, `25`, or `30-45`. For large books, process ranges and enable **Append to current review table**.
-
-**Page filtering**  
-- **Conservative:** recommended; skips only obvious non-parts pages.
-- **Strict:** use when many contents, narrative, or drawing-only pages create false rows.
-- **Off:** processes every OCR page; useful if valid tables are being skipped.
-
-**PDF pages per OCR request**  
-Controls OCR upload size. Use `25` normally, `10-15` for poor scans or failed OCR requests.
-
-**OCR pages per structuring batch**  
-Controls how much OCR text is converted to JSON at once. Use `3` normally and `1-2` for difficult layouts or repeated JSON recovery messages.
-
-**Maximum OCR characters per AI batch**  
-Use `12000` normally. Reduce to `8000` if responses are truncated or malformed.
-
-**Optional extraction instructions**  
-Use only for rules specific to the current manual, for example:  
-`Preserve leading zeros and hyphens. The first column is ITEM NO and the second is PART NO. Ignore prices and drawing dimensions.`
+Use `all`, `1-20`, `25`, or `30-45`. For large books, process ranges and enable **Append to current review table** after the first range.
 
 ### Review-table guide
 
 - **INCLUDE:** checked rows are considered for export.
 - **READY:** calculated automatically after validation.
-- **MACHINERY:** must exactly match a machinery name entered in tab 2.
+- **MACHINERY:** must exactly match a machinery name entered in step 1.
 - **CONFIDENCE:** low values should be checked against the source page.
 - **WARNING:** explains what must be corrected before export.
 - **SOURCE PAGE:** audit reference; it is not written to the import template.
 
 ### Troubleshooting
 
-- **No candidate pages:** change page filtering to Conservative or Off.
-- **Repeated JSON recovery messages:** reduce structuring batch to `1-2` and maximum characters to `8000`.
-- **Missing OCR pages:** reduce PDF pages per OCR request to `10-15`.
-- **Too many false spare parts:** use Strict filtering and add a short manual-specific instruction.
-- **Part numbers changed:** instruct the model to preserve leading zeros, spaces, slashes and hyphens exactly.
-- **Large job:** process the manual in ranges and download the audit workbook regularly. A redeploy or session reset clears in-memory results.
+- **No candidate pages:** in Advanced settings, change page filtering to Conservative or Off.
+- **Repeated JSON recovery messages:** choose **Careful**, or reduce structuring batch and maximum characters in Advanced settings.
+- **Missing OCR pages or timeouts:** choose **Careful**, or reduce PDF pages per OCR request.
+- **Too many false spare parts:** use Strict page filtering and add a short manual-specific instruction.
+- **Part numbers changed:** add an instruction to preserve leading zeros, spaces, slashes, dots, and hyphens exactly.
+- **Large job:** process page ranges and download the audit workbook regularly. A redeploy or session reset clears in-memory results.
 
 ### Data handling
 
@@ -207,7 +273,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
     )
 
     st.divider()
-    st.header("Mistral settings")
+    st.header("Processing mode")
     secret_api_key = get_secret("MISTRAL_API_KEY")
     if secret_api_key:
         entered_api_key = ""
@@ -219,79 +285,121 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
         )
     api_key = secret_api_key or entered_api_key
 
-    structure_mode = st.selectbox(
-        "Convert OCR text into rows",
-        ["AI JSON extraction (recommended)", "Local markdown-table parser"],
-        index=0,
-        help=(
-            "AI JSON extraction handles irregular tables and wrapped descriptions. "
-            "The local parser is faster but works best only when OCR already produced clean Markdown tables."
-        ),
+    st.caption(
+        "Choose one mode. Balanced is recommended for normal use; Advanced settings "
+        "remain available below for fine-tuning."
     )
-    page_filter_mode = st.selectbox(
-        "Page filtering before AI extraction",
-        PAGE_FILTER_MODES,
-        index=0,
-        help=(
-            "Conservative skips only obvious contents/revision/prose pages. Strict "
-            "processes only strong parts-table candidates. Off processes every OCR page. "
-            "This filter is local and makes no extra API calls."
-        ),
+    mode_columns = st.columns(3)
+    for column, preset_name in zip(mode_columns, PROCESSING_PRESETS):
+        selected = st.session_state.processing_preset == preset_name
+        label = f"✓ {preset_name}" if selected else preset_name
+        if column.button(
+            label,
+            key=f"preset_button_{preset_name.lower()}",
+            use_container_width=True,
+            help=PROCESSING_PRESETS[preset_name]["description"],
+        ):
+            st.session_state.processing_preset = preset_name
+            apply_processing_preset()
+            st.rerun()
+
+    active_preset = PROCESSING_PRESETS.get(
+        st.session_state.processing_preset, PROCESSING_PRESETS["Balanced"]
     )
-    extraction_model = st.text_input(
-        "Structured-extraction model",
-        value="mistral-small-latest",
-        disabled=structure_mode != "AI JSON extraction (recommended)",
-        help="Recommended default: mistral-small-latest. Change only after testing another supported Mistral model.",
-    )
-    ocr_pages_per_request = st.number_input(
-        "PDF pages per OCR request",
-        min_value=1,
-        max_value=100,
-        value=25,
-        step=1,
-        help="Recommended: 25. Use 10-15 for poor scans, missing pages, timeouts, or failed OCR requests.",
-    )
-    extraction_pages_per_batch = st.number_input(
-        "OCR pages per structuring batch",
-        min_value=1,
-        max_value=20,
-        value=3,
-        step=1,
-        disabled=structure_mode != "AI JSON extraction (recommended)",
-        help="Recommended: 3. Use 1-2 for complex layouts or repeated malformed/truncated JSON responses.",
-    )
-    extraction_max_chars = st.number_input(
-        "Maximum OCR characters per AI batch",
-        min_value=2000,
-        max_value=30000,
-        value=12000,
-        step=1000,
-        disabled=structure_mode != "AI JSON extraction (recommended)",
-        help=(
-            "Smaller batches reduce malformed/truncated JSON. If a response still "
-            "fails, the app automatically divides it into smaller requests."
-        ),
-    )
-    default_unit = st.selectbox(
-        "Default spare-part unit",
-        ["PCS", "SET", ""],
-        index=0,
-        help="PCS is the normal default. Use SET for kits/sets, or blank when every unit must be reviewed manually.",
-    )
-    extra_prompt = st.text_area(
-        "Optional manual-specific extraction instructions",
-        placeholder=(
-            "Example: The first column is ITEM NO and the second column is PART NO. "
-            "Ignore drawing dimensions and prices."
-        ),
-        height=100,
-        disabled=structure_mode != "AI JSON extraction (recommended)",
-        help=(
-            "Add only manual-specific rules. Example: Preserve leading zeros and hyphens; "
-            "the first column is ITEM NO; ignore prices and drawing dimensions."
-        ),
-    )
+    st.caption(f"**Active mode:** {st.session_state.processing_preset}")
+    st.caption(active_preset["description"])
+
+    with st.expander("Advanced Mistral settings", expanded=False):
+        st.caption(
+            "These are the active settings for the current run. Re-selecting a mode "
+            "restores that mode's defaults."
+        )
+
+        structure_mode = st.selectbox(
+            "Convert OCR text into rows",
+            ["AI JSON extraction (recommended)", "Local markdown-table parser"],
+            key="setting_structure_mode",
+            help=(
+                "AI JSON extraction handles irregular tables and wrapped descriptions. "
+                "The local parser is faster but works best when OCR already produced clean Markdown tables."
+            ),
+        )
+        page_filter_mode = st.selectbox(
+            "Page filtering before AI extraction",
+            PAGE_FILTER_MODES,
+            key="setting_page_filter_mode",
+            help=(
+                "Conservative skips only obvious contents/revision/prose pages. Strict "
+                "processes only strong parts-table candidates. Off processes every OCR page."
+            ),
+        )
+        extraction_model = st.text_input(
+            "Structured-extraction model",
+            key="setting_extraction_model",
+            disabled=structure_mode != "AI JSON extraction (recommended)",
+            help="Recommended default: mistral-small-latest.",
+        )
+        ocr_pages_per_request = st.number_input(
+            "PDF pages per OCR request",
+            min_value=1,
+            max_value=100,
+            step=1,
+            key="setting_ocr_pages_per_request",
+            help="Lower values improve stability for poor scans or OCR timeouts.",
+        )
+        extraction_pages_per_batch = st.number_input(
+            "OCR pages per structuring batch",
+            min_value=1,
+            max_value=20,
+            step=1,
+            key="setting_extraction_pages_per_batch",
+            disabled=structure_mode != "AI JSON extraction (recommended)",
+            help="Lower values reduce malformed or truncated JSON responses.",
+        )
+        extraction_max_chars = st.number_input(
+            "Maximum OCR characters per AI batch",
+            min_value=2000,
+            max_value=30000,
+            step=1000,
+            key="setting_extraction_max_chars",
+            disabled=structure_mode != "AI JSON extraction (recommended)",
+            help=(
+                "Smaller batches reduce malformed/truncated JSON. Failed batches are "
+                "also divided automatically into smaller requests."
+            ),
+        )
+        default_unit = st.selectbox(
+            "Default spare-part unit",
+            ["PCS", "SET", ""],
+            key="setting_default_unit",
+            help="PCS is the normal default. Use SET for kits or leave blank for manual review.",
+        )
+        extra_prompt = st.text_area(
+            "Optional manual-specific extraction instructions",
+            placeholder=(
+                "Example: The first column is ITEM NO and the second column is PART NO. "
+                "Ignore drawing dimensions and prices."
+            ),
+            height=100,
+            key="setting_extra_prompt",
+            disabled=structure_mode != "AI JSON extraction (recommended)",
+            help="Add only rules that are specific to the current manual.",
+        )
+
+        st.markdown(
+            f"""
+**Current active values**
+
+- Mode: `{st.session_state.processing_preset}`
+- Page filtering: `{page_filter_mode}`
+- Extraction method: `{structure_mode}`
+- Model: `{extraction_model}`
+- OCR pages/request: `{int(ocr_pages_per_request)}`
+- Structuring pages/batch: `{int(extraction_pages_per_batch)}`
+- Maximum characters/batch: `{int(extraction_max_chars)}`
+- Default unit: `{default_unit or 'Blank'}`
+            """
+        )
 
     st.divider()
     st.header("Template")
@@ -334,7 +442,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
 **Spare Parts OCR Import Builder — v{APP_VERSION}**
 
 **Workflow**  
-Upload → OCR → Page filtering → AI extraction → Review → Excel export
+Machinery → Upload → OCR → Page filtering → AI extraction → Review → Excel export
 
 **Supported sources**  
 Scanned PDFs, document URLs, images and image URLs.
@@ -361,12 +469,17 @@ if (
     st.session_state.auto_instruction_book_source = source_file.name
 
 
-input_tab, machinery_tab, review_tab, export_tab = st.tabs(
-    ["1. OCR", "2. Machinery", "3. Review spare parts", "4. Export"]
+def main_machinery_is_ready() -> bool:
+    required_keys = ("main_code", "main_name", "main_maker", "main_model")
+    return all(str(st.session_state.get(key, "")).strip() for key in required_keys)
+
+
+machinery_tab, input_tab, review_tab, export_tab = st.tabs(
+    ["1. Machinery", "2. OCR", "3. Review spare parts", "4. Export"]
 )
 
 with machinery_tab:
-    st.subheader("Main machinery — written to row 5 of sheet 1")
+    st.subheader("Step 1 — Main machinery")
     st.info(
         "Requires CODE, NAME, MAKER, MODEL and MCH_TP. The app fixes the "
         "main row's MCH_TP to 'Main Machinery'."
@@ -424,7 +537,17 @@ with machinery_tab:
 # ---------------------------------------------------------------------------
 
 with input_tab:
-    st.subheader("Process the scanned document")
+    st.subheader("Step 2 — Process the scanned document")
+
+    if main_machinery_is_ready():
+        st.success(
+            f"Machinery ready: {st.session_state.main_name}. You can run OCR."
+        )
+    else:
+        st.warning(
+            "Complete CODE, NAME, MAKER, and MODEL in step 1 before running OCR. "
+            "This ensures extracted rows are linked to the correct machinery."
+        )
 
     if input_type == "PDF" and source_file is not None:
         try:
@@ -441,6 +564,12 @@ with input_tab:
         "Run OCR and extract spare-parts rows",
         type="primary",
         use_container_width=True,
+        disabled=not main_machinery_is_ready(),
+        help=(
+            "Complete the required machinery fields in step 1 before running OCR."
+            if not main_machinery_is_ready()
+            else "Run OCR using the selected processing mode and active advanced settings."
+        ),
     )
 
     if process_button:
