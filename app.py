@@ -36,7 +36,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "2.2"
+APP_VERSION = "2.3"
 
 DEFAULT_PAGE_FILTER = next(
     (mode for mode in PAGE_FILTER_MODES if "conservative" in mode.lower()),
@@ -124,6 +124,7 @@ def initialize_state() -> None:
         "setting_extraction_max_chars": PROCESSING_PRESETS["Balanced"]["extraction_max_chars"],
         "setting_default_unit": PROCESSING_PRESETS["Balanced"]["default_unit"],
         "setting_extra_prompt": "",
+        "submachinery_editor_version": 0,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -510,26 +511,69 @@ with machinery_tab:
         key="fixed_main_machinery_type",
     )
 
-    st.subheader("Optional sub-machineries or book units")
+    st.subheader("Optional sub-machineries")
     st.caption(
-        "Add rows only when spare parts must refer to a sub-machinery or unit instead "
-        "of the main machinery. All required fields must be filled for each row."
+        "Add rows only when spare parts must refer to a sub-machinery instead "
+        "of the main machinery. Every added row is automatically classified as SubMachinery."
     )
 
-    additional_editor = st.data_editor(
-        st.session_state.additional_machinery,
-        key="additional_machinery_editor",
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "MCH_TP(M/S/U)": st.column_config.SelectboxColumn(
-                "MCH_TP(M/S/U)",
-                options=["SubMachinery", "Unit (Book Chapter)"],
+    # Normalize any existing rows from older app versions.
+    additional_frame = st.session_state.additional_machinery.copy()
+    if not additional_frame.empty:
+        additional_frame["MCH_TP(M/S/U)"] = "SubMachinery"
+        st.session_state.additional_machinery = additional_frame
+
+    button_cols = st.columns([1, 1, 3])
+    with button_cols[0]:
+        if st.button("Add sub-machinery", use_container_width=True):
+            new_row = {column: "" for column in MACHINERY_COLUMNS}
+            new_row["MCH_TP(M/S/U)"] = "SubMachinery"
+            st.session_state.additional_machinery = pd.concat(
+                [
+                    st.session_state.additional_machinery,
+                    pd.DataFrame([new_row], columns=MACHINERY_COLUMNS),
+                ],
+                ignore_index=True,
             )
-        },
-    )
-    st.session_state.additional_machinery = additional_editor
+            st.session_state.submachinery_editor_version = (
+                st.session_state.get("submachinery_editor_version", 0) + 1
+            )
+            st.rerun()
+
+    with button_cols[1]:
+        if st.button("Clear sub-machineries", use_container_width=True):
+            st.session_state.additional_machinery = empty_additional_machinery_dataframe()
+            st.session_state.submachinery_editor_version = (
+                st.session_state.get("submachinery_editor_version", 0) + 1
+            )
+            st.rerun()
+
+    if st.session_state.additional_machinery.empty:
+        st.info("No sub-machineries added yet. Select **Add sub-machinery** to create a row.")
+    else:
+        additional_editor = st.data_editor(
+            st.session_state.additional_machinery,
+            key=f"additional_machinery_editor_{st.session_state.get('submachinery_editor_version', 0)}",
+            num_rows="fixed",
+            use_container_width=True,
+            hide_index=True,
+            disabled=["MCH_TP(M/S/U)"],
+            column_config={
+                "CODE": st.column_config.TextColumn("CODE", help="Sub-machinery code."),
+                "NAME": st.column_config.TextColumn("NAME", help="Sub-machinery name used by spare-part rows."),
+                "MAKER": st.column_config.TextColumn("MAKER"),
+                "MODEL": st.column_config.TextColumn("MODEL"),
+                "TYPE": st.column_config.TextColumn("TYPE"),
+                "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK"),
+                "SPECIFICATIONS": st.column_config.TextColumn("SPECIFICATIONS"),
+                "MCH_TP(M/S/U)": st.column_config.TextColumn(
+                    "MCH_TP(M/S/U)",
+                    help="Automatically fixed to SubMachinery.",
+                ),
+            },
+        )
+        additional_editor["MCH_TP(M/S/U)"] = "SubMachinery"
+        st.session_state.additional_machinery = additional_editor.copy()
 
 
 # ---------------------------------------------------------------------------
