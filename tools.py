@@ -280,7 +280,51 @@ def ocr_pdf_bytes(
         writer.write(buffer)
         temp_path = _temporary_file(buffer.getvalue(), ".pdf")
         try:
-            response = helper.extract_text_using_pdf(temp_path)
+            response = None
+            retry_delays = (0, 2, 4, 8, 12)
+            last_error: Exception | None = None
+
+            for attempt, delay_seconds in enumerate(retry_delays, start=1):
+                if delay_seconds:
+                    if progress:
+                        progress(
+                            chunk_number - 1,
+                            len(page_chunks),
+                            (
+                                f"OCR request {chunk_number}/{len(page_chunks)}: "
+                                f"waiting {delay_seconds}s before retry {attempt}/{len(retry_delays)}"
+                            ),
+                        )
+                    time.sleep(delay_seconds)
+
+                try:
+                    # Recreate the helper for every retry. This avoids reusing stale
+                    # uploaded-file state inside py-mistral-helper after Mistral's file
+                    # service temporarily returns: 404 "No file matches the given query".
+                    attempt_helper = MistralHelper(api_key=api_key)
+                    response = attempt_helper.extract_text_using_pdf(temp_path)
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    message = str(exc).lower()
+                    transient_file_error = (
+                        "no file matches the given query" in message
+                        or "status 404" in message
+                        or "status_code=404" in message
+                    )
+
+                    if not transient_file_error or attempt == len(retry_delays):
+                        raise RuntimeError(
+                            f"OCR request {chunk_number}/{len(page_chunks)} failed "
+                            f"after {attempt} attempt(s): {exc}"
+                        ) from exc
+
+            if response is None:
+                raise RuntimeError(
+                    f"OCR request {chunk_number}/{len(page_chunks)} returned no response: "
+                    f"{last_error}"
+                )
+
             response_pages = list(getattr(response, "pages", []) or [])
             for local_index, page in enumerate(response_pages):
                 if local_index >= len(page_chunk):
