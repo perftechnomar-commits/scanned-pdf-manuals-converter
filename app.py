@@ -1,26 +1,29 @@
 from __future__ import annotations
 
-import io
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from tools import (
-    MACHINERY_COLUMNS,
-    MACHINERY_TYPES,
     PAGE_FILTER_MODES,
     REVIEW_COLUMNS,
+    SUBMACHINERY_REVIEW_COLUMNS,
     UNIT_OPTIONS,
+    add_manual_submachinery_candidate,
+    apply_submachinery_assignments,
     build_audit_workbook,
+    build_submachinery_candidates,
     build_workbook,
     classify_ocr_pages,
-    empty_additional_machinery_dataframe,
     empty_review_dataframe,
+    empty_submachinery_review_dataframe,
     extract_spare_parts_from_markdown_tables,
     extract_spare_parts_with_ai,
+    included_submachinery_rows,
     machinery_rows_from_main_and_additional,
     merge_review_dataframes,
+    merge_submachinery_candidates,
     ocr_document_url,
     ocr_image_bytes,
     ocr_image_url,
@@ -36,7 +39,132 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "2.4"
+APP_VERSION = "3.0"
+
+DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
+
+FALLBACK_VESSELS = [
+    'AGIOS DIMITRIOS',
+    'AFRICAN QUEEN',
+    'ANTHEA Y',
+    'ATETI',
+    'ATHENA I',
+    'BEATRICE',
+    'BREMERHAVEN EXPRESS',
+    'CAPTAIN THANASIS I',
+    'CHRISTINAB',
+    'CMA CGM ALCAZAR',
+    'CMA CGM AMERICA',
+    'CMA CGM JAMAICA',
+    'CMA CGM SAMBHAR',
+    'CMA CGM THALASSA',
+    'COLOMBIA EXPRESS',
+    'CONSTANTINOS P II',
+    'COSTA RICA EXPRESS',
+    'CYPRESS',
+    'CZECH',
+    'DARLEAKAY',
+    'DOLPHIN II',
+    'ELENI T',
+    'EPAMINONDAS',
+    'FRIEDERIKE',
+    'GSL ALEXANDRA',
+    'GSL ALICE',
+    'GSL ARCADIA',
+    "GSL CHATEAU D'IF",
+    'GSL CHLOE',
+    'GSL CHRISTEL ELISABETH',
+    'GSL CHRISTEN',
+    'GSL DOROTHEA',
+    'GSL EFFIE',
+    'GSL ELEFTHERIA',
+    'GSL ELENI',
+    'GSL ELIZABETH',
+    'GSL GRANIA',
+    'GSL KALLIOPI',
+    'GSL KITHIRA',
+    'GSL LALO',
+    'GSL LYDIA',
+    'GSL MAMITSA',
+    'GSL MAREN',
+    'GSL MARIA',
+    'GSL MELINA',
+    'GSL MELITA',
+    'GSL MERCER',
+    'GSL MYNY',
+    'GSL NICOLETTA',
+    'GSL NINGBO',
+    'GSL ROSSI',
+    'GSL SOFIA',
+    'GSL SUSAN',
+    'GSL SYROS',
+    'GSL TEGEA',
+    'GSL TINOS',
+    'GSL TRIPOLI',
+    'GSL VALERIE',
+    'GSL VINIA',
+    'GSL VIOLETTA',
+    'IAN H',
+    'ISTANBUL EXPRESS',
+    'JAMAICA EXPRESS',
+    'JULIE',
+    'KACEY',
+    'KOI',
+    'KOSTAS K',
+    'KUMASI',
+    'LINDSAYLOU',
+    'LOTUS A',
+    'MAIRA',
+    'MANET',
+    'MARIA Y',
+    'MARIANNA I',
+    'MARINO',
+    'MELINA',
+    'MELINDA',
+    'MEXICO EXPRESS',
+    'MOON',
+    'MSC QINGDAO',
+    'MSC ROMA',
+    'MSC TIANJIN',
+    'MYNY',
+    'NEWYORKER',
+    'NICARAGUA EXPRESS',
+    'NIKOLAS',
+    'NIKOLAS XL',
+    'ORCA I',
+    'PANAMA EXPRESS',
+    'SPYROS V',
+    'STAMATIS B',
+    'SYDNEY EXPRESS',
+    'TINA I',
+    'TONSBERG',
+    'TORRANCE',
+    'ZIM NORFOLK',
+    'ZIM XIAMEN',
+    'ZOI',
+    'ZOI XL',
+]
+
+
+def load_vessel_options() -> list[str]:
+    if DEFAULT_VESSEL_PATH.exists():
+        try:
+            vessel_frame = pd.read_csv(DEFAULT_VESSEL_PATH, dtype=str)
+            if not vessel_frame.empty:
+                first_column = vessel_frame.columns[0]
+                values = [
+                    str(value).strip()
+                    for value in vessel_frame[first_column].dropna().tolist()
+                    if str(value).strip()
+                ]
+                if values:
+                    return sorted(dict.fromkeys(values), key=str.upper)
+        except Exception:
+            pass
+    return sorted(dict.fromkeys(FALLBACK_VESSELS), key=str.upper)
+
+
+VESSEL_OPTIONS = load_vessel_options()
 
 DEFAULT_PAGE_FILTER = next(
     (mode for mode in PAGE_FILTER_MODES if "conservative" in mode.lower()),
@@ -103,7 +231,9 @@ def initialize_state() -> None:
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
         "spare_review": empty_review_dataframe(),
-        "additional_machinery": empty_additional_machinery_dataframe(),
+        "submachinery_review": empty_submachinery_review_dataframe(),
+        "selected_vessels": [],
+        "additional_vessels_text": "",
         "output": None,
         "output_name": "spare_parts.xlsx",
         "editor_version": 0,
@@ -128,6 +258,9 @@ def initialize_state() -> None:
         "review_filter": "Needs correction",
         "review_sort": "Issues first",
         "review_confidence_threshold": 0.75,
+        "source_page_lookup": 1,
+        "prepared_email_subject": "",
+        "prepared_email_body": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -168,64 +301,60 @@ with st.sidebar:
             """
 ### Quick start
 
-1. Open **1. Machinery** and complete `CODE`, `NAME`, `MAKER`, and `MODEL`.
+1. Open **1. Machinery**, select the applicable vessel(s), and complete the main machinery fields.
 2. Under **Source**, upload the scanned PDF and choose the pages to process.
-3. Select a processing mode. **Balanced** is the recommended default.
-4. Open **2. OCR** and run the extraction.
-5. Open **3. Review spare parts**, correct warnings, and exclude unwanted rows.
-6. Open **4. Export**, create the workbook, and test a small import first.
+3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
+4. Return to **1. Machinery** to review the automatically detected sub-machineries. Each proposal shows its first/last source page and number of linked spare parts.
+5. Apply the approved sub-machinery assignments, then open **3. Review spare parts**.
+6. Use the filters, source-page columns, and quick page lookup to correct only the rows that need attention.
+7. Open **4. Export**, create the workbook, download the audit file, and copy the prepared email text containing the selected vessel(s).
+
+### Vessel assignment
+
+- Select one or more vessels from the searchable list.
+- Vessel names are used in the export filename, audit workbook, and email draft.
+- Vessel names are **not written into the import template**, because vessel assignment is completed during the ERP process.
+- Use **Additional vessel(s)** only when a vessel is not yet available in the master list.
+
+### Automatic sub-machinery detection
+
+The AI reads the title above each spare-parts table and proposes sub-machineries automatically.
+
+- **FIRST PAGE / LAST PAGE:** where the detected table section appears.
+- **PARTS FOUND:** number of spare-part rows linked to the proposal.
+- **CONFIDENCE:** average extraction confidence for that detected section.
+- **VARIANTS:** different spellings found in the manual.
+- Uncheck **INCLUDE** to reject a false detection, or edit **NAME** and **CODE** before applying assignments.
+- Use **Apply approved assignments to spare parts** after renaming, excluding, or merging proposals.
 
 ### Processing modes
 
 **Balanced — recommended**  
-Best for most manuals. Uses moderate OCR and AI batches for a good balance of speed and stability.
+Best for most manuals. Good balance of speed, stability, and extraction accuracy.
 
 **Fast**  
-Use for clean, consistent scans and regular tables. It processes larger batches and may require more review.
+For clean, consistent scans and regular tables. Larger batches are faster but may need more review.
 
 **Careful**  
-Use for poor scans, complex tables, missing OCR pages, or repeated JSON recovery messages. It processes smaller batches and is slower but more stable.
+For poor scans, complex layouts, OCR timeouts, or repeated recovery messages. Smaller batches are slower but more stable.
 
 ### Advanced Mistral settings
 
-Normal users only need to select a processing mode. Open **Advanced Mistral settings** when a manual needs fine-tuning. The expander shows the exact active values for:
-
-- page filtering,
-- extraction method and model,
-- PDF pages per OCR request,
-- OCR pages per structuring batch,
-- maximum characters per AI batch,
-- default unit, and
-- manual-specific extraction instructions.
-
-Selecting a processing mode resets the advanced numeric settings to that mode's defaults. Advanced changes then apply to the current run.
-
-### Source and page ranges
-
-**Pages to process**  
-Use `all`, `1-20`, `25`, or `30-45`. For large books, process ranges and enable **Append to current review table** after the first range.
+Normal users only need a processing mode. Open **Advanced Mistral settings** for difficult manuals. Re-selecting a mode restores that mode's default values.
 
 ### Review dashboard
 
-The Review tab opens on **Needs correction** by default, so users see only blocked rows first.
+- **Needs correction** opens by default.
+- Filter by low confidence, unassigned sub-machinery, ready, excluded, or all rows.
+- Sort by issues, confidence, source page, section start page, sub-machinery, part number, or description.
+- **SOURCE PAGE** is the exact page containing the spare-part row.
+- **SECTION START PAGE** is where the detected sub-machinery/table section began.
+- Use **Source page quick lookup** to display the OCR text for a page while the original PDF is open on a second monitor.
+- Corrections are saved to the full dataset even when only a filtered subset is visible.
 
-- Use **View** to switch between Needs correction, Low confidence, Ready, Excluded, and All rows.
-- Use **Sort by** for issues first, lowest confidence, source page, part number, or description.
-- Correct values directly in the visible table. Changes are written back to the full review dataset automatically.
-- Use **Set visible unit** and **Set visible machinery** for quick bulk corrections.
-- **INCLUDE:** checked rows are considered for export.
-- **READY:** calculated automatically after validation.
-- **WARNING:** explains what blocks export.
-- **SOURCE PAGE:** audit reference; it is not written to the import template.
+### Large manuals
 
-### Troubleshooting
-
-- **No candidate pages:** in Advanced settings, change page filtering to Conservative or Off.
-- **Repeated JSON recovery messages:** choose **Careful**, or reduce structuring batch and maximum characters in Advanced settings.
-- **Missing OCR pages or timeouts:** choose **Careful**, or reduce PDF pages per OCR request.
-- **Too many false spare parts:** use Strict page filtering and add a short manual-specific instruction.
-- **Part numbers changed:** add an instruction to preserve leading zeros, spaces, slashes, dots, and hyphens exactly.
-- **Large job:** process page ranges and download the audit workbook regularly. A redeploy or session reset clears in-memory results.
+For very large books, process page ranges such as `1-100`, `101-200`, and so on. Enable **Append to current review table** after the first range. Download the audit workbook regularly because an app restart clears in-memory data.
 
 ### Data handling
 
@@ -439,8 +568,12 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
         st.session_state.page_classification = pd.DataFrame()
         st.session_state.extraction_log = []
         st.session_state.spare_review = empty_review_dataframe()
+        st.session_state.submachinery_review = empty_submachinery_review_dataframe()
         st.session_state.output = None
+        st.session_state.prepared_email_subject = ""
+        st.session_state.prepared_email_body = ""
         st.session_state.editor_version += 1
+        st.session_state.submachinery_editor_version += 1
         st.rerun()
 
     st.divider()
@@ -450,7 +583,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
 **Spare Parts OCR Import Builder — v{APP_VERSION}**
 
 **Workflow**  
-Machinery → Upload → OCR → Page filtering → AI extraction → Review → Excel export
+Vessels → Main machinery → OCR → Auto-detected sub-machineries → Review → Excel export → Email draft
 
 **Supported sources**  
 Scanned PDFs, document URLs, images and image URLs.
@@ -462,7 +595,7 @@ The generated workbook should be tested with a small import batch before product
 
 
 # ---------------------------------------------------------------------------
-# Main machinery and optional sub-units
+# Vessel, main machinery, and detected sub-machineries
 # ---------------------------------------------------------------------------
 
 # Use the uploaded PDF name as the initial instruction-book value, without
@@ -477,9 +610,50 @@ if (
     st.session_state.auto_instruction_book_source = source_file.name
 
 
+def selected_vessel_names() -> list[str]:
+    selected = [
+        str(value).strip()
+        for value in st.session_state.get("selected_vessels", [])
+        if str(value).strip()
+    ]
+    additional_text = str(st.session_state.get("additional_vessels_text", ""))
+    additional = [
+        item.strip()
+        for item in additional_text.replace(";", "\n").replace(",", "\n").splitlines()
+        if item.strip()
+    ]
+    return list(dict.fromkeys(selected + additional))
+
+
+def current_main_row() -> dict[str, str]:
+    return {
+        "CODE": st.session_state.main_code,
+        "NAME": st.session_state.main_name,
+        "MAKER": st.session_state.main_maker,
+        "MODEL": st.session_state.main_model,
+        "TYPE": st.session_state.main_type,
+        "INSTR.BOOK": st.session_state.main_instruction_book,
+        "SPECIFICATIONS": st.session_state.main_specifications,
+        "MCH_TP(M/S/U)": "Main Machinery",
+    }
+
+
+def current_submachinery_rows() -> pd.DataFrame:
+    return included_submachinery_rows(st.session_state.submachinery_review)
+
+
+def current_machinery_frame() -> pd.DataFrame:
+    return machinery_rows_from_main_and_additional(
+        current_main_row(),
+        current_submachinery_rows(),
+    )
+
+
 def main_machinery_is_ready() -> bool:
     required_keys = ("main_code", "main_name", "main_maker", "main_model")
-    return all(str(st.session_state.get(key, "")).strip() for key in required_keys)
+    return bool(selected_vessel_names()) and all(
+        str(st.session_state.get(key, "")).strip() for key in required_keys
+    )
 
 
 machinery_tab, input_tab, review_tab, export_tab = st.tabs(
@@ -487,29 +661,85 @@ machinery_tab, input_tab, review_tab, export_tab = st.tabs(
 )
 
 with machinery_tab:
-    st.subheader("Step 1 — Main machinery")
+    st.subheader("Step 1 — Vessel assignment")
+    st.multiselect(
+        "Vessel(s) *",
+        options=VESSEL_OPTIONS,
+        key="selected_vessels",
+        placeholder="Search and select one or more vessels",
+        help=(
+            "The vessel selection is used in the audit file, output filename, and "
+            "email draft. It is not written into the import workbook."
+        ),
+    )
+    with st.expander("Additional vessel(s) not in the list", expanded=False):
+        st.text_area(
+            "Enter one vessel per line",
+            key="additional_vessels_text",
+            height=90,
+            help="Use only for vessels that are not yet present in vessels.csv.",
+        )
+    vessels = selected_vessel_names()
+    if vessels:
+        st.success(f"Selected vessel(s): {', '.join(vessels)}")
+    else:
+        st.warning("Select at least one vessel before running OCR.")
+
+    st.subheader("Main machinery")
     st.info(
-        "Requires CODE, NAME, MAKER, MODEL and MCH_TP. The app fixes the "
-        "main row's MCH_TP to 'Main Machinery'."
+        "Enter the main machinery once. The app will detect the sub-machinery/table "
+        "headings during OCR and propose the remaining machinery rows automatically."
     )
 
     row1 = st.columns(4)
     with row1[0]:
-        st.text_input("CODE *", key="main_code", placeholder="M/E", help="Required machinery code written to sheet 1.")
+        st.text_input(
+            "CODE *",
+            key="main_code",
+            placeholder="M/E",
+            help="Required main-machinery code written to sheet 1.",
+        )
     with row1[1]:
-        st.text_input("NAME *", key="main_name", placeholder="Main Engine", help="Required. Spare-part MACHINERY values must match this name exactly.")
+        st.text_input(
+            "NAME *",
+            key="main_name",
+            placeholder="Main Engine",
+            help="Required main-machinery name.",
+        )
     with row1[2]:
-        st.text_input("MAKER *", key="main_maker", placeholder="Sulzer", help="Required machinery manufacturer.")
+        st.text_input(
+            "MAKER *",
+            key="main_maker",
+            placeholder="MAN",
+            help="Required manufacturer, normally found on the first pages/nameplate.",
+        )
     with row1[3]:
-        st.text_input("MODEL *", key="main_model", placeholder="RTA 56", help="Required machinery model.")
+        st.text_input(
+            "MODEL *",
+            key="main_model",
+            placeholder="6S50MC-C",
+            help="Required model, normally found on the first pages/nameplate.",
+        )
 
     row2 = st.columns(3)
     with row2[0]:
-        st.text_input("TYPE", key="main_type", help="Optional type or variant from the manual/nameplate.")
+        st.text_input(
+            "TYPE",
+            key="main_type",
+            help="Optional type or variant from the manual/nameplate.",
+        )
     with row2[1]:
-        st.text_input("INSTR.BOOK", key="main_instruction_book", help="Instruction-book/manual reference. The uploaded PDF filename is filled automatically when empty.")
+        st.text_input(
+            "INSTR.BOOK",
+            key="main_instruction_book",
+            help="The uploaded PDF filename is filled automatically when this is empty.",
+        )
     with row2[2]:
-        st.text_input("SPECIFICATIONS", key="main_specifications", help="Optional technical specifications or distinguishing information.")
+        st.text_input(
+            "SPECIFICATIONS",
+            key="main_specifications",
+            help="Optional technical specifications or distinguishing information.",
+        )
 
     st.text_input(
         "MCH_TP(M/S/U)",
@@ -518,69 +748,172 @@ with machinery_tab:
         key="fixed_main_machinery_type",
     )
 
-    st.subheader("Optional sub-machineries")
+    st.divider()
+    st.subheader("Detected sub-machineries")
     st.caption(
-        "Add rows only when spare parts must refer to a sub-machinery instead "
-        "of the main machinery. Every added row is automatically classified as SubMachinery."
+        "After OCR, the app groups the titles found above spare-parts tables. Review "
+        "the proposed names, codes, source-page ranges, and variants before export."
     )
 
-    # Normalize any existing rows from older app versions.
-    additional_frame = st.session_state.additional_machinery.copy()
-    if not additional_frame.empty:
-        additional_frame["MCH_TP(M/S/U)"] = "SubMachinery"
-        st.session_state.additional_machinery = additional_frame
+    # Normalize state after upgrades or older sessions.
+    sub_frame = st.session_state.submachinery_review.copy()
+    for column in SUBMACHINERY_REVIEW_COLUMNS:
+        if column not in sub_frame.columns:
+            sub_frame[column] = False if column == "INCLUDE" else ""
+    if not sub_frame.empty:
+        sub_frame = sub_frame[SUBMACHINERY_REVIEW_COLUMNS]
+        sub_frame["MCH_TP(M/S/U)"] = "SubMachinery"
+    st.session_state.submachinery_review = sub_frame
 
-    button_cols = st.columns([1, 1, 3])
-    with button_cols[0]:
-        if st.button("Add sub-machinery", use_container_width=True):
-            new_row = {column: "" for column in MACHINERY_COLUMNS}
-            new_row["MCH_TP(M/S/U)"] = "SubMachinery"
-            st.session_state.additional_machinery = pd.concat(
-                [
-                    st.session_state.additional_machinery,
-                    pd.DataFrame([new_row], columns=MACHINERY_COLUMNS),
-                ],
-                ignore_index=True,
+    sub_action_cols = st.columns([1.25, 1.5, 1.5, 1.1])
+    with sub_action_cols[0]:
+        if st.button("Add manual sub-machinery", use_container_width=True):
+            st.session_state.submachinery_review = add_manual_submachinery_candidate(
+                st.session_state.submachinery_review,
+                current_main_row(),
             )
-            st.session_state.submachinery_editor_version = (
-                st.session_state.get("submachinery_editor_version", 0) + 1
+            st.session_state.submachinery_editor_version += 1
+            st.rerun()
+    with sub_action_cols[1]:
+        if st.button(
+            "Fill missing details from main",
+            use_container_width=True,
+            disabled=st.session_state.submachinery_review.empty,
+        ):
+            frame = st.session_state.submachinery_review.copy()
+            defaults = current_main_row()
+            for column in ("MAKER", "MODEL", "INSTR.BOOK"):
+                blank = frame[column].astype(str).str.strip().eq("")
+                frame.loc[blank, column] = defaults[column]
+            frame["MCH_TP(M/S/U)"] = "SubMachinery"
+            st.session_state.submachinery_review = frame
+            st.session_state.submachinery_editor_version += 1
+            st.rerun()
+    with sub_action_cols[2]:
+        if st.button(
+            "Apply approved assignments to spare parts",
+            use_container_width=True,
+            disabled=(
+                st.session_state.submachinery_review.empty
+                or st.session_state.spare_review.empty
+            ),
+            help=(
+                "Applies included proposal names to linked spare-part rows. Run this "
+                "after renaming or excluding sub-machineries."
+            ),
+        ):
+            st.session_state.spare_review = apply_submachinery_assignments(
+                st.session_state.spare_review,
+                st.session_state.submachinery_review,
+                st.session_state.main_name,
+                overwrite_auto_assignments=True,
             )
+            st.session_state.editor_version += 1
+            st.success("Approved sub-machinery assignments were applied.")
+    with sub_action_cols[3]:
+        if st.button(
+            "Clear proposals",
+            use_container_width=True,
+            disabled=st.session_state.submachinery_review.empty,
+        ):
+            st.session_state.submachinery_review = empty_submachinery_review_dataframe()
+            st.session_state.submachinery_editor_version += 1
             st.rerun()
 
-    with button_cols[1]:
-        if st.button("Clear sub-machineries", use_container_width=True):
-            st.session_state.additional_machinery = empty_additional_machinery_dataframe()
-            st.session_state.submachinery_editor_version = (
-                st.session_state.get("submachinery_editor_version", 0) + 1
-            )
-            st.rerun()
-
-    if st.session_state.additional_machinery.empty:
-        st.info("No sub-machineries added yet. Select **Add sub-machinery** to create a row.")
+    if st.session_state.submachinery_review.empty:
+        st.info(
+            "No sub-machineries detected yet. Complete the main machinery, upload the "
+            "manual, and run OCR. Proposals will appear here automatically."
+        )
     else:
-        additional_editor = st.data_editor(
-            st.session_state.additional_machinery,
-            key=f"additional_machinery_editor_{st.session_state.get('submachinery_editor_version', 0)}",
+        candidate_frame = st.session_state.submachinery_review
+        candidate_metrics = st.columns(4)
+        candidate_metrics[0].metric("Proposals", len(candidate_frame))
+        candidate_metrics[1].metric(
+            "Included", int(candidate_frame["INCLUDE"].astype(bool).sum())
+        )
+        candidate_metrics[2].metric(
+            "Linked parts",
+            int(pd.to_numeric(candidate_frame["PARTS FOUND"], errors="coerce").fillna(0).sum()),
+        )
+        candidate_metrics[3].metric(
+            "Low confidence",
+            int(
+                (
+                    pd.to_numeric(candidate_frame["CONFIDENCE"], errors="coerce").fillna(0)
+                    < 0.75
+                ).sum()
+            ),
+        )
+
+        edited_submachineries = st.data_editor(
+            candidate_frame,
+            key=(
+                "submachinery_editor_"
+                f"{st.session_state.submachinery_editor_version}"
+            ),
             num_rows="fixed",
             use_container_width=True,
             hide_index=True,
-            disabled=["MCH_TP(M/S/U)"],
+            height=430,
+            disabled=[
+                "MCH_TP(M/S/U)",
+                "FIRST PAGE",
+                "LAST PAGE",
+                "PARTS FOUND",
+                "CONFIDENCE",
+                "VARIANTS",
+                "ORIGIN",
+            ],
             column_config={
-                "CODE": st.column_config.TextColumn("CODE", help="Sub-machinery code."),
-                "NAME": st.column_config.TextColumn("NAME", help="Sub-machinery name used by spare-part rows."),
-                "MAKER": st.column_config.TextColumn("MAKER"),
-                "MODEL": st.column_config.TextColumn("MODEL"),
-                "TYPE": st.column_config.TextColumn("TYPE"),
-                "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK"),
-                "SPECIFICATIONS": st.column_config.TextColumn("SPECIFICATIONS"),
-                "MCH_TP(M/S/U)": st.column_config.TextColumn(
-                    "MCH_TP(M/S/U)",
-                    help="Automatically fixed to SubMachinery.",
+                "INCLUDE": st.column_config.CheckboxColumn(
+                    "INCLUDE",
+                    help="Only included rows are written to the machinery sheet.",
+                    default=True,
                 ),
+                "CODE": st.column_config.TextColumn("CODE", width="small"),
+                "NAME": st.column_config.TextColumn(
+                    "NAME",
+                    width="large",
+                    help="Canonical sub-machinery name used by linked spare parts.",
+                ),
+                "MAKER": st.column_config.TextColumn("MAKER", width="medium"),
+                "MODEL": st.column_config.TextColumn("MODEL", width="medium"),
+                "TYPE": st.column_config.TextColumn("TYPE", width="medium"),
+                "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK", width="medium"),
+                "SPECIFICATIONS": st.column_config.TextColumn(
+                    "SPECIFICATIONS", width="medium"
+                ),
+                "MCH_TP(M/S/U)": st.column_config.TextColumn(
+                    "MCH_TP(M/S/U)", width="small"
+                ),
+                "FIRST PAGE": st.column_config.NumberColumn(
+                    "FIRST PAGE", format="%d", width="small"
+                ),
+                "LAST PAGE": st.column_config.NumberColumn(
+                    "LAST PAGE", format="%d", width="small"
+                ),
+                "PARTS FOUND": st.column_config.NumberColumn(
+                    "PARTS FOUND", format="%d", width="small"
+                ),
+                "CONFIDENCE": st.column_config.ProgressColumn(
+                    "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
+                ),
+                "VARIANTS": st.column_config.TextColumn(
+                    "VARIANTS", width="large"
+                ),
+                "DETECTION KEYS": None,
+                "ORIGIN": st.column_config.TextColumn("ORIGIN", width="small"),
             },
         )
-        additional_editor["MCH_TP(M/S/U)"] = "SubMachinery"
-        st.session_state.additional_machinery = additional_editor.copy()
+        edited_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
+        st.session_state.submachinery_review = edited_submachineries[
+            SUBMACHINERY_REVIEW_COLUMNS
+        ].copy()
+        st.caption(
+            "The page range lets the reviewer open the same location in the original "
+            "PDF on a second monitor. After edits, use Apply approved assignments."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -742,29 +1075,53 @@ with input_tab:
                             subset=["SOURCE PAGE"],
                             keep="last",
                         ).sort_values("SOURCE PAGE")
-                    st.session_state.page_classification = combined_classification.reset_index(drop=True)
+                    st.session_state.page_classification = (
+                        combined_classification.reset_index(drop=True)
+                    )
                     st.session_state.extraction_log = list(
                         dict.fromkeys(
                             list(st.session_state.extraction_log) + extraction_messages
                         )
                     )
-                    st.session_state.spare_review = merge_review_dataframes(
+                    combined_review = merge_review_dataframes(
                         st.session_state.spare_review,
                         new_review,
                     )
+                    previous_candidates = st.session_state.submachinery_review
                 else:
                     st.session_state.extracted_pages = list(extracted_pages)
                     st.session_state.page_classification = classification_frame
                     st.session_state.extraction_log = extraction_messages
-                    st.session_state.spare_review = new_review
+                    combined_review = new_review
+                    previous_candidates = empty_submachinery_review_dataframe()
 
+                detected_candidates = build_submachinery_candidates(
+                    combined_review,
+                    current_main_row(),
+                )
+                merged_candidates = merge_submachinery_candidates(
+                    previous_candidates,
+                    detected_candidates,
+                )
+                assigned_review = apply_submachinery_assignments(
+                    combined_review,
+                    merged_candidates,
+                    st.session_state.main_name,
+                    overwrite_auto_assignments=False,
+                )
+
+                st.session_state.submachinery_review = merged_candidates
+                st.session_state.spare_review = assigned_review
+                st.session_state.submachinery_editor_version += 1
                 st.session_state.editor_version += 1
                 st.session_state.output = None
                 progress_bar.progress(1.0, text="OCR and extraction complete")
                 st.success(
                     f"OCR processed {len(extracted_pages)} page(s); "
                     f"{len(candidate_pages)} were structured, {skipped_count} were skipped, "
-                    f"and {len(new_review)} candidate spare-part row(s) were created."
+                    f"and {len(new_review)} candidate spare-part row(s) were created. "
+                    f"The app currently has {len(st.session_state.submachinery_review)} "
+                    "sub-machinery proposal(s) for review."
                 )
                 for message in extraction_messages:
                     if message.startswith("Recovered") or "recovered" in message.lower():
@@ -833,39 +1190,22 @@ with input_tab:
 # Spare-parts review
 # ---------------------------------------------------------------------------
 
-
-def current_main_row() -> dict[str, str]:
-    return {
-        "CODE": st.session_state.main_code,
-        "NAME": st.session_state.main_name,
-        "MAKER": st.session_state.main_maker,
-        "MODEL": st.session_state.main_model,
-        "TYPE": st.session_state.main_type,
-        "INSTR.BOOK": st.session_state.main_instruction_book,
-        "SPECIFICATIONS": st.session_state.main_specifications,
-        "MCH_TP(M/S/U)": "Main Machinery",
-    }
-
-
-def current_machinery_frame() -> pd.DataFrame:
-    return machinery_rows_from_main_and_additional(
-        current_main_row(),
-        st.session_state.additional_machinery,
-    )
-
-
 with review_tab:
     st.subheader("Step 3 — Review and correct candidate rows")
     st.caption(
-        "The table opens on rows that need correction. Filter and sort instantly, "
-        "edit the visible rows, and the app writes those changes back to the complete dataset."
+        "Start with blocked rows, then inspect sub-machinery assignments and low-confidence "
+        "identifiers. Source-page references are retained for quick navigation in the PDF."
     )
 
     if st.session_state.spare_review.empty:
         st.info("Run OCR first. Candidate spare-parts rows will appear here.")
     else:
         machinery_frame = current_machinery_frame()
-        valid_machinery_names = machinery_frame["NAME"].tolist()
+        valid_machinery_names = [
+            str(name).strip()
+            for name in machinery_frame["NAME"].tolist()
+            if str(name).strip()
+        ]
 
         full_status = recalculate_review_status(
             st.session_state.spare_review,
@@ -876,37 +1216,67 @@ with review_tab:
 
         included_mask = full_status["INCLUDE"].astype(bool)
         ready_mask = full_status["READY"].astype(bool)
-        confidence_values = pd.to_numeric(full_status["CONFIDENCE"], errors="coerce").fillna(0.0)
+        confidence_values = pd.to_numeric(
+            full_status["CONFIDENCE"], errors="coerce"
+        ).fillna(0.0)
         threshold = float(st.session_state.review_confidence_threshold)
+        detected_mask = full_status["DETECTED MACHINERY"].astype(str).str.strip().ne("")
+        assignment_values = full_status["ASSIGNMENT SOURCE"].astype(str)
+        submachinery_review_mask = (
+            included_mask
+            & detected_mask
+            & assignment_values.eq("Main machinery default")
+        )
 
         counts = {
             "Needs correction": int((included_mask & ~ready_mask).sum()),
-            "Low confidence": int((included_mask & (confidence_values < threshold)).sum()),
+            "Sub-machinery review": int(submachinery_review_mask.sum()),
+            "Low confidence": int(
+                (included_mask & (confidence_values < threshold)).sum()
+            ),
             "Ready": int((included_mask & ready_mask).sum()),
             "Excluded": int((~included_mask).sum()),
             "All rows": len(full_status),
         }
 
-        metric_cols = st.columns(5)
+        metric_cols = st.columns(6)
         metric_cols[0].metric("Candidates", len(full_status))
         metric_cols[1].metric("Included", int(included_mask.sum()))
         metric_cols[2].metric("Ready", counts["Ready"])
         metric_cols[3].metric("Needs correction", counts["Needs correction"])
-        metric_cols[4].metric("Low confidence", counts["Low confidence"])
+        metric_cols[4].metric(
+            "Sub-machinery review", counts["Sub-machinery review"]
+        )
+        metric_cols[5].metric("Low confidence", counts["Low confidence"])
 
         toolbar = st.columns([1.5, 1.5, 1, 1])
         with toolbar[0]:
             review_filter = st.selectbox(
                 "View",
-                ["Needs correction", "Low confidence", "Ready", "Excluded", "All rows"],
+                [
+                    "Needs correction",
+                    "Sub-machinery review",
+                    "Low confidence",
+                    "Ready",
+                    "Excluded",
+                    "All rows",
+                ],
                 key="review_filter",
                 format_func=lambda value: f"{value} ({counts[value]})",
-                help="Needs correction is the recommended default for fast quality control.",
+                help="Needs correction is the recommended starting view.",
             )
         with toolbar[1]:
             review_sort = st.selectbox(
                 "Sort by",
-                ["Issues first", "Lowest confidence", "Source page", "Part number", "Description"],
+                [
+                    "Issues first",
+                    "Lowest confidence",
+                    "Source page",
+                    "Section start page",
+                    "Machinery",
+                    "Part number",
+                    "Description",
+                ],
                 key="review_sort",
             )
         with toolbar[2]:
@@ -917,7 +1287,7 @@ with review_tab:
                 step=0.05,
                 format="%.2f",
                 key="review_confidence_threshold",
-                help="Rows below this confidence appear in the Low confidence view.",
+                help="Rows below this confidence appear in Low confidence.",
             )
         with toolbar[3]:
             st.write("")
@@ -928,8 +1298,12 @@ with review_tab:
 
         if review_filter == "Needs correction":
             visible = full_status.loc[included_mask & ~ready_mask].copy()
+        elif review_filter == "Sub-machinery review":
+            visible = full_status.loc[submachinery_review_mask].copy()
         elif review_filter == "Low confidence":
-            visible = full_status.loc[included_mask & (confidence_values < threshold)].copy()
+            visible = full_status.loc[
+                included_mask & (confidence_values < threshold)
+            ].copy()
         elif review_filter == "Ready":
             visible = full_status.loc[included_mask & ready_mask].copy()
         elif review_filter == "Excluded":
@@ -946,32 +1320,63 @@ with review_tab:
                 na_position="last",
             ).drop(columns=["_ISSUE_RANK"])
         elif review_sort == "Lowest confidence":
-            visible = visible.sort_values("CONFIDENCE", ascending=True, na_position="last")
+            visible = visible.sort_values(
+                "CONFIDENCE", ascending=True, na_position="last"
+            )
         elif review_sort == "Source page":
-            visible = visible.sort_values("SOURCE PAGE", ascending=True, na_position="last")
+            visible = visible.sort_values(
+                "SOURCE PAGE", ascending=True, na_position="last"
+            )
+        elif review_sort == "Section start page":
+            visible = visible.sort_values(
+                ["SECTION START PAGE", "SOURCE PAGE"],
+                ascending=True,
+                na_position="last",
+            )
+        elif review_sort == "Machinery":
+            visible = visible.sort_values(
+                ["MACHINERY", "SOURCE PAGE"],
+                key=lambda series: series.astype(str).str.upper(),
+            )
         elif review_sort == "Part number":
-            visible = visible.sort_values("PART NO", key=lambda s: s.astype(str).str.upper())
+            visible = visible.sort_values(
+                "PART NO", key=lambda series: series.astype(str).str.upper()
+            )
         elif review_sort == "Description":
-            visible = visible.sort_values("DESCRIPTION", key=lambda s: s.astype(str).str.upper())
+            visible = visible.sort_values(
+                "DESCRIPTION", key=lambda series: series.astype(str).str.upper()
+            )
 
         action_cols = st.columns([1.4, 1.4, 1.4, 1.2, 1.2])
         with action_cols[0]:
-            if st.button("Use main machinery for visible", use_container_width=True, disabled=visible.empty):
+            if st.button(
+                "Use main machinery for visible",
+                use_container_width=True,
+                disabled=visible.empty,
+            ):
                 frame = st.session_state.spare_review.copy()
-                frame.loc[visible["_ROW_ID"], "MACHINERY"] = st.session_state.main_name
+                row_ids = visible["_ROW_ID"].tolist()
+                frame.loc[row_ids, "MACHINERY"] = st.session_state.main_name
+                frame.loc[row_ids, "ASSIGNMENT SOURCE"] = "Manual bulk assignment"
                 st.session_state.spare_review = frame
                 st.session_state.editor_version += 1
                 st.rerun()
         with action_cols[1]:
             visible_machinery = st.selectbox(
                 "Set visible machinery",
-                [""] + [name for name in valid_machinery_names if str(name).strip()],
+                [""] + valid_machinery_names,
                 key="bulk_visible_machinery",
                 label_visibility="collapsed",
             )
-            if st.button("Apply machinery", use_container_width=True, disabled=visible.empty or not visible_machinery):
+            if st.button(
+                "Apply machinery",
+                use_container_width=True,
+                disabled=visible.empty or not visible_machinery,
+            ):
                 frame = st.session_state.spare_review.copy()
-                frame.loc[visible["_ROW_ID"], "MACHINERY"] = visible_machinery
+                row_ids = visible["_ROW_ID"].tolist()
+                frame.loc[row_ids, "MACHINERY"] = visible_machinery
+                frame.loc[row_ids, "ASSIGNMENT SOURCE"] = "Manual bulk assignment"
                 st.session_state.spare_review = frame
                 st.session_state.editor_version += 1
                 st.rerun()
@@ -982,23 +1387,31 @@ with review_tab:
                 key="bulk_visible_unit",
                 label_visibility="collapsed",
             )
-            if st.button("Apply unit", use_container_width=True, disabled=visible.empty):
+            if st.button(
+                "Apply unit",
+                use_container_width=True,
+                disabled=visible.empty,
+            ):
                 frame = st.session_state.spare_review.copy()
-                frame.loc[visible["_ROW_ID"], "UNIT"] = visible_unit
+                frame.loc[visible["_ROW_ID"].tolist(), "UNIT"] = visible_unit
                 st.session_state.spare_review = frame
                 st.session_state.editor_version += 1
                 st.rerun()
         with action_cols[3]:
-            if st.button("Include visible", use_container_width=True, disabled=visible.empty):
+            if st.button(
+                "Include visible", use_container_width=True, disabled=visible.empty
+            ):
                 frame = st.session_state.spare_review.copy()
-                frame.loc[visible["_ROW_ID"], "INCLUDE"] = True
+                frame.loc[visible["_ROW_ID"].tolist(), "INCLUDE"] = True
                 st.session_state.spare_review = frame
                 st.session_state.editor_version += 1
                 st.rerun()
         with action_cols[4]:
-            if st.button("Exclude visible", use_container_width=True, disabled=visible.empty):
+            if st.button(
+                "Exclude visible", use_container_width=True, disabled=visible.empty
+            ):
                 frame = st.session_state.spare_review.copy()
-                frame.loc[visible["_ROW_ID"], "INCLUDE"] = False
+                frame.loc[visible["_ROW_ID"].tolist(), "INCLUDE"] = False
                 st.session_state.spare_review = frame
                 st.session_state.editor_version += 1
                 st.rerun()
@@ -1010,10 +1423,53 @@ with review_tab:
                 st.info(f"No rows match the {review_filter.lower()} view.")
         else:
             st.info(f"Showing {len(visible)} of {len(full_status)} total rows.")
+
+            source_pages = sorted(
+                {
+                    int(value)
+                    for value in pd.to_numeric(
+                        visible["SOURCE PAGE"], errors="coerce"
+                    ).dropna()
+                }
+            )
+            if source_pages:
+                with st.expander("Source page quick lookup", expanded=False):
+                    page_choice = st.selectbox(
+                        "Source page",
+                        source_pages,
+                        key=(
+                            f"source_page_lookup_{review_filter}_"
+                            f"{st.session_state.editor_version}"
+                        ),
+                        help=(
+                            "Open the original PDF at the same page on the second "
+                            "monitor, or inspect the OCR text here."
+                        ),
+                    )
+                    page_markdown = next(
+                        (
+                            markdown
+                            for page, markdown in st.session_state.extracted_pages
+                            if int(page) == int(page_choice)
+                        ),
+                        "",
+                    )
+                    st.caption(
+                        f"Navigate to page {page_choice} in the original PDF for visual verification."
+                    )
+                    if page_markdown:
+                        st.markdown(page_markdown)
+                    else:
+                        st.info("OCR text for this page is not available in the current session.")
+
             editor_source = visible.drop(columns=["_ROW_ID"])
+            original_machinery = editor_source["MACHINERY"].astype(str).copy()
             edited_visible = st.data_editor(
                 editor_source,
-                key=f"spare_editor_{st.session_state.editor_version}_{review_filter}_{review_sort}",
+                key=(
+                    f"spare_editor_{st.session_state.editor_version}_"
+                    f"{review_filter}_{review_sort}"
+                ),
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
@@ -1021,38 +1477,78 @@ with review_tab:
                 disabled=[
                     "READY",
                     "SOURCE PAGE",
+                    "SECTION START PAGE",
+                    "TABLE TITLE",
                     "CONFIDENCE",
                     "DETECTED MACHINERY",
+                    "ASSIGNMENT SOURCE",
                     "WARNING",
                 ],
                 column_config={
-                    "INCLUDE": st.column_config.CheckboxColumn("INCLUDE", default=True),
-                    "READY": st.column_config.CheckboxColumn("READY", disabled=True),
+                    "INCLUDE": st.column_config.CheckboxColumn(
+                        "INCLUDE", default=True
+                    ),
+                    "READY": st.column_config.CheckboxColumn(
+                        "READY", disabled=True
+                    ),
                     "MACHINERY": st.column_config.SelectboxColumn(
                         "MACHINERY",
-                        options=[name for name in valid_machinery_names if str(name).strip()],
-                        help="Must match a machinery name entered in step 1.",
+                        options=valid_machinery_names,
+                        help="Must match an included machinery name from step 1.",
                         width="medium",
                     ),
-                    "PART NO": st.column_config.TextColumn("PART NO", width="medium"),
-                    "DESCRIPTION": st.column_config.TextColumn("DESCRIPTION", width="large"),
+                    "PART NO": st.column_config.TextColumn(
+                        "PART NO", width="medium"
+                    ),
+                    "DESCRIPTION": st.column_config.TextColumn(
+                        "DESCRIPTION", width="large"
+                    ),
                     "CODE": st.column_config.TextColumn("CODE", width="medium"),
-                    "ITEM NO": st.column_config.TextColumn("ITEM NO", width="small"),
-                    "UNIT": st.column_config.SelectboxColumn("UNIT", options=UNIT_OPTIONS),
-                    "QNT": st.column_config.NumberColumn("QNT", min_value=0, step=1),
-                    "SOURCE PAGE": st.column_config.NumberColumn("SOURCE PAGE", format="%d"),
+                    "ITEM NO": st.column_config.TextColumn(
+                        "ITEM NO", width="small"
+                    ),
+                    "UNIT": st.column_config.SelectboxColumn(
+                        "UNIT", options=UNIT_OPTIONS
+                    ),
+                    "QNT": st.column_config.NumberColumn(
+                        "QNT", min_value=0, step=1
+                    ),
+                    "SOURCE PAGE": st.column_config.NumberColumn(
+                        "SOURCE PAGE", format="%d", width="small"
+                    ),
+                    "SECTION START PAGE": st.column_config.NumberColumn(
+                        "SECTION START PAGE", format="%d", width="small"
+                    ),
+                    "TABLE TITLE": st.column_config.TextColumn(
+                        "TABLE TITLE", width="large"
+                    ),
                     "CONFIDENCE": st.column_config.ProgressColumn(
                         "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
                     ),
                     "DETECTED MACHINERY": st.column_config.TextColumn(
                         "DETECTED MACHINERY", width="medium"
                     ),
-                    "WARNING": st.column_config.TextColumn("WARNING", width="large"),
+                    "ASSIGNMENT SOURCE": st.column_config.TextColumn(
+                        "ASSIGNMENT SOURCE", width="medium"
+                    ),
+                    "WARNING": st.column_config.TextColumn(
+                        "WARNING", width="large"
+                    ),
                 },
             )
 
+            machinery_changed = (
+                edited_visible["MACHINERY"].astype(str).reset_index(drop=True)
+                != original_machinery.reset_index(drop=True)
+            )
+            edited_visible.loc[
+                machinery_changed.to_numpy(), "ASSIGNMENT SOURCE"
+            ] = "Manual assignment"
+
             updated_full = st.session_state.spare_review.copy()
-            updated_full.loc[visible["_ROW_ID"], REVIEW_COLUMNS] = edited_visible[REVIEW_COLUMNS].to_numpy()
+            updated_full.loc[
+                visible["_ROW_ID"].tolist(), REVIEW_COLUMNS
+            ] = edited_visible[REVIEW_COLUMNS].to_numpy()
             st.session_state.spare_review = recalculate_review_status(
                 updated_full,
                 valid_machinery_names=valid_machinery_names,
@@ -1060,29 +1556,87 @@ with review_tab:
             )
 
             st.caption(
-                "Corrections are saved immediately. After editing, select Refresh review "
-                "to remove rows that are now ready from the Needs correction view."
+                "Corrections are saved immediately. Select Refresh review after edits "
+                "to remove resolved rows from the current queue."
             )
 
 
 # ---------------------------------------------------------------------------
-# Template export
+# Template export, audit, and vessel email
 # ---------------------------------------------------------------------------
 
+
+def export_filename(vessels: list[str], machinery_code: str, machinery_name: str) -> str:
+    machinery_part = safe_filename(machinery_code or machinery_name or "spare_parts")
+    if len(vessels) == 1:
+        vessel_part = safe_filename(vessels[0])
+    elif len(vessels) == 2:
+        vessel_part = "_".join(safe_filename(value) for value in vessels)
+    else:
+        vessel_part = f"{len(vessels)}_vessels"
+    return f"{vessel_part}_{machinery_part}_import.xlsx"
+
+
+def build_email_content(
+    vessels: list[str],
+    machinery_frame: pd.DataFrame,
+    ready_rows: int,
+) -> tuple[str, str]:
+    vessel_subject = vessels[0] if len(vessels) == 1 else f"{len(vessels)} vessels"
+    machinery_name = st.session_state.main_name or st.session_state.main_code
+    subject = f"Spare Parts Import - {machinery_name} - {vessel_subject}"
+    vessel_lines = "\n".join(f"- {vessel}" for vessel in vessels)
+    sub_count = max(0, len(machinery_frame) - 1)
+    body = f"""Dear Support Team,
+
+Please find attached the spare-parts import workbook applicable to the following vessel(s):
+
+{vessel_lines}
+
+Main machinery: {st.session_state.main_name}
+Code: {st.session_state.main_code}
+Maker: {st.session_state.main_maker}
+Model: {st.session_state.main_model}
+Type: {st.session_state.main_type or '-'}
+Instruction book: {st.session_state.main_instruction_book or '-'}
+Included sub-machineries: {sub_count}
+Ready spare-part rows: {ready_rows}
+
+Please proceed with the corresponding import and let us know if any correction is required.
+
+Best regards,
+"""
+    return subject, body
+
+
 with export_tab:
-    st.subheader("Build import workbook")
+    st.subheader("Step 4 — Build import workbook")
+    vessels = selected_vessel_names()
+    if vessels:
+        st.info(
+            "Applicable vessel(s): " + ", ".join(vessels) +
+            ". Vessel names are used in the email and audit file, not in the import template."
+        )
+    else:
+        st.error("Select at least one vessel in step 1 before export.")
+
     st.markdown(
         "The app writes the reviewed data into the existing template as follows:\n\n"
         "- **1.Machineries|Sub|Units**, starting at row 5: CODE, NAME, MAKER, MODEL, "
         "TYPE, INSTR.BOOK, SPECIFICATIONS, MCH_TP(M/S/U).\n"
         "- **2.Spare Parts**, starting at row 4: MACHINERY, PART NO, DESCRIPTION, CODE, "
-        "ITEM NO, UNIT, QNT."
+        "ITEM NO, UNIT, QNT.\n\n"
+        "Source pages, detected headings, confidence values, vessels, and review notes "
+        "remain in the separate audit workbook."
     )
 
     clear_existing = st.checkbox(
         "Clear existing data rows in the template before writing",
         value=True,
-        help="Recommended when creating a new import file. Turn off only when intentionally adding to data already stored in the uploaded template.",
+        help=(
+            "Recommended for a new import file. Turn off only when intentionally "
+            "adding to records already stored in a replacement template."
+        ),
     )
     allow_duplicates = st.checkbox(
         "Allow possible duplicate spare-part rows",
@@ -1113,20 +1667,24 @@ with export_tab:
     else:
         st.error(f"Correct {len(blocked)} included row(s) before export.")
         st.dataframe(
-            blocked[[
-                "SOURCE PAGE",
-                "MACHINERY",
-                "PART NO",
-                "DESCRIPTION",
-                "ITEM NO",
-                "WARNING",
-            ]],
+            blocked[
+                [
+                    "SOURCE PAGE",
+                    "SECTION START PAGE",
+                    "MACHINERY",
+                    "PART NO",
+                    "DESCRIPTION",
+                    "ITEM NO",
+                    "WARNING",
+                ]
+            ],
             use_container_width=True,
             hide_index=True,
         )
 
     can_build = (
         template_bytes is not None
+        and bool(vessels)
         and not machinery_errors
         and not included.empty
         and blocked.empty
@@ -1145,15 +1703,22 @@ with export_tab:
                 review_frame=export_review,
                 clear_existing=clear_existing,
             )
-            name_source = (
-                st.session_state.main_code
-                or st.session_state.main_name
-                or "spare_parts"
+            st.session_state.output_name = export_filename(
+                vessels,
+                st.session_state.main_code,
+                st.session_state.main_name,
             )
-            output_name = safe_filename(name_source) + "_import.xlsx"
             st.session_state.output = output_bytes
-            st.session_state.output_name = output_name
-            st.success("Workbook created. Download it below and test a small import first.")
+            email_subject, email_body = build_email_content(
+                vessels,
+                machinery_frame,
+                len(included),
+            )
+            st.session_state.prepared_email_subject = email_subject
+            st.session_state.prepared_email_body = email_body
+            st.success(
+                "Workbook created. Download it below and test a small import first."
+            )
         except Exception as exc:
             st.error(f"Could not create the workbook: {exc}")
 
@@ -1167,6 +1732,34 @@ with export_tab:
             use_container_width=True,
         )
 
+        st.subheader("Prepared email")
+        if not st.session_state.prepared_email_subject or not st.session_state.prepared_email_body:
+            email_subject, email_body = build_email_content(
+                vessels,
+                machinery_frame,
+                len(included),
+            )
+            st.session_state.prepared_email_subject = email_subject
+            st.session_state.prepared_email_body = email_body
+        email_subject_value = st.text_input(
+            "Subject",
+            key="prepared_email_subject",
+        )
+        email_body_value = st.text_area(
+            "Body",
+            height=330,
+            key="prepared_email_body",
+            help="Review, copy, and paste this text into the email accompanying the workbook.",
+        )
+        email_text = f"Subject: {email_subject_value}\n\n{email_body_value}"
+        st.download_button(
+            "Download email draft",
+            data=email_text.encode("utf-8"),
+            file_name=safe_filename(st.session_state.output_name) + "_email.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
     if st.session_state.extracted_pages:
         audit_bytes = build_audit_workbook(
             st.session_state.extracted_pages,
@@ -1174,11 +1767,29 @@ with export_tab:
             export_review,
             page_classification=st.session_state.page_classification,
             extraction_log=st.session_state.extraction_log,
+            vessels=vessels,
+            submachinery_review=st.session_state.submachinery_review,
+            job_metadata={
+                "Main machinery code": st.session_state.main_code,
+                "Main machinery name": st.session_state.main_name,
+                "Maker": st.session_state.main_maker,
+                "Model": st.session_state.main_model,
+                "Type": st.session_state.main_type,
+                "Instruction book": st.session_state.main_instruction_book,
+                "Processing mode": st.session_state.processing_preset,
+                "OCR pages": len(st.session_state.extracted_pages),
+                "Included spare parts": len(included),
+            },
+        )
+        audit_name = (
+            safe_filename(st.session_state.output_name or st.session_state.main_name)
+            + "_OCR_audit.xlsx"
         )
         st.download_button(
             "Download OCR audit/review workbook",
             data=audit_bytes,
-            file_name="OCR_review_and_audit.xlsx",
+            file_name=audit_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
