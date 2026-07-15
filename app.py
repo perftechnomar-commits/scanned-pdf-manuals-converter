@@ -39,7 +39,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -289,6 +289,7 @@ def apply_processing_preset() -> None:
 initialize_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
+st.caption("Build 3.1 — vessel assignment and automatic sub-machinery detection enabled")
 
 
 # ---------------------------------------------------------------------------
