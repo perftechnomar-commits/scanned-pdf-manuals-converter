@@ -45,7 +45,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.0"
+APP_VERSION = "4.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -511,7 +511,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.0 — multi-PDF jobs with per-document vessel assignment")
+st.caption("Build 4.1 — stable review editing with explicit save")
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +550,8 @@ The AI reads the title above each spare-parts table and proposes sub-machineries
 - **CONFIDENCE:** average extraction confidence for that detected section.
 - **VARIANTS:** different spellings found in the manual.
 - Uncheck **INCLUDE** to reject a false detection, or edit **NAME** and **CODE** before applying assignments.
-- Use **Apply approved assignments to spare parts** after renaming, excluding, or merging proposals.
+- Edit several cells without interruption, then select **Save sub-machinery changes**.
+- Use **Apply approved assignments to spare parts** after saving, renaming, excluding, or merging proposals.
 
 ### Processing modes
 
@@ -1179,73 +1180,99 @@ with submachinery_tab:
             ),
         )
 
-        edited_submachineries = st.data_editor(
-            candidate_frame,
-            key=(
-                "submachinery_editor_"
-                f"{st.session_state.submachinery_editor_version}"
-            ),
-            num_rows="fixed",
-            use_container_width=True,
-            hide_index=True,
-            height=430,
-            disabled=[
-                "MCH_TP(M/S/U)",
-                "FIRST PAGE",
-                "LAST PAGE",
-                "PARTS FOUND",
-                "CONFIDENCE",
-                "VARIANTS",
-                "ORIGIN",
-            ],
-            column_config={
-                "INCLUDE": st.column_config.CheckboxColumn(
-                    "INCLUDE",
-                    help="Only included rows are written to the machinery sheet.",
-                    default=True,
-                ),
-                "CODE": st.column_config.TextColumn("CODE", width="small"),
-                "NAME": st.column_config.TextColumn(
-                    "NAME",
-                    width="large",
-                    help="Canonical sub-machinery name used by linked spare parts.",
-                ),
-                "MAKER": st.column_config.TextColumn("MAKER", width="medium"),
-                "MODEL": st.column_config.TextColumn("MODEL", width="medium"),
-                "TYPE": st.column_config.TextColumn("TYPE", width="medium"),
-                "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK", width="medium"),
-                "SPECIFICATIONS": st.column_config.TextColumn(
-                    "SPECIFICATIONS", width="medium"
-                ),
-                "MCH_TP(M/S/U)": st.column_config.TextColumn(
-                    "MCH_TP(M/S/U)", width="small"
-                ),
-                "FIRST PAGE": st.column_config.NumberColumn(
-                    "FIRST PAGE", format="%d", width="small"
-                ),
-                "LAST PAGE": st.column_config.NumberColumn(
-                    "LAST PAGE", format="%d", width="small"
-                ),
-                "PARTS FOUND": st.column_config.NumberColumn(
-                    "PARTS FOUND", format="%d", width="small"
-                ),
-                "CONFIDENCE": st.column_config.ProgressColumn(
-                    "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
-                ),
-                "VARIANTS": st.column_config.TextColumn(
-                    "VARIANTS", width="large"
-                ),
-                "DETECTION KEYS": None,
-                "ORIGIN": st.column_config.TextColumn("ORIGIN", width="small"),
-            },
+        active_job_id = str(st.session_state.get("loaded_job_id", "single"))
+        form_key = (
+            f"submachinery_edit_form_{active_job_id}_"
+            f"{st.session_state.submachinery_editor_version}"
         )
-        edited_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
-        st.session_state.submachinery_review = edited_submachineries[
-            SUBMACHINERY_REVIEW_COLUMNS
-        ].copy()
+        editor_key = (
+            f"submachinery_editor_{active_job_id}_"
+            f"{st.session_state.submachinery_editor_version}"
+        )
+
+        st.info(
+            "Edit as many cells as needed, including in full-screen view. Cell edits "
+            "are held without rerunning the app. Exit full-screen and select "
+            "**Save sub-machinery changes** once when finished."
+        )
+
+        with st.form(form_key, clear_on_submit=False, border=False):
+            edited_submachineries = st.data_editor(
+                candidate_frame,
+                key=editor_key,
+                num_rows="fixed",
+                use_container_width=True,
+                hide_index=True,
+                height=520,
+                disabled=[
+                    "MCH_TP(M/S/U)",
+                    "FIRST PAGE",
+                    "LAST PAGE",
+                    "PARTS FOUND",
+                    "CONFIDENCE",
+                    "VARIANTS",
+                    "ORIGIN",
+                ],
+                column_config={
+                    "INCLUDE": st.column_config.CheckboxColumn(
+                        "INCLUDE",
+                        help="Only included rows are written to the machinery sheet.",
+                        default=True,
+                    ),
+                    "CODE": st.column_config.TextColumn("CODE", width="small"),
+                    "NAME": st.column_config.TextColumn(
+                        "NAME",
+                        width="large",
+                        help="Canonical sub-machinery name used by linked spare parts.",
+                    ),
+                    "MAKER": st.column_config.TextColumn("MAKER", width="medium"),
+                    "MODEL": st.column_config.TextColumn("MODEL", width="medium"),
+                    "TYPE": st.column_config.TextColumn("TYPE", width="medium"),
+                    "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK", width="medium"),
+                    "SPECIFICATIONS": st.column_config.TextColumn(
+                        "SPECIFICATIONS", width="medium"
+                    ),
+                    "MCH_TP(M/S/U)": st.column_config.TextColumn(
+                        "MCH_TP(M/S/U)", width="small"
+                    ),
+                    "FIRST PAGE": st.column_config.NumberColumn(
+                        "FIRST PAGE", format="%d", width="small"
+                    ),
+                    "LAST PAGE": st.column_config.NumberColumn(
+                        "LAST PAGE", format="%d", width="small"
+                    ),
+                    "PARTS FOUND": st.column_config.NumberColumn(
+                        "PARTS FOUND", format="%d", width="small"
+                    ),
+                    "CONFIDENCE": st.column_config.ProgressColumn(
+                        "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
+                    ),
+                    "VARIANTS": st.column_config.TextColumn(
+                        "VARIANTS", width="large"
+                    ),
+                    "DETECTION KEYS": None,
+                    "ORIGIN": st.column_config.TextColumn("ORIGIN", width="small"),
+                },
+            )
+            save_submachinery_changes = st.form_submit_button(
+                "Save sub-machinery changes",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if save_submachinery_changes:
+            edited_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
+            st.session_state.submachinery_review = edited_submachineries[
+                SUBMACHINERY_REVIEW_COLUMNS
+            ].copy()
+            st.session_state.submachinery_editor_version += 1
+            save_loaded_job_state()
+            st.success("Sub-machinery changes saved.")
+            st.rerun()
+
         st.caption(
             "The page range lets the reviewer open the same location in the original "
-            "PDF on a second monitor. After edits, use Apply approved assignments."
+            "PDF on a second monitor. Save edits before using the action buttons above."
         )
 
 
