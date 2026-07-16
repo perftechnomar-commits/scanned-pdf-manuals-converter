@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import copy
+import hashlib
+import io
+import tempfile
+import uuid
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -39,7 +45,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "3.2"
+APP_VERSION = "4.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -261,10 +267,225 @@ def initialize_state() -> None:
         "source_page_lookup": 1,
         "prepared_email_subject": "",
         "prepared_email_body": "",
+        "active_page_spec": "all",
+        "append_results": False,
+        "document_jobs": {},
+        "session_token": uuid.uuid4().hex,
+        "loaded_job_id": "",
+        "active_document_id": "",
+        "active_document_selector": "",
+        "multi_package_output": None,
+        "multi_package_name": "multi_document_import_package.zip",
+        "multi_package_report": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+JOB_STATE_FIELDS = [
+    "extracted_pages",
+    "page_classification",
+    "extraction_log",
+    "spare_review",
+    "submachinery_review",
+    "selected_vessels",
+    "additional_vessels_text",
+    "output",
+    "output_name",
+    "editor_version",
+    "main_code",
+    "main_name",
+    "main_maker",
+    "main_model",
+    "main_type",
+    "main_instruction_book",
+    "main_specifications",
+    "auto_instruction_book_source",
+    "submachinery_editor_version",
+    "review_filter",
+    "review_sort",
+    "review_confidence_threshold",
+    "source_page_lookup",
+    "prepared_email_subject",
+    "prepared_email_body",
+    "active_page_spec",
+    "append_results",
+]
+
+JOB_STORAGE_DIR = Path(tempfile.gettempdir()) / "spare_parts_builder_jobs"
+JOB_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _clone_state_value(value):
+    if isinstance(value, pd.DataFrame):
+        return value.copy(deep=True)
+    return copy.deepcopy(value)
+
+
+def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: int) -> dict:
+    return {
+        "job_id": file_hash[:16],
+        "file_hash": file_hash,
+        "file_name": file_name,
+        "pdf_path": pdf_path,
+        "size_bytes": int(size_bytes),
+        "extracted_pages": [],
+        "page_classification": pd.DataFrame(),
+        "extraction_log": [],
+        "spare_review": empty_review_dataframe(),
+        "submachinery_review": empty_submachinery_review_dataframe(),
+        "selected_vessels": [],
+        "additional_vessels_text": "",
+        "output": None,
+        "output_name": "spare_parts.xlsx",
+        "editor_version": 0,
+        "main_code": "",
+        "main_name": "",
+        "main_maker": "",
+        "main_model": "",
+        "main_type": "",
+        "main_instruction_book": file_name,
+        "main_specifications": "",
+        "auto_instruction_book_source": file_name,
+        "submachinery_editor_version": 0,
+        "review_filter": "Needs correction",
+        "review_sort": "Issues first",
+        "review_confidence_threshold": 0.75,
+        "source_page_lookup": 1,
+        "prepared_email_subject": "",
+        "prepared_email_body": "",
+        "active_page_spec": "all",
+        "append_results": False,
+    }
+
+
+def save_loaded_job_state() -> None:
+    job_id = str(st.session_state.get("loaded_job_id", ""))
+    jobs = st.session_state.get("document_jobs", {})
+    if not job_id or job_id not in jobs:
+        return
+    job = jobs[job_id]
+    for field in JOB_STATE_FIELDS:
+        if field in st.session_state:
+            job[field] = _clone_state_value(st.session_state[field])
+    jobs[job_id] = job
+    st.session_state.document_jobs = jobs
+
+
+def load_document_job(job_id: str) -> None:
+    jobs = st.session_state.get("document_jobs", {})
+    if job_id not in jobs:
+        return
+    job = jobs[job_id]
+    for field in JOB_STATE_FIELDS:
+        if field in job:
+            st.session_state[field] = _clone_state_value(job[field])
+    st.session_state.loaded_job_id = job_id
+    st.session_state.active_document_id = job_id
+
+
+def register_uploaded_pdfs(uploaded_files) -> None:
+    if not uploaded_files:
+        return
+    jobs = st.session_state.get("document_jobs", {})
+    for uploaded in uploaded_files:
+        data = uploaded.getvalue()
+        file_hash = hashlib.sha256(data).hexdigest()
+        job_id = file_hash[:16]
+        session_token = str(st.session_state.get("session_token", "session"))
+        pdf_path = JOB_STORAGE_DIR / f"{session_token}_{file_hash}.pdf"
+        if not pdf_path.exists():
+            pdf_path.write_bytes(data)
+        if job_id not in jobs:
+            jobs[job_id] = _empty_job_state(
+                file_name=uploaded.name,
+                pdf_path=str(pdf_path),
+                file_hash=file_hash,
+                size_bytes=len(data),
+            )
+        else:
+            jobs[job_id]["file_name"] = uploaded.name
+            jobs[job_id]["pdf_path"] = str(pdf_path)
+            jobs[job_id]["size_bytes"] = len(data)
+    st.session_state.document_jobs = jobs
+
+
+def remove_document_job(job_id: str) -> None:
+    jobs = st.session_state.get("document_jobs", {})
+    job = jobs.pop(job_id, None)
+    if job:
+        pdf_path = Path(str(job.get("pdf_path", "")))
+        try:
+            if pdf_path.exists():
+                pdf_path.unlink()
+        except OSError:
+            pass
+    st.session_state.document_jobs = jobs
+    remaining = list(jobs)
+    next_job = remaining[0] if remaining else ""
+    st.session_state.loaded_job_id = ""
+    st.session_state.active_document_id = next_job
+    st.session_state.active_document_selector = next_job
+    if next_job:
+        load_document_job(next_job)
+
+
+class StoredPdf:
+    def __init__(self, file_name: str, pdf_path: str):
+        self.name = file_name
+        self._path = Path(pdf_path)
+
+    def getvalue(self) -> bytes:
+        return self._path.read_bytes()
+
+
+def active_document_job() -> dict | None:
+    job_id = str(st.session_state.get("loaded_job_id", ""))
+    return st.session_state.get("document_jobs", {}).get(job_id)
+
+
+def _job_vessels(job: dict) -> list[str]:
+    selected = [str(value).strip() for value in job.get("selected_vessels", []) if str(value).strip()]
+    additional_text = str(job.get("additional_vessels_text", ""))
+    additional = [
+        item.strip()
+        for item in additional_text.replace(";", "\n").replace(",", "\n").splitlines()
+        if item.strip()
+    ]
+    return list(dict.fromkeys(selected + additional))
+
+
+def _job_main_row(job: dict) -> dict[str, str]:
+    return {
+        "CODE": str(job.get("main_code", "")),
+        "NAME": str(job.get("main_name", "")),
+        "MAKER": str(job.get("main_maker", "")),
+        "MODEL": str(job.get("main_model", "")),
+        "TYPE": str(job.get("main_type", "")),
+        "INSTR.BOOK": str(job.get("main_instruction_book", "")),
+        "SPECIFICATIONS": str(job.get("main_specifications", "")),
+        "MCH_TP(M/S/U)": "Main Machinery",
+    }
+
+
+def _job_machinery_frame(job: dict) -> pd.DataFrame:
+    sub_frame = included_submachinery_rows(job.get("submachinery_review", empty_submachinery_review_dataframe()))
+    return machinery_rows_from_main_and_additional(_job_main_row(job), sub_frame)
+
+
+def _job_status(job: dict) -> tuple[str, int, int]:
+    review = job.get("spare_review", empty_review_dataframe())
+    rows = len(review) if isinstance(review, pd.DataFrame) else 0
+    sub_frame = job.get("submachinery_review", empty_submachinery_review_dataframe())
+    sub_count = len(sub_frame) if isinstance(sub_frame, pd.DataFrame) else 0
+    if job.get("output"):
+        return "Export created", rows, sub_count
+    if rows:
+        return "Review in progress", rows, sub_count
+    if job.get("extracted_pages"):
+        return "OCR complete", rows, sub_count
+    return "Not processed", rows, sub_count
 
 
 def get_secret(name: str) -> str:
@@ -287,9 +508,10 @@ def apply_processing_preset() -> None:
 
 
 initialize_state()
+save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 3.2 — dedicated sub-machinery review and clearer spare-parts assignment")
+st.caption("Build 4.0 — multi-PDF jobs with per-document vessel assignment")
 
 
 # ---------------------------------------------------------------------------
@@ -302,17 +524,19 @@ with st.sidebar:
             """
 ### Quick start
 
-1. Open **1. Machinery**, select the applicable vessel(s), and complete the main machinery fields.
-2. Under **Source**, upload the scanned PDF and choose the pages to process.
+1. Under **Documents**, upload one or more PDF manuals and select the active document.
+2. Open **1. Machinery**, assign vessel(s) to that PDF, and complete its main machinery fields.
 3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
 4. Open **3. Sub-machineries** to review the automatically detected table headings. Each proposal shows its source-page range and number of linked spare parts.
 5. Apply the approved sub-machinery assignments, then open **4. Review spare parts**.
 6. Use the filters, source-page columns, and quick page lookup to correct only the rows that need attention.
-7. Open **5. Export**, create the workbook, download the audit file, and copy the prepared email text containing the selected vessel(s).
+7. Open **5. Export** to create the active document workbook or a ZIP package for every ready document.
 
-### Vessel assignment
+### Multiple documents and vessel assignment
 
-- Select one or more vessels from the searchable list.
+- Every uploaded PDF keeps its own machinery, vessel, OCR, review, and export state.
+- Switch the **Active document** in the sidebar to configure another PDF.
+- Select one or more vessels from the searchable list for the active PDF.
 - Vessel names are used in the export filename, audit workbook, and email draft.
 - Vessel names are **not written into the import template**, because vessel assignment is completed during the ERP process.
 - Use **Additional vessel(s)** only when a vessel is not yet available in the master list.
@@ -356,7 +580,7 @@ Normal users only need a processing mode. Open **Advanced Mistral settings** for
 
 ### Large manuals
 
-For very large books, process page ranges such as `1-100`, `101-200`, and so on. Enable **Append to current review table** after the first range. Download the audit workbook regularly because an app restart clears in-memory data.
+For very large books, process page ranges such as `1-100`, `101-200`, and so on. Each PDF is processed independently. Enable **Append to current review table** after the first range. Download the audit workbook regularly because an app restart clears in-memory data.
 
 ### Data handling
 
@@ -364,34 +588,89 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
             """
         )
 
-    st.header("Source")
+    st.header("Documents")
     input_type = st.radio(
         "Choose input type",
         ["PDF", "Document URL", "Image", "Image URL"],
-        index=0,  # PDF is deliberately the default.
-        help="PDF is recommended for scanned manuals. URL options require an accessible direct file URL.",
+        index=0,
+        help=(
+            "Multi-document job management is available for PDF manuals. "
+            "URL and image sources continue to use the current single workspace."
+        ),
     )
 
     source_file = None
     document_url = ""
     image_url = ""
-    page_spec = ""
+    page_spec = "all"
+    append_results = False
 
     if input_type == "PDF":
-        source_file = st.file_uploader(
-            "Upload a scanned PDF",
+        uploaded_pdf_files = st.file_uploader(
+            "Upload one or more scanned PDFs",
             type=["pdf"],
-            help="Upload the original scanned manual. For very large books, process selected page ranges.",
+            accept_multiple_files=True,
+            key="multi_pdf_uploader",
+            help=(
+                "Each unique PDF becomes an independent job. A PDF is OCR-processed once, "
+                "even when it is assigned to several vessels."
+            ),
         )
-        page_spec = st.text_input(
-            "Pages to process",
-            value="all",
-            help="Examples: all, 1-20, 25, 30-35. Process large books in batches.",
-        )
+        register_uploaded_pdfs(uploaded_pdf_files)
+        jobs = st.session_state.document_jobs
+
+        if jobs:
+            job_ids = list(jobs)
+            if st.session_state.get("active_document_selector") not in jobs:
+                st.session_state.active_document_selector = job_ids[0]
+
+            selected_job_id = st.selectbox(
+                "Active document",
+                options=job_ids,
+                key="active_document_selector",
+                format_func=lambda value: jobs[value]["file_name"],
+                help="Switch documents without losing the OCR, review, vessel, or export state of the other jobs.",
+            )
+
+            if st.session_state.get("loaded_job_id") != selected_job_id:
+                save_loaded_job_state()
+                load_document_job(selected_job_id)
+                st.rerun()
+
+            active_job = jobs[selected_job_id]
+            source_file = StoredPdf(active_job["file_name"], active_job["pdf_path"])
+            page_spec = st.text_input(
+                "Pages to process for active document",
+                key="active_page_spec",
+                help="Examples: all, 1-20, 25, 30-35.",
+            )
+            append_results = st.checkbox(
+                "Append to this document's review table",
+                key="append_results",
+                help="Use when processing additional page ranges from the same PDF.",
+            )
+            active_status, active_rows, active_subs = _job_status(active_job)
+            st.caption(
+                f"{active_status} · {active_rows} spare-part row(s) · "
+                f"{active_subs} sub-machinery proposal(s)"
+            )
+            st.button(
+                "Remove active document",
+                use_container_width=True,
+                on_click=remove_document_job,
+                args=(selected_job_id,),
+            )
+        else:
+            st.info("Upload one or more PDFs to create document jobs.")
     elif input_type == "Document URL":
         document_url = st.text_input(
             "Document URL",
-            help="Enter a direct, publicly accessible PDF URL. Use file upload for internal documents.",
+            help="Enter a direct, publicly accessible PDF URL.",
+        )
+        append_results = st.checkbox(
+            "Append to current review table",
+            value=False,
+            help="Single-workspace behavior for URL sources.",
         )
     elif input_type == "Image":
         source_file = st.file_uploader(
@@ -399,17 +678,21 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
             type=["png", "jpg", "jpeg"],
             help="Use this for a single scanned page or photograph.",
         )
+        append_results = st.checkbox(
+            "Append to current review table",
+            value=False,
+            help="Single-workspace behavior for image sources.",
+        )
     else:
         image_url = st.text_input(
             "Image URL",
             help="Enter a direct, publicly accessible image URL.",
         )
-
-    append_results = st.checkbox(
-        "Append to current review table",
-        value=False,
-        help="Useful when processing different page ranges from the same large manual.",
-    )
+        append_results = st.checkbox(
+            "Append to current review table",
+            value=False,
+            help="Single-workspace behavior for image URL sources.",
+        )
 
     st.divider()
     st.header("Processing mode")
@@ -562,7 +845,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
         st.error("Place the template beside app.py or upload it here.")
 
     if st.button(
-        "Reset OCR and review data",
+        "Reset active document OCR and review data",
         use_container_width=True,
         help="Clears extracted pages, classifications, candidate rows and the generated workbook from this session.",
     ):
@@ -572,6 +855,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
         st.session_state.spare_review = empty_review_dataframe()
         st.session_state.submachinery_review = empty_submachinery_review_dataframe()
         st.session_state.output = None
+        st.session_state.multi_package_output = None
         st.session_state.prepared_email_subject = ""
         st.session_state.prepared_email_body = ""
         st.session_state.editor_version += 1
@@ -585,7 +869,7 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
 **Spare Parts OCR Import Builder — v{APP_VERSION}**
 
 **Workflow**  
-Vessels → Main machinery → OCR → Sub-machinery review → Spare-parts review → Excel export → Email draft
+Multiple PDFs → Per-document vessels and machinery → OCR → Review → Individual or package export
 
 **Supported sources**  
 Scanned PDFs, document URLs, images and image URLs.
@@ -593,6 +877,39 @@ Scanned PDFs, document URLs, images and image URLs.
 **Important**  
 The generated workbook should be tested with a small import batch before production use.
             """
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multi-document dashboard
+# ---------------------------------------------------------------------------
+
+if st.session_state.document_jobs:
+    save_loaded_job_state()
+    with st.expander("Document job dashboard", expanded=True):
+        dashboard_rows = []
+        for job_id, job in st.session_state.document_jobs.items():
+            status, row_count, sub_count = _job_status(job)
+            dashboard_rows.append(
+                {
+                    "ACTIVE": job_id == st.session_state.get("loaded_job_id"),
+                    "DOCUMENT": job.get("file_name", ""),
+                    "VESSELS": ", ".join(_job_vessels(job)) or "Not assigned",
+                    "MAIN MACHINERY": job.get("main_name", "") or "Not entered",
+                    "OCR PAGES": len(job.get("extracted_pages", [])),
+                    "SUB-MACHINERIES": sub_count,
+                    "SPARE-PART ROWS": row_count,
+                    "STATUS": status,
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(dashboard_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "The same PDF may be assigned to many vessels without repeating OCR. "
+            "Each PDF can also have a different vessel list."
         )
 
 
@@ -669,6 +986,9 @@ machinery_tab, input_tab, submachinery_tab, review_tab, export_tab = st.tabs(
 )
 
 with machinery_tab:
+    active_job = active_document_job()
+    if active_job:
+        st.caption(f"Active document: **{active_job['file_name']}**")
     st.subheader("Step 1 — Vessel assignment")
     st.multiselect(
         "Vessel(s) *",
@@ -759,6 +1079,9 @@ with machinery_tab:
 
 
 with submachinery_tab:
+    active_job = active_document_job()
+    if active_job:
+        st.caption(f"Active document: **{active_job['file_name']}**")
     st.subheader("Step 3 — Detected sub-machineries")
     st.caption(
         "After OCR, the app groups the titles found above spare-parts tables. Review "
@@ -931,6 +1254,9 @@ with submachinery_tab:
 # ---------------------------------------------------------------------------
 
 with input_tab:
+    active_job = active_document_job()
+    if active_job:
+        st.caption(f"Active document: **{active_job['file_name']}**")
     st.subheader("Step 2 — Process the scanned document")
 
     if main_machinery_is_ready():
@@ -1201,6 +1527,9 @@ with input_tab:
 # ---------------------------------------------------------------------------
 
 with review_tab:
+    active_job = active_document_job()
+    if active_job:
+        st.caption(f"Active document: **{active_job['file_name']}**")
     st.subheader("Step 4 — Review and correct candidate rows")
     st.caption(
         "Start with blocked rows, then inspect sub-machinery assignments and low-confidence "
@@ -1627,7 +1956,146 @@ Best regards,
     return subject, body
 
 
+
+def build_multi_document_package(
+    template_bytes: bytes,
+    clear_existing: bool,
+    allow_duplicates: bool,
+) -> tuple[bytes | None, list[dict[str, str]]]:
+    save_loaded_job_state()
+    package = io.BytesIO()
+    report: list[dict[str, str]] = []
+    manifest_rows: list[dict[str, str | int]] = []
+    email_sections: list[str] = []
+    created_count = 0
+
+    with zipfile.ZipFile(package, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for position, (job_id, job) in enumerate(st.session_state.document_jobs.items(), start=1):
+            vessels = _job_vessels(job)
+            machinery_frame = _job_machinery_frame(job)
+            machinery_errors = validate_machinery_dataframe(machinery_frame)
+            valid_names = machinery_frame["NAME"].tolist() if not machinery_frame.empty else []
+            review = recalculate_review_status(
+                job.get("spare_review", empty_review_dataframe()),
+                valid_machinery_names=valid_names,
+                allow_duplicates=allow_duplicates,
+            )
+            included = review[review["INCLUDE"].astype(bool)] if not review.empty else review
+            blocked = included[~included["READY"].astype(bool)] if not included.empty else included
+
+            reasons = []
+            if not vessels:
+                reasons.append("no vessels assigned")
+            reasons.extend(machinery_errors)
+            if included.empty:
+                reasons.append("no included spare-part rows")
+            elif not blocked.empty:
+                reasons.append(f"{len(blocked)} row(s) still need correction")
+
+            if reasons:
+                report.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Result": "Skipped",
+                        "Details": "; ".join(reasons),
+                    }
+                )
+                continue
+
+            try:
+                workbook_bytes = build_workbook(
+                    template_bytes=template_bytes,
+                    machinery_frame=machinery_frame,
+                    review_frame=review,
+                    clear_existing=clear_existing,
+                )
+                file_name = export_filename(
+                    vessels,
+                    str(job.get("main_code", "")),
+                    str(job.get("main_name", "")),
+                )
+                archive.writestr(f"imports/{position:02d}_{file_name}", workbook_bytes)
+
+                audit_bytes = build_audit_workbook(
+                    job.get("extracted_pages", []),
+                    machinery_frame,
+                    review,
+                    page_classification=job.get("page_classification", pd.DataFrame()),
+                    extraction_log=job.get("extraction_log", []),
+                    vessels=vessels,
+                    submachinery_review=job.get("submachinery_review", empty_submachinery_review_dataframe()),
+                    job_metadata={
+                        "Source document": job.get("file_name", ""),
+                        "Main machinery code": job.get("main_code", ""),
+                        "Main machinery name": job.get("main_name", ""),
+                        "Maker": job.get("main_maker", ""),
+                        "Model": job.get("main_model", ""),
+                        "OCR pages": len(job.get("extracted_pages", [])),
+                        "Included spare parts": len(included),
+                    },
+                )
+                audit_name = safe_filename(Path(job.get("file_name", "document")).stem) + "_OCR_audit.xlsx"
+                archive.writestr(f"audit/{position:02d}_{audit_name}", audit_bytes)
+
+                vessel_lines = "\n".join(f"- {value}" for value in vessels)
+                email_sections.append(
+                    f"{position}. {file_name}\n"
+                    f"Source PDF: {job.get('file_name', '')}\n"
+                    f"Main machinery: {job.get('main_name', '')}\n"
+                    f"Applicable vessels:\n{vessel_lines}\n"
+                )
+                manifest_rows.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Import workbook": file_name,
+                        "Vessels": "; ".join(vessels),
+                        "Main machinery": job.get("main_name", ""),
+                        "Maker": job.get("main_maker", ""),
+                        "Model": job.get("main_model", ""),
+                        "Sub-machineries": max(0, len(machinery_frame) - 1),
+                        "Spare-part rows": len(included),
+                    }
+                )
+                report.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Result": "Included",
+                        "Details": file_name,
+                    }
+                )
+                created_count += 1
+            except Exception as exc:
+                report.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Result": "Error",
+                        "Details": str(exc),
+                    }
+                )
+
+        if created_count:
+            manifest = pd.DataFrame(manifest_rows)
+            archive.writestr("document_vessel_assignments.csv", manifest.to_csv(index=False).encode("utf-8-sig"))
+            email_body = (
+                "Dear Support Team,\n\n"
+                "Please find attached the import workbooks listed below. Each workbook "
+                "applies only to the corresponding vessel(s).\n\n"
+                + "\n".join(email_sections)
+                + "\nPlease proceed with the corresponding imports and let us know if any correction is required.\n\n"
+                "Best regards,\n"
+            )
+            archive.writestr("email_draft.txt", email_body.encode("utf-8"))
+
+    if created_count == 0:
+        return None, report
+    package.seek(0)
+    return package.getvalue(), report
+
+
 with export_tab:
+    active_job = active_document_job()
+    if active_job:
+        st.caption(f"Active document: **{active_job['file_name']}**")
     st.subheader("Step 5 — Build import workbook")
     vessels = selected_vessel_names()
     if vessels:
@@ -1778,6 +2246,46 @@ with export_tab:
             use_container_width=True,
         )
 
+    if len(st.session_state.document_jobs) > 1:
+        st.divider()
+        st.subheader("All documents package")
+        st.caption(
+            "Builds one import workbook and one audit workbook for every ready PDF. "
+            "A single PDF assigned to several vessels is included only once, with the vessel mapping in the manifest and email draft."
+        )
+        if st.button(
+            "Build ZIP package for all ready documents",
+            use_container_width=True,
+            disabled=template_bytes is None,
+        ):
+            package_bytes, package_report = build_multi_document_package(
+                template_bytes=template_bytes,
+                clear_existing=clear_existing,
+                allow_duplicates=allow_duplicates,
+            )
+            st.session_state.multi_package_output = package_bytes
+            st.session_state.multi_package_report = package_report
+            if package_bytes:
+                st.success("Multi-document package created.")
+            else:
+                st.error("No document was ready for package export. Review the report below.")
+
+        if st.session_state.multi_package_report:
+            st.dataframe(
+                pd.DataFrame(st.session_state.multi_package_report),
+                use_container_width=True,
+                hide_index=True,
+            )
+        if st.session_state.multi_package_output:
+            st.download_button(
+                "Download all-documents ZIP package",
+                data=st.session_state.multi_package_output,
+                file_name=st.session_state.multi_package_name,
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+            )
+
     if st.session_state.extracted_pages:
         audit_bytes = build_audit_workbook(
             st.session_state.extracted_pages,
@@ -1811,3 +2319,7 @@ with export_tab:
             use_container_width=True,
         )
 
+
+
+# Persist the active document workspace after every completed rerun.
+save_loaded_job_state()
