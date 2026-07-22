@@ -45,7 +45,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.1"
+APP_VERSION = "4.3"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -511,6 +511,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
+st.caption("Build 4.3 — direct Mistral OCR API; legacy helper removed")
 
 
 # ---------------------------------------------------------------------------
@@ -1492,7 +1493,10 @@ with input_tab:
                         st.warning(message)
             except Exception as exc:
                 progress_bar.empty()
-                st.error(f"Processing failed: {exc}")
+                safe_message = str(exc)
+                if api_key:
+                    safe_message = safe_message.replace(api_key, "***REDACTED***")
+                st.error(f"Processing failed: {safe_message}")
 
     if st.session_state.extracted_pages:
         st.subheader("Raw OCR output")
