@@ -490,7 +490,7 @@ def _job_status(job: dict) -> tuple[str, int, int]:
 
 def get_secret(name: str) -> str:
     try:
-        return str(st.secrets[name])
+        return str(st.secrets[name]).strip()
     except Exception:
         return ""
 
