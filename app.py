@@ -511,7 +511,6 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.1 — stable review editing with explicit save")
 
 
 # ---------------------------------------------------------------------------
