@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -17,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "3.1"
+TOOLS_VERSION = "4.3"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -275,6 +276,159 @@ def _delete_file(path: str | None) -> None:
         pass
 
 
+def _normalize_api_key(api_key: str) -> str:
+    """Normalize a Mistral key without ever logging or returning it in an error."""
+    key = str(api_key or "").strip().strip('"').strip("'").strip()
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    if not key:
+        raise RuntimeError("A Mistral API key is required.")
+    return key
+
+
+def _safe_api_error_text(value: Any, api_key: str = "") -> str:
+    """Return a concise error message with credentials and very long bodies removed."""
+    text = str(value or "").replace("\x00", " ")
+    if api_key:
+        text = text.replace(api_key, "***REDACTED***")
+    # Some upstream libraries include the key after labels such as api_key= or Bearer.
+    text = re.sub(
+        r"(?i)(api[_ -]?key\s*[:=]\s*|authorization\s*[:=]\s*bearer\s+)([^\s,;\]\[{}]+)",
+        r"\1***REDACTED***",
+        text,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:1200]
+
+
+def _mistral_ocr_request(
+    api_key: str,
+    document: dict[str, str],
+    model: str = "mistral-ocr-latest",
+    timeout_seconds: int = 600,
+    max_retries: int = 5,
+) -> dict[str, Any]:
+    """Call Mistral's official OCR REST endpoint directly.
+
+    This intentionally bypasses ``py-mistral-helper`` and its transitive SDK
+    dependencies. PDF and image bytes are sent as supported base64 data URLs,
+    while external sources are passed through as ordinary URLs.
+    """
+    key = _normalize_api_key(api_key)
+    endpoint = os.getenv("MISTRAL_OCR_URL", "https://api.mistral.ai/v1/ocr")
+    payload = {
+        "model": model,
+        "document": document,
+        "include_image_base64": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    retryable_statuses = {404, 408, 409, 425, 429, 500, 502, 503, 504}
+    last_error: Exception | None = None
+
+    for attempt in range(1, max(1, int(max_retries)) + 1):
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json=payload,
+                timeout=max(30, int(timeout_seconds)),
+            )
+
+            if 200 <= response.status_code < 300:
+                try:
+                    body = response.json()
+                except ValueError as exc:
+                    raise RuntimeError("Mistral OCR returned non-JSON output.") from exc
+                if not isinstance(body, dict):
+                    raise RuntimeError("Mistral OCR returned an unexpected response type.")
+                return body
+
+            try:
+                body_value: Any = response.json()
+            except ValueError:
+                body_value = response.text
+            detail = _safe_api_error_text(body_value, key)
+
+            if response.status_code in retryable_statuses and attempt < max_retries:
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = max(1.0, float(retry_after))
+                except (TypeError, ValueError):
+                    delay = min(20.0, float(2 ** (attempt - 1)))
+                time.sleep(delay)
+                continue
+
+            if response.status_code in {401, 403}:
+                raise RuntimeError(
+                    f"Mistral OCR authentication failed (HTTP {response.status_code}). "
+                    "Verify the key stored in Streamlit Secrets and its workspace access. "
+                    f"Service response: {detail or 'No additional details.'}"
+                )
+            if response.status_code == 402:
+                raise RuntimeError(
+                    "Mistral OCR rejected the request because billing or workspace "
+                    f"payment is not enabled (HTTP 402). Service response: {detail}"
+                )
+            if response.status_code == 429:
+                raise RuntimeError(
+                    "Mistral OCR rate or usage limit reached (HTTP 429). Wait and retry, "
+                    f"or check the workspace Limits and Usage pages. Service response: {detail}"
+                )
+            raise RuntimeError(
+                f"Mistral OCR request failed (HTTP {response.status_code}). "
+                f"Service response: {detail or 'No additional details.'}"
+            )
+        except requests.Timeout as exc:
+            last_error = exc
+            if attempt < max_retries:
+                time.sleep(min(20.0, float(2 ** (attempt - 1))))
+                continue
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < max_retries:
+                time.sleep(min(20.0, float(2 ** (attempt - 1))))
+                continue
+        except RuntimeError:
+            raise
+
+    raise RuntimeError(
+        "Mistral OCR could not be reached after repeated attempts: "
+        + _safe_api_error_text(last_error, key)
+    )
+
+
+def _pdf_data_url(pdf_bytes: bytes) -> str:
+    encoded = base64.b64encode(pdf_bytes).decode("ascii")
+    return f"data:application/pdf;base64,{encoded}"
+
+
+def _image_data_url(image_bytes: bytes, suffix: str) -> str:
+    extension = str(suffix or "").lower().lstrip(".")
+    mime_type = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "gif": "image/gif",
+    }.get(extension, "image/png")
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _response_pages(response: dict[str, Any]) -> list[dict[str, Any]]:
+    pages = response.get("pages", []) if isinstance(response, dict) else []
+    if pages is None:
+        return []
+    if not isinstance(pages, list):
+        raise RuntimeError("Mistral OCR returned an invalid pages collection.")
+    return [page for page in pages if isinstance(page, dict)]
+
+
 def ocr_pdf_bytes(
     api_key: str,
     pdf_bytes: bytes,
@@ -287,8 +441,6 @@ def ocr_pdf_bytes(
     indexes = list(page_indexes) if page_indexes is not None else list(range(len(reader.pages)))
     if not indexes:
         return []
-
-    from py_mistral_helper.MistralHelper import MistralHelper
 
     page_chunks = list(chunks(indexes, pages_per_request))
     extracted: list[tuple[int, str]] = []
@@ -307,62 +459,25 @@ def ocr_pdf_bytes(
 
         buffer = io.BytesIO()
         writer.write(buffer)
-        temp_path = _temporary_file(buffer.getvalue(), ".pdf")
-        try:
-            response = None
-            retry_delays = (0, 2, 4, 8, 12)
-            last_error: Exception | None = None
+        response = _mistral_ocr_request(
+            api_key=api_key,
+            document={
+                "type": "document_url",
+                "document_url": _pdf_data_url(buffer.getvalue()),
+            },
+        )
 
-            for attempt, delay_seconds in enumerate(retry_delays, start=1):
-                if delay_seconds:
-                    if progress:
-                        progress(
-                            chunk_number - 1,
-                            len(page_chunks),
-                            (
-                                f"OCR request {chunk_number}/{len(page_chunks)}: "
-                                f"waiting {delay_seconds}s before retry {attempt}/{len(retry_delays)}"
-                            ),
-                        )
-                    time.sleep(delay_seconds)
+        response_pages = _response_pages(response)
+        if not response_pages:
+            raise RuntimeError(
+                f"OCR request {chunk_number}/{len(page_chunks)} completed but returned no pages."
+            )
 
-                try:
-                    # Recreate the helper for every retry. This avoids reusing stale
-                    # uploaded-file state inside py-mistral-helper after Mistral's file
-                    # service temporarily returns: 404 "No file matches the given query".
-                    attempt_helper = MistralHelper(api_key=api_key)
-                    response = attempt_helper.extract_text_using_pdf(temp_path)
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    message = str(exc).lower()
-                    transient_file_error = (
-                        "no file matches the given query" in message
-                        or "status 404" in message
-                        or "status_code=404" in message
-                    )
-
-                    if not transient_file_error or attempt == len(retry_delays):
-                        raise RuntimeError(
-                            f"OCR request {chunk_number}/{len(page_chunks)} failed "
-                            f"after {attempt} attempt(s): {exc}"
-                        ) from exc
-
-            if response is None:
-                raise RuntimeError(
-                    f"OCR request {chunk_number}/{len(page_chunks)} returned no response: "
-                    f"{last_error}"
-                )
-
-            response_pages = list(getattr(response, "pages", []) or [])
-            for local_index, page in enumerate(response_pages):
-                if local_index >= len(page_chunk):
-                    break
-                original_page = page_chunk[local_index] + 1
-                markdown = clean_markdown(getattr(page, "markdown", ""))
-                extracted.append((original_page, markdown))
-        finally:
-            _delete_file(temp_path)
+        for local_index, page in enumerate(response_pages):
+            if local_index >= len(page_chunk):
+                break
+            original_page = page_chunk[local_index] + 1
+            extracted.append((original_page, clean_markdown(page.get("markdown", ""))))
 
         if progress:
             progress(
@@ -376,41 +491,45 @@ def ocr_pdf_bytes(
 
 
 def ocr_document_url(api_key: str, document_url: str) -> list[tuple[int, str]]:
-    from py_mistral_helper.MistralHelper import MistralHelper
-
-    helper = MistralHelper(api_key=api_key)
-    response = helper.extract_text_using_pdf_document_url(document_url)
+    response = _mistral_ocr_request(
+        api_key=api_key,
+        document={
+            "type": "document_url",
+            "document_url": clean_text(document_url),
+        },
+    )
     return [
-        (index + 1, clean_markdown(getattr(page, "markdown", "")))
-        for index, page in enumerate(getattr(response, "pages", []) or [])
+        (index + 1, clean_markdown(page.get("markdown", "")))
+        for index, page in enumerate(_response_pages(response))
     ]
 
 
 def ocr_image_bytes(api_key: str, image_bytes: bytes, suffix: str) -> list[tuple[int, str]]:
-    from py_mistral_helper.MistralHelper import MistralHelper
-
-    helper = MistralHelper(api_key=api_key)
-    temp_path = _temporary_file(image_bytes, suffix)
-    try:
-        response = helper.extract_text_using_image_path(temp_path)
-        return [
-            (index + 1, clean_markdown(getattr(page, "markdown", "")))
-            for index, page in enumerate(getattr(response, "pages", []) or [])
-        ]
-    finally:
-        _delete_file(temp_path)
+    response = _mistral_ocr_request(
+        api_key=api_key,
+        document={
+            "type": "image_url",
+            "image_url": _image_data_url(image_bytes, suffix),
+        },
+    )
+    return [
+        (index + 1, clean_markdown(page.get("markdown", "")))
+        for index, page in enumerate(_response_pages(response))
+    ]
 
 
 def ocr_image_url(api_key: str, image_url: str) -> list[tuple[int, str]]:
-    from py_mistral_helper.MistralHelper import MistralHelper
-
-    helper = MistralHelper(api_key=api_key)
-    response = helper.extract_text_using_image_url(image_url)
+    response = _mistral_ocr_request(
+        api_key=api_key,
+        document={
+            "type": "image_url",
+            "image_url": clean_text(image_url),
+        },
+    )
     return [
-        (index + 1, clean_markdown(getattr(page, "markdown", "")))
-        for index, page in enumerate(getattr(response, "pages", []) or [])
+        (index + 1, clean_markdown(page.get("markdown", "")))
+        for index, page in enumerate(_response_pages(response))
     ]
-
 
 def clean_markdown(value: Any) -> str:
     text = "" if value is None else str(value)
