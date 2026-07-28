@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import io
+import secrets
+import smtplib
+import ssl
 import tempfile
+import threading
+import time
 import uuid
 import zipfile
+from email.message import EmailMessage
 from pathlib import Path
 
 import pandas as pd
@@ -45,7 +52,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.3"
+APP_VERSION = "4.4"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -224,6 +231,300 @@ st.set_page_config(
     page_icon="📄",
     layout="wide",
 )
+
+
+# ---------------------------------------------------------------------------
+# Shared mailbox one-time-password access gate
+# ---------------------------------------------------------------------------
+
+
+def _auth_secret(name: str, default: str = "") -> str:
+    try:
+        value = st.secrets[name]
+    except Exception:
+        return default
+    return str(value).strip()
+
+
+def _auth_int_secret(name: str, default: int) -> int:
+    try:
+        return int(_auth_secret(name, str(default)))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+@st.cache_resource
+def _auth_global_state() -> dict[str, object]:
+    """Small server-wide throttle shared by browser sessions on this app instance."""
+    return {
+        "lock": threading.Lock(),
+        "last_sent_at": 0.0,
+    }
+
+
+def _initialize_auth_state() -> None:
+    defaults = {
+        "auth_authenticated": False,
+        "auth_expires_at": 0.0,
+        "auth_otp_hash": "",
+        "auth_otp_salt": "",
+        "auth_otp_expires_at": 0.0,
+        "auth_otp_attempts": 0,
+        "auth_last_sent_at": 0.0,
+        "auth_lock_until": 0.0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _clear_otp_state() -> None:
+    st.session_state.auth_otp_hash = ""
+    st.session_state.auth_otp_salt = ""
+    st.session_state.auth_otp_expires_at = 0.0
+    st.session_state.auth_otp_attempts = 0
+
+
+def _clear_entire_session() -> None:
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+
+def _hash_otp(code: str, salt: str) -> str:
+    return hmac.new(
+        salt.encode("utf-8"),
+        code.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _send_otp_email(code: str, expiry_minutes: int) -> None:
+    recipient = _auth_secret("OTP_EMAIL", "perftechnomar@gmail.com")
+    smtp_user = _auth_secret("GMAIL_SMTP_USER", recipient)
+    # Google displays app passwords in groups. Removing spaces allows either format.
+    smtp_password = _auth_secret("GMAIL_APP_PASSWORD").replace(" ", "")
+    smtp_host = _auth_secret("OTP_SMTP_HOST", "smtp.gmail.com")
+    smtp_port = _auth_int_secret("OTP_SMTP_PORT", 465)
+
+    if not recipient or not smtp_user or not smtp_password:
+        raise RuntimeError(
+            "OTP email is not configured. Add OTP_EMAIL, GMAIL_SMTP_USER, "
+            "and GMAIL_APP_PASSWORD to Streamlit Secrets."
+        )
+
+    message = EmailMessage()
+    message["Subject"] = "Spare Parts OCR Builder access code"
+    message["From"] = f"Spare Parts OCR Builder <{smtp_user}>"
+    message["To"] = recipient
+    message.set_content(
+        "Your one-time access code is:\n\n"
+        f"{code}\n\n"
+        f"This code expires in {expiry_minutes} minutes and can be used once.\n"
+        "If you did not request this code, you can ignore this email."
+    )
+
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL(smtp_host, smtp_port, context=context, timeout=30) as server:
+        server.login(smtp_user, smtp_password)
+        server.send_message(message)
+
+
+def require_authentication() -> None:
+    """Block the complete application until a valid shared-mailbox OTP is entered."""
+    _initialize_auth_state()
+    now = time.time()
+
+    if st.session_state.auth_authenticated:
+        if float(st.session_state.auth_expires_at) > now:
+            remaining_minutes = max(
+                1,
+                int((float(st.session_state.auth_expires_at) - now) // 60),
+            )
+            with st.sidebar:
+                st.success("Access verified")
+                st.caption(
+                    f"Performance Team session · approximately {remaining_minutes} minute(s) remaining"
+                )
+                if st.button("Log out", use_container_width=True, key="auth_logout"):
+                    _clear_entire_session()
+                    st.rerun()
+            return
+
+        # An expired login must not expose the previous user's uploaded documents
+        # or review state after another person re-authenticates in the same browser.
+        _clear_entire_session()
+        _initialize_auth_state()
+        now = time.time()
+
+    expiry_minutes = max(1, _auth_int_secret("OTP_EXPIRY_MINUTES", 5))
+    resend_seconds = max(15, _auth_int_secret("OTP_RESEND_SECONDS", 60))
+    global_resend_seconds = max(15, _auth_int_secret("OTP_GLOBAL_RESEND_SECONDS", 30))
+    max_attempts = max(1, _auth_int_secret("OTP_MAX_ATTEMPTS", 5))
+    lock_minutes = max(1, _auth_int_secret("OTP_LOCK_MINUTES", 10))
+    session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
+
+    st.title("📄 Spare Parts OCR Import Builder")
+    st.caption("Restricted access · Build 4.4")
+
+    left, centre, right = st.columns([1, 1.35, 1])
+    with centre:
+        st.subheader("Performance Team access")
+        st.write(
+            "Request a one-time code. The code will be sent to the shared "
+            "Performance mailbox and must be entered in this same browser session."
+        )
+
+        lock_remaining = max(0, int(float(st.session_state.auth_lock_until) - now))
+        cooldown_remaining = max(
+            0,
+            int(
+                resend_seconds
+                - (now - float(st.session_state.auth_last_sent_at))
+            ),
+        )
+        global_state = _auth_global_state()
+        global_cooldown_remaining = max(
+            0,
+            int(
+                global_resend_seconds
+                - (now - float(global_state.get("last_sent_at", 0.0)))
+            ),
+        )
+
+        if lock_remaining > 0:
+            st.error(
+                "Too many incorrect attempts. Try again in "
+                f"{max(1, lock_remaining // 60 + 1)} minute(s)."
+            )
+
+        send_disabled = (
+            lock_remaining > 0
+            or cooldown_remaining > 0
+            or global_cooldown_remaining > 0
+        )
+        if st.button(
+            "Send one-time access code",
+            type="primary",
+            use_container_width=True,
+            disabled=send_disabled,
+            key="auth_send_otp",
+        ):
+            code = f"{secrets.randbelow(1_000_000):06d}"
+            salt = secrets.token_hex(32)
+            global_lock = global_state["lock"]
+            with global_lock:
+                checked_at = time.time()
+                seconds_since_global_send = checked_at - float(
+                    global_state.get("last_sent_at", 0.0)
+                )
+                if seconds_since_global_send < global_resend_seconds:
+                    wait_seconds = max(
+                        1,
+                        int(global_resend_seconds - seconds_since_global_send),
+                    )
+                    st.warning(
+                        "Another access code was just requested. Try again in "
+                        f"{wait_seconds} second(s)."
+                    )
+                else:
+                    try:
+                        _send_otp_email(code, expiry_minutes)
+                    except Exception as exc:
+                        st.error(f"Could not send the access code: {exc}")
+                    else:
+                        sent_at = time.time()
+                        global_state["last_sent_at"] = sent_at
+                        st.session_state.auth_otp_hash = _hash_otp(code, salt)
+                        st.session_state.auth_otp_salt = salt
+                        st.session_state.auth_otp_expires_at = sent_at + expiry_minutes * 60
+                        st.session_state.auth_otp_attempts = 0
+                        st.session_state.auth_last_sent_at = sent_at
+                        st.success(
+                            "A six-digit code was sent to the shared Performance mailbox."
+                        )
+                        st.rerun()
+
+        effective_cooldown = max(cooldown_remaining, global_cooldown_remaining)
+        if effective_cooldown > 0 and lock_remaining <= 0:
+            st.caption(
+                f"A new code can be requested in {effective_cooldown} second(s)."
+            )
+
+        otp_is_active = bool(st.session_state.auth_otp_hash)
+        if otp_is_active:
+            otp_seconds_left = max(
+                0,
+                int(float(st.session_state.auth_otp_expires_at) - time.time()),
+            )
+            if otp_seconds_left <= 0:
+                _clear_otp_state()
+                st.warning("The access code expired. Request a new one.")
+                otp_is_active = False
+            else:
+                st.info(
+                    f"Code active for approximately {max(1, otp_seconds_left // 60 + 1)} minute(s)."
+                )
+
+        with st.form("auth_verify_form", clear_on_submit=True):
+            entered_code = st.text_input(
+                "Six-digit access code",
+                type="password",
+                max_chars=6,
+                placeholder="000000",
+                disabled=(not otp_is_active or lock_remaining > 0),
+            )
+            verify = st.form_submit_button(
+                "Verify and open app",
+                use_container_width=True,
+                disabled=(not otp_is_active or lock_remaining > 0),
+            )
+
+        if verify:
+            submitted = "".join(character for character in entered_code if character.isdigit())
+            current_time = time.time()
+
+            if current_time >= float(st.session_state.auth_otp_expires_at):
+                _clear_otp_state()
+                st.error("The access code expired. Request a new one.")
+            elif len(submitted) != 6:
+                st.error("Enter the complete six-digit code.")
+            else:
+                submitted_hash = _hash_otp(
+                    submitted,
+                    str(st.session_state.auth_otp_salt),
+                )
+                valid = hmac.compare_digest(
+                    submitted_hash,
+                    str(st.session_state.auth_otp_hash),
+                )
+                if valid:
+                    st.session_state.auth_authenticated = True
+                    st.session_state.auth_expires_at = current_time + session_hours * 3600
+                    _clear_otp_state()
+                    st.rerun()
+
+                st.session_state.auth_otp_attempts = int(
+                    st.session_state.auth_otp_attempts
+                ) + 1
+                remaining_attempts = max_attempts - int(
+                    st.session_state.auth_otp_attempts
+                )
+                if remaining_attempts <= 0:
+                    _clear_otp_state()
+                    st.session_state.auth_lock_until = current_time + lock_minutes * 60
+                    st.error(
+                        f"Too many incorrect attempts. Access is locked for {lock_minutes} minute(s)."
+                    )
+                else:
+                    st.error(
+                        f"Incorrect code. {remaining_attempts} attempt(s) remaining."
+                    )
+
+        st.caption(
+            "The code is single-use, expires automatically, and is never stored in plain text."
+        )
+
+    st.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -507,11 +808,12 @@ def apply_processing_preset() -> None:
     st.session_state.setting_default_unit = preset["default_unit"]
 
 
+require_authentication()
 initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.3 — direct Mistral OCR API; legacy helper removed")
+st.caption("Build 4.4 — shared Gmail OTP access gate + direct Mistral OCR API")
 
 
 # ---------------------------------------------------------------------------
