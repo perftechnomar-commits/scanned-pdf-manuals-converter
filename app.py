@@ -813,7 +813,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.4 — shared Gmail OTP access gate + direct Mistral OCR API")
+st.caption("Build 4.4")
 
 
 # ---------------------------------------------------------------------------
