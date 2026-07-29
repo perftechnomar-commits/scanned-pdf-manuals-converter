@@ -2387,9 +2387,10 @@ def recalculate_review_status(
             if not allow_duplicates:
                 blocking = True
         confidence = clamp_confidence(row.get("CONFIDENCE", 0.70))
+        # OCR confidence is advisory only. A user-corrected row must become READY
+        # when all required Benefit fields and machinery links are valid.
         if confidence < 0.65:
-            row_messages.append("Language or OCR exception requires review")
-            blocking = True
+            row_messages.append("Very low OCR confidence - manually verified fields recommended")
         elif confidence < 0.80:
             row_messages.append("Low OCR confidence - verify when practical")
         warnings.append("; ".join(row_messages))
