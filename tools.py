@@ -735,6 +735,10 @@ Benefit mapping rules:
 5. The first table column is often a drawing position even when its multilingual
    header contains "Part-No.". When it contains sequential callouts such as 1,
    2, 3, 1-12, P101, etc., return it as item_no.
+5a. When one printed drawing position/item number is visually merged across two
+   or more spare-part records, repeat that same item_no on EVERY returned record.
+   Never leave a continuation record blank merely because the source cell is
+   merged or printed only once.
 6. ident_no is the identifier under headers such as Ident-Nr., Ident-No., Code,
    Material Code, Spare Part Code, or equivalent. This value will populate BOTH
    Benefit CODE and Benefit PART NO.
@@ -762,6 +766,11 @@ Source row:
 Return:
   item_no="2", ident_no="10.10.10.40",
   description_english="SLIDE BEARING", quantity=1.
+
+Merged-position continuation example:
+  2 | 53.20.1-.2 | 2/2-way solenoid valve 1st and 2nd stage | 2
+    | 53.20.3    | 2/2-way solenoid valve 3rd stage         | 1
+Return TWO rows and repeat item_no="2" on BOTH rows.
 Do NOT return the section drawing code as the spare-part identifier.
 """.strip()
 
@@ -1614,6 +1623,59 @@ def _normalized_ai_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _carry_forward_merged_item_numbers(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Repeat a merged drawing position on immediate continuation records.
+
+    Some manuals print one ITEM NO in a vertically merged cell while listing two
+    or more identifiers/descriptions beside it. OCR/Markdown may therefore leave
+    the continuation record's item number blank. Carry forward only within the
+    same source page, section code, and table title, and only for a genuine spare
+    row with its own identifier and description.
+    """
+    result: list[dict[str, Any]] = []
+    last_key: tuple[str, str, str] | None = None
+    last_item_no = ""
+    inherited_count = 0
+
+    for raw in rows:
+        row = dict(raw)
+        key = (
+            str(row.get("source_page", "")),
+            normalize_key(row.get("section_code", "")),
+            normalize_key(row.get("table_title", "")),
+        )
+        item_no = clean_text(row.get("item_no", ""))
+        identifier = clean_text(
+            row.get("ident_no", row.get("code", row.get("part_no", "")))
+        )
+        description = clean_text(
+            row.get("description_english", row.get("description", ""))
+        )
+
+        if item_no:
+            last_key = key
+            last_item_no = item_no
+        elif (
+            last_key == key
+            and last_item_no
+            and identifier
+            and description
+        ):
+            row["item_no"] = last_item_no
+            row["item_no_inherited"] = True
+            inherited_count += 1
+        else:
+            # Do not carry a position across another page, section, or table.
+            last_key = key
+            last_item_no = ""
+
+        result.append(row)
+
+    return result, inherited_count
+
+
 def prepare_benefit_rows(
     ai_rows: Sequence[dict[str, Any]],
     extracted_pages: Sequence[tuple[int, str]],
@@ -1700,6 +1762,12 @@ def prepare_benefit_rows(
             if language_review:
                 confidence = min(confidence, 0.60)
             ident_no = clean_text(direct.get("ident_no", ""))
+            # Prefer the item number parsed directly from the table. When the
+            # source uses a vertically merged item-number cell, the AI may still
+            # repeat the governing position on the continuation record.
+            resolved_item_no = clean_text(direct.get("item_no", "")) or clean_text(
+                (ai or {}).get("item_no", "")
+            )
             output.append(
                 {
                     "source_page": page,
@@ -1713,7 +1781,7 @@ def prepare_benefit_rows(
                     "ident_no": ident_no,
                     "part_no": ident_no,
                     "code": ident_no,
-                    "item_no": clean_text(direct.get("item_no", "")),
+                    "item_no": resolved_item_no,
                     "description_english": description.upper(),
                     "description": description.upper(),
                     "unit": normalize_unit((ai or {}).get("unit", ""), default_unit),
@@ -1778,6 +1846,10 @@ def prepare_benefit_rows(
                     }
                 )
 
+    # Repair vertically merged/continuation ITEM NO cells before row identity
+    # and duplicate checks are calculated.
+    output, inherited_item_count = _carry_forward_merged_item_numbers(output)
+
     # Deterministic de-duplication by source page + item + identifier.
     deduplicated: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
@@ -1796,6 +1868,10 @@ def prepare_benefit_rows(
         f"Deterministic table verification found {len(direct_rows)} spare-part row(s).",
         f"Detected {len(sections)} source-coded sub-machinery section(s).",
     ]
+    if inherited_item_count:
+        messages.append(
+            f"Repeated {inherited_item_count} merged/continuation ITEM NO value(s) on linked spare-part rows."
+        )
     if language_exceptions:
         messages.append(
             f"{language_exceptions} description(s) could not be confidently isolated as English and remain in the exception review queue."
