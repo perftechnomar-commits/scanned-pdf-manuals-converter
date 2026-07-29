@@ -43,8 +43,10 @@ from tools import (
     ocr_pdf_bytes,
     parse_page_spec,
     pdf_page_count,
+    prepare_benefit_rows,
     recalculate_review_status,
     rows_to_review_dataframe,
+    select_spare_table_pages,
     safe_filename,
     validate_machinery_dataframe,
 )
@@ -52,7 +54,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.4"
+APP_VERSION = "4.5"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -329,6 +331,57 @@ def _send_otp_email(code: str, expiry_minutes: int) -> None:
         server.send_message(message)
 
 
+def _content_column_width(
+    frame: pd.DataFrame,
+    column: str,
+    minimum: int = 78,
+    maximum: int = 420,
+) -> int:
+    """Estimate a readable Streamlit column width from heading and cell content."""
+    if frame is None or column not in frame.columns:
+        return minimum
+    sample = [str(column)] + [
+        str(value) if value is not None else ""
+        for value in frame[column].head(500).tolist()
+    ]
+    longest = max((len(value) for value in sample), default=8)
+    return max(minimum, min(maximum, 18 + longest * 7))
+
+
+def _auto_dataframe_config(
+    frame: pd.DataFrame,
+    maximums: dict[str, int] | None = None,
+) -> dict[str, object]:
+    maximums = maximums or {}
+    compact = {
+        "ACTIVE", "INCLUDE", "READY", "PROCESS", "QNT", "UNIT", "PAGE",
+        "SOURCE PAGE", "SECTION START PAGE", "FIRST PAGE", "LAST PAGE",
+        "OCR PAGES", "PARTS FOUND", "CONFIDENCE",
+    }
+    config: dict[str, object] = {}
+    for column in frame.columns:
+        minimum = 70 if column in compact else 90
+        maximum = maximums.get(column, 420)
+        config[column] = st.column_config.Column(
+            width=_content_column_width(frame, column, minimum, maximum)
+        )
+    return config
+
+
+def _source_document_name(
+    input_type: str,
+    source_file: object | None,
+    document_url: str,
+    image_url: str,
+) -> str:
+    if source_file is not None and getattr(source_file, "name", ""):
+        return str(source_file.name)
+    candidate = document_url if input_type == "Document URL" else image_url
+    if candidate:
+        return Path(candidate.split("?", 1)[0]).name or input_type.replace(" ", "_")
+    return input_type.replace(" ", "_")
+
+
 def require_authentication() -> None:
     """Block the complete application until a valid shared-mailbox OTP is entered."""
     _initialize_auth_state()
@@ -364,7 +417,7 @@ def require_authentication() -> None:
     session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
 
     st.title("📄 Spare Parts OCR Import Builder")
-    st.caption("Restricted access · Build 4.4")
+    st.caption("Restricted access · Build 4.5")
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
@@ -812,6 +865,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
+st.caption("Build 4.5 — source-code matching, English uppercase normalization, and exception-only review")
 
 
 # ---------------------------------------------------------------------------
@@ -827,9 +881,9 @@ with st.sidebar:
 1. Under **Documents**, upload one or more PDF manuals and select the active document.
 2. Open **1. Machinery**, assign vessel(s) to that PDF, and complete its main machinery fields.
 3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
-4. Open **3. Sub-machineries** to review the automatically detected table headings. Each proposal shows its source-page range and number of linked spare parts.
-5. Apply the approved sub-machinery assignments, then open **4. Review spare parts**.
-6. Use the filters, source-page columns, and quick page lookup to correct only the rows that need attention.
+4. The app automatically matches each spare to a source-coded sub-machinery and fills its maker, model, first PDF page, and source filename.
+5. Open **3. Sub-machineries** only to inspect or override exceptions.
+6. Open **4. Review spare parts**; normally only genuine exceptions are shown.
 7. Open **5. Export** to create the active document workbook or a ZIP package for every ready document.
 
 ### Multiple documents and vessel assignment
@@ -843,15 +897,15 @@ with st.sidebar:
 
 ### Automatic sub-machinery detection
 
-The AI reads the title above each spare-parts table and proposes sub-machineries automatically in the dedicated **3. Sub-machineries** tab.
+The app uses the PDF drawing/table code as the internal key, creates one canonical ENGLISH UPPERCASE sub-machinery name, and assigns every spare by that exact key.
 
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
 - **PARTS FOUND:** number of spare-part rows linked to the proposal.
 - **CONFIDENCE:** average extraction confidence for that detected section.
 - **VARIANTS:** different spellings found in the manual.
-- Uncheck **INCLUDE** to reject a false detection, or edit **NAME** and **CODE** before applying assignments.
+- Maker/model printed in the section override the manually entered main-machinery defaults.
 - Edit several cells without interruption, then select **Save sub-machinery changes**.
-- Use **Apply approved assignments to spare parts** after saving, renaming, excluding, or merging proposals.
+- INSTR.BOOK is filled as the first PDF page of the section; SPECIFICATIONS stores the source PDF filename.
 
 ### Processing modes
 
@@ -1203,10 +1257,15 @@ if st.session_state.document_jobs:
                     "STATUS": status,
                 }
             )
+        dashboard_frame = pd.DataFrame(dashboard_rows)
         st.dataframe(
-            pd.DataFrame(dashboard_rows),
+            dashboard_frame,
             use_container_width=True,
             hide_index=True,
+            column_config=_auto_dataframe_config(
+                dashboard_frame,
+                maximums={"DOCUMENT": 360, "VESSELS": 340, "MAIN MACHINERY": 320},
+            ),
         )
         st.caption(
             "The same PDF may be assigned to many vessels without repeating OCR. "
@@ -1385,8 +1444,8 @@ with submachinery_tab:
         st.caption(f"Active document: **{active_job['file_name']}**")
     st.subheader("Step 3 — Detected sub-machineries")
     st.caption(
-        "After OCR, the app groups the titles found above spare-parts tables. Review "
-        "the proposed names, codes, source-page ranges, and variants before export."
+        "The app matches sections by their source drawing/table code, uses ENGLISH "
+        "UPPERCASE names, and applies the exact same NAME to the spare-parts MACHINERY column."
     )
 
     # Normalize state after upgrades or older sessions.
@@ -1410,13 +1469,13 @@ with submachinery_tab:
             st.rerun()
     with sub_action_cols[1]:
         if st.button(
-            "Fill missing details from main",
+            "Fill missing maker/model from main",
             use_container_width=True,
             disabled=st.session_state.submachinery_review.empty,
         ):
             frame = st.session_state.submachinery_review.copy()
             defaults = current_main_row()
-            for column in ("MAKER", "MODEL", "INSTR.BOOK"):
+            for column in ("MAKER", "MODEL"):
                 blank = frame[column].astype(str).str.strip().eq("")
                 frame.loc[blank, column] = defaults[column]
             frame["MCH_TP(M/S/U)"] = "SubMachinery"
@@ -1425,7 +1484,7 @@ with submachinery_tab:
             st.rerun()
     with sub_action_cols[2]:
         if st.button(
-            "Apply approved assignments to spare parts",
+            "Reapply assignments after manual changes",
             use_container_width=True,
             disabled=(
                 st.session_state.submachinery_review.empty
@@ -1480,6 +1539,22 @@ with submachinery_tab:
             ),
         )
 
+        required_sub_fields = ["CODE", "NAME", "MAKER", "MODEL"]
+        incomplete_sub_mask = pd.Series(False, index=candidate_frame.index)
+        for required_column in required_sub_fields:
+            incomplete_sub_mask |= candidate_frame[required_column].astype(str).str.strip().eq("")
+        incomplete_sub_count = int(incomplete_sub_mask.sum())
+        if incomplete_sub_count == 0:
+            st.success(
+                "All detected sections contain CODE, English NAME, MAKER, and MODEL. "
+                "Sub-machinery review is optional unless you want to override a source value."
+            )
+        else:
+            st.warning(
+                f"{incomplete_sub_count} detected section(s) are missing a required source value "
+                "and need review."
+            )
+
         active_job_id = str(st.session_state.get("loaded_job_id", "single"))
         form_key = (
             f"submachinery_edit_form_{active_job_id}_"
@@ -1519,18 +1594,18 @@ with submachinery_tab:
                         help="Only included rows are written to the machinery sheet.",
                         default=True,
                     ),
-                    "CODE": st.column_config.TextColumn("CODE", width="small"),
+                    "CODE": st.column_config.TextColumn("CODE", width=_content_column_width(candidate_frame, "CODE", 95, 230)),
                     "NAME": st.column_config.TextColumn(
                         "NAME",
-                        width="large",
+                        width=_content_column_width(candidate_frame, "NAME", 160, 420),
                         help="Canonical sub-machinery name used by linked spare parts.",
                     ),
-                    "MAKER": st.column_config.TextColumn("MAKER", width="medium"),
-                    "MODEL": st.column_config.TextColumn("MODEL", width="medium"),
-                    "TYPE": st.column_config.TextColumn("TYPE", width="medium"),
-                    "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK", width="medium"),
+                    "MAKER": st.column_config.TextColumn("MAKER", width=_content_column_width(candidate_frame, "MAKER", 110, 280)),
+                    "MODEL": st.column_config.TextColumn("MODEL", width=_content_column_width(candidate_frame, "MODEL", 100, 240)),
+                    "TYPE": st.column_config.TextColumn("TYPE", width=_content_column_width(candidate_frame, "TYPE", 90, 220)),
+                    "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK", width=_content_column_width(candidate_frame, "INSTR.BOOK", 110, 260)),
                     "SPECIFICATIONS": st.column_config.TextColumn(
-                        "SPECIFICATIONS", width="medium"
+                        "SPECIFICATIONS", width=_content_column_width(candidate_frame, "SPECIFICATIONS", 150, 420)
                     ),
                     "MCH_TP(M/S/U)": st.column_config.TextColumn(
                         "MCH_TP(M/S/U)", width="small"
@@ -1548,10 +1623,10 @@ with submachinery_tab:
                         "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
                     ),
                     "VARIANTS": st.column_config.TextColumn(
-                        "VARIANTS", width="large"
+                        "VARIANTS", width=_content_column_width(candidate_frame, "VARIANTS", 160, 420)
                     ),
                     "DETECTION KEYS": None,
-                    "ORIGIN": st.column_config.TextColumn("ORIGIN", width="small"),
+                    "ORIGIN": st.column_config.TextColumn("ORIGIN", width=_content_column_width(candidate_frame, "ORIGIN", 110, 260)),
                 },
             )
             save_submachinery_changes = st.form_submit_button(
@@ -1561,6 +1636,29 @@ with submachinery_tab:
             )
 
         if save_submachinery_changes:
+            for uppercase_column in ("NAME", "MAKER", "MODEL"):
+                edited_submachineries[uppercase_column] = edited_submachineries[
+                    uppercase_column
+                ].map(
+                    lambda value: ""
+                    if pd.isna(value)
+                    else str(value).strip().upper()
+                )
+            user_controlled_columns = [
+                "INCLUDE", "CODE", "NAME", "MAKER", "MODEL", "TYPE",
+                "INSTR.BOOK", "SPECIFICATIONS",
+            ]
+            for row_position in range(len(edited_submachineries)):
+                changed = any(
+                    str(edited_submachineries.iloc[row_position].get(column, "")).strip()
+                    != str(candidate_frame.iloc[row_position].get(column, "")).strip()
+                    for column in user_controlled_columns
+                )
+                if changed:
+                    edited_submachineries.iat[
+                        row_position,
+                        edited_submachineries.columns.get_loc("ORIGIN"),
+                    ] = "Manual override"
             edited_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
             st.session_state.submachinery_review = edited_submachineries[
                 SUBMACHINERY_REVIEW_COLUMNS
@@ -1680,32 +1778,60 @@ with input_tab:
                         "Try Conservative or Off in the sidebar."
                     )
 
+                structure_pages = select_spare_table_pages(
+                    extracted_pages,
+                    fallback_pages=candidate_pages,
+                )
                 progress_bar.progress(
                     0.0,
                     text=(
-                        f"Converting {len(candidate_pages)} candidate page(s) into "
-                        "spare-parts rows..."
+                        f"Converting {len(structure_pages)} confirmed table page(s) into "
+                        "Benefit-ready rows..."
                     ),
                 )
                 extraction_messages: list[str] = []
                 if structure_mode == "AI JSON extraction (recommended)":
-                    rows, extraction_messages = extract_spare_parts_with_ai(
+                    ai_rows, extraction_messages = extract_spare_parts_with_ai(
                         api_key=api_key,
                         model=extraction_model.strip() or "mistral-small-latest",
-                        extracted_pages=candidate_pages,
+                        extracted_pages=structure_pages,
                         pages_per_batch=int(extraction_pages_per_batch),
                         max_chars_per_batch=int(extraction_max_chars),
                         additional_instructions=extra_prompt,
                         progress=show_progress,
                     )
-                    if not rows:
-                        extraction_messages.append(
-                            "AI extraction returned no rows; the local markdown-table "
-                            "parser was used on the candidate pages."
-                        )
-                        rows = extract_spare_parts_from_markdown_tables(candidate_pages)
                 else:
-                    rows = extract_spare_parts_from_markdown_tables(candidate_pages)
+                    ai_rows = []
+
+                source_document_name = _source_document_name(
+                    input_type, source_file, document_url, image_url
+                )
+                catalog_context_pages = list(extracted_pages)
+                if append_results and st.session_state.extracted_pages:
+                    context_lookup = {
+                        int(page): markdown
+                        for page, markdown in st.session_state.extracted_pages
+                    }
+                    context_lookup.update(
+                        {int(page): markdown for page, markdown in extracted_pages}
+                    )
+                    catalog_context_pages = sorted(
+                        context_lookup.items(), key=lambda value: value[0]
+                    )
+                rows, automation_messages = prepare_benefit_rows(
+                    ai_rows=ai_rows,
+                    extracted_pages=extracted_pages,
+                    source_document_name=source_document_name,
+                    main_row=current_main_row(),
+                    default_unit=default_unit,
+                    catalog_pages=catalog_context_pages,
+                )
+                extraction_messages.extend(automation_messages)
+                if not rows:
+                    rows = extract_spare_parts_from_markdown_tables(structure_pages)
+                    extraction_messages.append(
+                        "The deterministic local parser was used because no structured rows were returned."
+                    )
 
                 new_review = rows_to_review_dataframe(
                     rows,
@@ -1761,6 +1887,9 @@ with input_tab:
                 detected_candidates = build_submachinery_candidates(
                     combined_review,
                     current_main_row(),
+                    source_document_name=_source_document_name(
+                        input_type, source_file, document_url, image_url
+                    ),
                 )
                 merged_candidates = merge_submachinery_candidates(
                     previous_candidates,
@@ -1773,24 +1902,44 @@ with input_tab:
                     overwrite_auto_assignments=False,
                 )
 
+                valid_auto_names = [
+                    str(value).strip()
+                    for value in included_submachinery_rows(merged_candidates)["NAME"].tolist()
+                    if str(value).strip()
+                ]
+                assigned_review = recalculate_review_status(
+                    assigned_review,
+                    valid_machinery_names=[st.session_state.main_name] + valid_auto_names,
+                    allow_duplicates=False,
+                )
                 st.session_state.submachinery_review = merged_candidates
                 st.session_state.spare_review = assigned_review
                 st.session_state.submachinery_editor_version += 1
                 st.session_state.editor_version += 1
                 st.session_state.output = None
-                progress_bar.progress(1.0, text="OCR and extraction complete")
+                ready_count = int(assigned_review["READY"].astype(bool).sum()) if not assigned_review.empty else 0
+                exception_count = int((assigned_review["INCLUDE"].astype(bool) & ~assigned_review["READY"].astype(bool)).sum()) if not assigned_review.empty else 0
+                progress_bar.progress(1.0, text="OCR and automated matching complete")
                 st.success(
-                    f"OCR processed {len(extracted_pages)} page(s); "
-                    f"{len(candidate_pages)} were structured, {skipped_count} were skipped, "
-                    f"and {len(new_review)} candidate spare-part row(s) were created. "
-                    f"The app currently has {len(st.session_state.submachinery_review)} "
-                    "sub-machinery proposal(s) for review."
+                    f"OCR processed {len(extracted_pages)} page(s). The app identified "
+                    f"{len(structure_pages)} genuine table page(s), created {len(new_review)} spare-part row(s), "
+                    f"matched {len(merged_candidates)} source-coded sub-machinery section(s), and marked "
+                    f"{ready_count} row(s) ready. Exceptions requiring review: {exception_count}."
                 )
                 for message in extraction_messages:
-                    if message.startswith("Recovered") or "recovered" in message.lower():
+                    lowered_message = message.lower()
+                    if (
+                        message.startswith("Recovered")
+                        or "recovered" in lowered_message
+                        or "deterministic" in lowered_message
+                        or "detected" in lowered_message
+                        or "verified" in lowered_message
+                    ):
                         st.info(message)
-                    else:
+                    elif "exception" in lowered_message or "review" in lowered_message:
                         st.warning(message)
+                    else:
+                        st.info(message)
             except Exception as exc:
                 progress_bar.empty()
                 safe_message = str(exc)
@@ -1831,7 +1980,12 @@ with input_tab:
             "Pages skipped",
             int((~page_summary["Process"]).sum()),
         )
-        st.dataframe(page_summary, use_container_width=True, hide_index=True)
+        st.dataframe(
+            page_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_auto_dataframe_config(page_summary, maximums={"Preview": 520}),
+        )
 
         raw_markdown = "\n\n".join(
             f"# Page {page}\n\n{markdown}"
@@ -2153,6 +2307,9 @@ with review_tab:
                     "SOURCE PAGE",
                     "SECTION START PAGE",
                     "TABLE TITLE",
+                    "SECTION CODE",
+                    "SECTION MAKER",
+                    "SECTION MODEL",
                     "CONFIDENCE",
                     "DETECTED MACHINERY",
                     "ASSIGNMENT SOURCE",
@@ -2172,17 +2329,17 @@ with review_tab:
                             "Approved sub-machinery assigned to this spare-part row. "
                             "The main machinery appears only when no sub-machinery applies."
                         ),
-                        width="medium",
+                        width=_content_column_width(editor_source, "MACHINERY", 160, 420),
                     ),
                     "PART NO": st.column_config.TextColumn(
-                        "PART NO", width="medium"
+                        "PART NO", width=_content_column_width(editor_source, "PART NO", 100, 260)
                     ),
                     "DESCRIPTION": st.column_config.TextColumn(
-                        "DESCRIPTION", width="large"
+                        "DESCRIPTION", width=_content_column_width(editor_source, "DESCRIPTION", 160, 420)
                     ),
-                    "CODE": st.column_config.TextColumn("CODE", width="medium"),
+                    "CODE": st.column_config.TextColumn("CODE", width=_content_column_width(editor_source, "CODE", 100, 260)),
                     "ITEM NO": st.column_config.TextColumn(
-                        "ITEM NO", width="small"
+                        "ITEM NO", width=_content_column_width(editor_source, "ITEM NO", 80, 180)
                     ),
                     "UNIT": st.column_config.SelectboxColumn(
                         "UNIT", options=UNIT_OPTIONS
@@ -2197,19 +2354,22 @@ with review_tab:
                         "SECTION START PAGE", format="%d", width="small"
                     ),
                     "TABLE TITLE": st.column_config.TextColumn(
-                        "TABLE TITLE", width="large"
+                        "TABLE TITLE", width=_content_column_width(editor_source, "TABLE TITLE", 150, 420)
                     ),
+                    "SECTION CODE": None,
+                    "SECTION MAKER": None,
+                    "SECTION MODEL": None,
                     "CONFIDENCE": st.column_config.ProgressColumn(
                         "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
                     ),
                     "DETECTED MACHINERY": st.column_config.TextColumn(
-                        "DETECTED MACHINERY", width="medium"
+                        "DETECTED MACHINERY", width=_content_column_width(editor_source, "DETECTED MACHINERY", 150, 420)
                     ),
                     "ASSIGNMENT SOURCE": st.column_config.TextColumn(
-                        "ASSIGNMENT SOURCE", width="medium"
+                        "ASSIGNMENT SOURCE", width=_content_column_width(editor_source, "ASSIGNMENT SOURCE", 150, 320)
                     ),
                     "WARNING": st.column_config.TextColumn(
-                        "WARNING", width="large"
+                        "WARNING", width=_content_column_width(editor_source, "WARNING", 160, 420)
                     ),
                 },
             )
@@ -2440,8 +2600,8 @@ with export_tab:
         "The app writes the reviewed data into the existing template as follows:\n\n"
         "- **1.Machineries|Sub|Units**, starting at row 5: CODE, NAME, MAKER, MODEL, "
         "TYPE, INSTR.BOOK, SPECIFICATIONS, MCH_TP(M/S/U).\n"
-        "- **2.Spare Parts**, starting at row 4: MACHINERY (approved sub-machinery), PART NO, DESCRIPTION, CODE, "
-        "ITEM NO, UNIT, QNT.\n\n"
+        "- **2.Spare Parts**, starting at row 4: MACHINERY (exact sub-machinery NAME), PART NO, DESCRIPTION, CODE, "
+        "ITEM NO, UNIT, QNT. Ident/Code is copied to both PART NO and CODE; drawing position goes to ITEM NO.\n\n"
         "Source pages, detected headings, confidence values, vessels, and review notes "
         "remain in the separate audit workbook."
     )
@@ -2482,20 +2642,25 @@ with export_tab:
         st.warning("No spare-part rows are currently included.")
     else:
         st.error(f"Correct {len(blocked)} included row(s) before export.")
+        blocked_display = blocked[
+            [
+                "SOURCE PAGE",
+                "SECTION START PAGE",
+                "MACHINERY",
+                "PART NO",
+                "DESCRIPTION",
+                "ITEM NO",
+                "WARNING",
+            ]
+        ]
         st.dataframe(
-            blocked[
-                [
-                    "SOURCE PAGE",
-                    "SECTION START PAGE",
-                    "MACHINERY",
-                    "PART NO",
-                    "DESCRIPTION",
-                    "ITEM NO",
-                    "WARNING",
-                ]
-            ],
+            blocked_display,
             use_container_width=True,
             hide_index=True,
+            column_config=_auto_dataframe_config(
+                blocked_display,
+                maximums={"MACHINERY": 360, "DESCRIPTION": 420, "WARNING": 420},
+            ),
         )
 
     can_build = (
@@ -2601,10 +2766,12 @@ with export_tab:
                 st.error("No document was ready for package export. Review the report below.")
 
         if st.session_state.multi_package_report:
+            package_report_frame = pd.DataFrame(st.session_state.multi_package_report)
             st.dataframe(
-                pd.DataFrame(st.session_state.multi_package_report),
+                package_report_frame,
                 use_container_width=True,
                 hide_index=True,
+                column_config=_auto_dataframe_config(package_report_frame, maximums={"Details": 520}),
             )
         if st.session_state.multi_package_output:
             st.download_button(
