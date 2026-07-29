@@ -368,7 +368,6 @@ def require_authentication() -> None:
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
-        st.subheader("Performance Team access")
         st.write(
             "Request a one-time code. The code will be sent to the shared "
             "Performance mailbox and must be entered in this same browser session."
