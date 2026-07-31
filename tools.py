@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.5"
+TOOLS_VERSION = "4.6"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -745,14 +745,19 @@ Benefit mapping rules:
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
-   UPPERCASE. When German/English/French are printed together, return only the
-   English phrase. Preserve dimensions, standards, stage numbers, and symbols.
+   UPPERCASE. When German/English/French are printed together, return the EXACT
+   printed English phrase. Do not paraphrase, modernize, shorten, expand, or replace
+   it with a synonym. Preserve the source wording, dimensions, standards, stage
+   numbers, punctuation, and symbols. Translate only when no English phrase is
+   printed on the source page, and lower confidence when translation is required.
 9. quantity must be numeric or null. unit is PCS, SET, or an empty string.
 10. source_page is the PAGE marker supplied in the user message.
 11. section_start_page is the first PDF page where the section begins, including
     its sectional/exploded drawing page when that page precedes the parts table.
 12. Continuation pages keep exactly the same section_code, section_name_english,
-    section_maker, section_model, and section_start_page.
+    section_maker, section_model, and section_start_page only when the current page
+    has no new drawing/table code in its own header. A code printed in a spare-part
+    row, description, cross-reference, or table body is never a section_code.
 13. Do not convert contents/index entries, drawing callouts without a parts table,
     page numbers, headers, or prose into spare-part rows.
 14. confidence is 0 to 1 and reflects OCR quality, row alignment, English-language
@@ -1135,10 +1140,27 @@ def extract_spare_parts_with_ai(
 # ---------------------------------------------------------------------------
 
 
+def _clean_markdown_cell(value: Any) -> str:
+    """Clean a Markdown table cell while preserving meaningful line breaks.
+
+    Mistral commonly separates German / English / French variants with ``<br>``.
+    Keeping those boundaries lets the deterministic layer select the exact printed
+    English phrase instead of trusting an AI paraphrase.
+    """
+    raw = "" if value is None else str(value)
+    raw = raw.replace("\x00", " ").replace("\\|", "|")
+    raw = re.sub(r"<br\s*/?>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"[`*_]+", "", raw)
+    lines = [re.sub(r"\s+", " ", line).strip() for line in raw.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def _split_markdown_row(line: str) -> list[str]:
     stripped = line.strip().strip("|")
-    return [clean_text(cell.replace("\\|", "|").replace("**", "")) for cell in re.split(r"(?<!\\)\|", stripped)]
-
+    return [
+        _clean_markdown_cell(cell)
+        for cell in re.split(r"(?<!\\)\|", stripped)
+    ]
 
 def _is_markdown_separator(line: str) -> bool:
     cells = _split_markdown_row(line)
@@ -1225,40 +1247,157 @@ def _join_section_codes(tokens: Sequence[str]) -> str:
     return " / ".join(dict.fromkeys(cleaned))
 
 
+def _language_segments(value: Any) -> list[str]:
+    """Return visually separated language variants without splitting values like 2/2-way."""
+    raw = _clean_markdown_cell(value)
+    if not raw:
+        return []
+    line_parts = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(line_parts) >= 2:
+        return line_parts
+    # Only split slashes surrounded by whitespace. Technical values such as
+    # ``2/2-way`` and dimensions such as ``10/12 mm`` must remain intact.
+    slash_parts = [
+        clean_text(part)
+        for part in re.split(r"\s+/\s+", raw)
+        if clean_text(part)
+    ]
+    return slash_parts if len(slash_parts) >= 2 else [clean_text(raw)]
+
+
+def _looks_likely_non_english(value: Any) -> bool:
+    text = clean_text(value).lower()
+    markers = (
+        "schraube", "mutter", "dichtung", "gleitlager", "stufe", "zylinder",
+        "halter", "kupplung", "scheibe", "leitung", "gehäuse", "manometer",
+        "pièce", "soupape", "tuyau", "arbre", "carter", "écrou", "palier",
+        "étage", "raccord", "support pour", "vis hexagonale", "joint de",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _looks_likely_english(value: Any) -> bool:
+    text = clean_text(value).lower()
+    if not text or _looks_likely_non_english(text):
+        return False
+    markers = (
+        " for ", " with ", " and ", " of ", "stage", "support", "motor",
+        "bolt", "nut", "ring", "valve", "pipe", "gauge", "piece", "hose",
+        "bearing", "coupling", "mounting", "separator", "filter", "plate",
+        "disc", "cylinder", "head", "pressure", "suction", "flywheel",
+        "socket", "clip", "flange", "fitting", "thermometer", "gasket",
+        "joint", "seal", "spring", "shaft", "cover", "piston", "liner",
+        "screw", "washer", "nozzle", "support", "bracket", "cartridge",
+    )
+    padded = f" {text} "
+    if any(marker in padded for marker in markers):
+        return True
+    # Short plain-ASCII technical labels are usually the English line after OCR.
+    # Known German/French terms were rejected above.
+    return bool(re.fullmatch(r"[a-z0-9 .,+()'°%/_-]{2,80}", text))
+
 def _english_variant(value: Any) -> str:
-    text = clean_text(value)
-    if not text:
+    segments = _language_segments(value)
+    if not segments:
         return ""
-    slash_parts = [clean_text(part) for part in re.split(r"\s*/\s*", text) if clean_text(part)]
-    if len(slash_parts) >= 3:
-        return slash_parts[1].upper()
-    line_parts = [clean_text(part) for part in re.split(r"[\r\n]+", str(value)) if clean_text(part)]
-    if len(line_parts) >= 3:
-        return line_parts[1].upper()
-    return text.upper()
+    if len(segments) >= 3:
+        return clean_text(segments[1]).upper()
+    if len(segments) == 2:
+        first, second = segments
+        if _looks_likely_non_english(first) and _looks_likely_english(second):
+            return clean_text(second).upper()
+    return clean_text(segments[0]).upper()
 
 
 def _best_effort_english_description(value: Any) -> tuple[str, bool]:
     """Return uppercase English text and whether language review is still needed."""
-    text = clean_text(value)
-    if not text:
+    segments = _language_segments(value)
+    if not segments:
         return "", True
-    if "/" in text:
-        parts = [clean_text(part) for part in re.split(r"\s*/\s*", text) if clean_text(part)]
-        if len(parts) >= 3:
-            return parts[1].upper(), False
-    lines = [clean_text(part) for part in re.split(r"[\r\n]+", str(value)) if clean_text(part)]
-    if len(lines) >= 3:
-        return lines[1].upper(), False
-    # A single phrase from AI is already acceptable. Long concatenated multilingual
-    # cells remain visible as an exception rather than being silently mistranslated.
-    multilingual_markers = (
-        " dés", " soupape", " joint ", " tuyau", " vis ", " arbre ", " carter",
-        " und ", " schraube", " dichtung", " lager", " stufe", " zylinder",
-    )
-    lower = f" {text.lower()} "
-    needs_review = sum(marker in lower for marker in multilingual_markers) >= 2
+    if len(segments) >= 3:
+        return clean_text(segments[1]).upper(), False
+    if len(segments) == 2:
+        first, second = segments
+        if _looks_likely_non_english(first) and _looks_likely_english(second):
+            return clean_text(second).upper(), False
+    text = clean_text(segments[0])
+    # A single AI phrase is accepted only when it looks plausibly English. This
+    # catches cases such as MANOMETER / STUFE being returned as the English line.
+    needs_review = _looks_likely_non_english(text) or not _looks_likely_english(text)
     return text.upper(), needs_review
+
+
+def _source_english_description(value: Any) -> tuple[str, bool]:
+    """Return an exact English phrase printed in the source when it can be isolated."""
+    segments = _language_segments(value)
+    if not segments:
+        return "", False
+    if len(segments) >= 3:
+        return clean_text(segments[1]).upper(), True
+    if len(segments) == 2:
+        first, second = segments
+        if _looks_likely_non_english(first) and _looks_likely_english(second):
+            return clean_text(second).upper(), True
+    if len(segments) == 1 and _looks_likely_english(segments[0]):
+        return clean_text(segments[0]).upper(), True
+    return "", False
+
+
+def _select_source_faithful_description(
+    source_value: Any,
+    ai_value: Any,
+) -> tuple[str, bool, bool, str]:
+    """Choose a description while keeping exact source English ahead of AI wording.
+
+    Returns ``(description, needs_review, ai_disagreed, source_kind)``.
+    """
+    source_description, source_is_exact = _source_english_description(source_value)
+    ai_description, ai_needs_review = _best_effort_english_description(ai_value)
+
+    if source_is_exact and source_description:
+        disagreed = bool(
+            ai_description
+            and SequenceMatcher(
+                None,
+                normalize_key(source_description),
+                normalize_key(ai_description),
+            ).ratio() < 0.92
+        )
+        # The printed English phrase is authoritative even when the AI produced a
+        # fluent synonym or paraphrase.
+        return source_description, False, disagreed, "printed English"
+
+    if ai_description:
+        return ai_description, bool(ai_needs_review), False, "AI English/translation"
+
+    fallback = clean_text(source_value).upper()
+    return fallback, True, False, "unresolved source text"
+
+def _page_header_text(markdown: str, max_lines: int = 28) -> str:
+    """Return only the page header / pre-table area used for section detection."""
+    candidates: list[str] = []
+    for block in _markdown_table_blocks(markdown):
+        header_index = _find_data_header_index(block)
+        if header_index is not None and header_index > 0:
+            for row in block[:header_index]:
+                candidates.extend(cell for cell in row if clean_text(cell))
+            break
+
+    if not candidates:
+        for line in str(markdown or "").splitlines():
+            cleaned = _clean_markdown_cell(line.lstrip("# "))
+            if not cleaned or line.lstrip().startswith("!["):
+                continue
+            lowered = clean_text(cleaned).lower()
+            if (
+                any(token in lowered for token in ("description", "designation", "benennung"))
+                and any(token in lowered for token in ("ident", "part-no", "part no", "item"))
+            ):
+                break
+            candidates.append(cleaned)
+            if len(candidates) >= max_lines:
+                break
+    return "\n".join(dict.fromkeys(clean_text(value) for value in candidates if clean_text(value)))
 
 
 def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
@@ -1269,69 +1408,108 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
         "section_name_english": "",
         "maker": "",
         "model": "",
+        "header_text": "",
+        "section_code_source": "",
     }
     blocks = _markdown_table_blocks(markdown)
     for block in blocks:
         header_index = _find_data_header_index(block)
         if header_index is None or header_index <= 0:
             continue
-        meta_row = block[0]
-        nonempty = [clean_text(value) for value in meta_row if clean_text(value)]
-        if meta_row:
-            metadata["maker"] = clean_text(meta_row[0]).upper()
-        if len(meta_row) >= 3:
-            metadata["section_name_raw"] = clean_text(meta_row[-2])
-        tail = clean_text(meta_row[-1]) if meta_row else ""
-        tokens = _section_code_tokens(tail, permissive=True)
-        if tokens:
-            metadata["section_code"] = _join_section_codes(tokens)
-        model_part = re.split(r"\b(?:TAFEL|TABLE|PLANCHE|DRAWING|DWG)\b", tail, maxsplit=1, flags=re.I)[0]
+        preheader_rows = block[:header_index]
+        meta_row = max(
+            preheader_rows,
+            key=lambda row: sum(bool(clean_text(value)) for value in row),
+        )
+        nonempty = [value for value in meta_row if clean_text(value)]
+        if nonempty:
+            metadata["maker"] = clean_text(nonempty[0]).upper()
+
+        tail = nonempty[-1] if nonempty else ""
+        tail_tokens = _section_code_tokens(tail, permissive=True)
+        if tail_tokens:
+            metadata["section_code"] = _join_section_codes(tail_tokens)
+            metadata["section_code_source"] = "page header cell"
+
+        middle_candidates = nonempty[1:-1] if len(nonempty) >= 3 else nonempty[1:]
+        title_candidates = []
+        for value in middle_candidates:
+            cleaned = _clean_markdown_cell(value)
+            flat = clean_text(cleaned)
+            if not re.search(r"[A-Za-zÀ-ÿ]", flat):
+                continue
+            if re.fullmatch(r"[A-Z]?\s*\d+(?:[ ._/-]\d+)*", flat, flags=re.I):
+                continue
+            if re.search(r"\b(?:TAFEL|TABLE|PLANCHE|DRAWING|DWG)\b", flat, flags=re.I):
+                continue
+            title_candidates.append(cleaned)
+        if title_candidates:
+            # Prefer the richest multilingual title cell rather than a short model label.
+            metadata["section_name_raw"] = max(
+                title_candidates,
+                key=lambda value: (len(_language_segments(value)), len(clean_text(value))),
+            )
+
+        model_part = re.split(
+            r"\b(?:TAFEL|TABLE|PLANCHE|DRAWING|DWG)\b",
+            clean_text(tail),
+            maxsplit=1,
+            flags=re.I,
+        )[0]
         metadata["model"] = clean_text(model_part).upper()
         break
 
-    text = str(markdown or "")
+    header_text = _page_header_text(markdown)
+    metadata["header_text"] = header_text
     if not metadata["section_code"]:
-        tokens = _section_code_tokens(text)
+        # Never search the spare-parts table body for a section code. Identifiers and
+        # cross-references in the body caused the previous section to remain active.
+        tokens = _section_code_tokens(header_text, permissive=True)
         if tokens:
             metadata["section_code"] = _join_section_codes(tokens)
+            metadata["section_code_source"] = "page header area"
+
+    text = str(markdown or "")
     if not metadata["maker"]:
-        bold_candidates = re.findall(r"\*\*([^*]{2,60})\*\*", text)
+        bold_candidates = re.findall(r"\*\*([^*]{2,60})\*\*", header_text or text)
         for candidate in bold_candidates:
             candidate_clean = clean_text(candidate).upper()
             if re.search(r"[A-Z]", candidate_clean) and not re.search(r"\d", candidate_clean):
                 if candidate_clean not in {"DESCRIPTION", "DESIGNATION", "QUANTITY", "TABLE"}:
                     metadata["maker"] = candidate_clean
                     break
+
     if not metadata["section_name_raw"]:
         lines = [
-            clean_text(line.lstrip("# "))
-            for line in text.splitlines()
+            _clean_markdown_cell(line.lstrip("# "))
+            for line in (header_text or text).splitlines()
             if clean_text(line.lstrip("# ")) and not line.lstrip().startswith("![")
         ]
         stop_index = next(
-            (idx for idx, line in enumerate(lines) if re.search(r"\b(?:TAFEL|TABLE|PLANCHE)\b", line, flags=re.I)),
+            (idx for idx, line in enumerate(lines) if re.search(r"\b(?:TAFEL|TABLE|PLANCHE)\b", clean_text(line), flags=re.I)),
             None,
         )
-        title_lines = lines[:stop_index] if stop_index is not None else lines[:5]
+        title_lines = lines[:stop_index] if stop_index is not None else lines[:6]
         title_lines = [line for line in title_lines if not _section_code_tokens(line)]
-        title_lines = [line for line in title_lines if not re.fullmatch(r"[A-Z]?\s*\d+(?:\s*-\s*[A-Z]?\s*\d+)*", line, flags=re.I)]
+        title_lines = [
+            line for line in title_lines
+            if not re.fullmatch(r"[A-Z]?\s*\d+(?:\s*-\s*[A-Z]?\s*\d+)*", clean_text(line), flags=re.I)
+        ]
         if len(title_lines) >= 3:
-            metadata["section_name_english"] = title_lines[1].upper()
-            metadata["section_name_raw"] = " / ".join(title_lines[:3])
+            metadata["section_name_raw"] = "\n".join(title_lines[:3])
         elif title_lines:
             metadata["section_name_raw"] = title_lines[0]
-    if not metadata["section_name_english"]:
-        metadata["section_name_english"] = _english_variant(metadata["section_name_raw"])
+
+    metadata["section_name_english"] = _english_variant(metadata["section_name_raw"])
     if not metadata["model"]:
         model_match = re.search(
             r"\b(?:COMPRESSOR|KOMPRESSOR|ENGINE|GENERATOR|PUMP)\s+([A-Z0-9][A-Z0-9 ._/-]{1,30})",
-            text,
+            header_text or text,
             flags=re.I,
         )
         if model_match:
             metadata["model"] = clean_text(model_match.group(1)).upper()
     return metadata
-
 
 def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -1360,7 +1538,12 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                 }
                 for column_index, canonical in enumerate(mappings):
                     if canonical and column_index < len(padded):
-                        record[canonical] = clean_text(padded[column_index])
+                        value = padded[column_index]
+                        record[canonical] = (
+                            _clean_markdown_cell(value)
+                            if canonical == "description_raw"
+                            else clean_text(value)
+                        )
                 description_raw = clean_text(record.get("description_raw", ""))
                 ident_no = clean_text(record.get("ident_no", ""))
                 item_no = clean_text(record.get("item_no", ""))
@@ -1447,17 +1630,37 @@ def build_section_catalog(
     extracted_rows: Sequence[dict[str, Any]] | None = None,
     main_row: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a deterministic section catalogue keyed by source drawing/table code."""
-    sections, index_pages = _index_sections(extracted_pages)
+    """Build a section catalogue anchored to codes printed in each page header.
+
+    Version 4.6 deliberately avoids scanning the spare-parts table body for section
+    codes. Body identifiers and cross-references previously produced multiple matches,
+    leaving the previous ``active`` section stuck while the spare rows moved on.
+    """
+    index_sections, index_pages = _index_sections(extracted_pages)
     global_maker, global_model = _global_manual_maker_model(extracted_pages)
     main_row = main_row or {}
+    sections: list[dict[str, Any]] = []
     by_alias: dict[str, dict[str, Any]] = {}
 
-    def register(section: dict[str, Any]) -> dict[str, Any]:
-        aliases = [clean_text(value).upper() for value in section.get("aliases", []) if clean_text(value)]
-        code = clean_text(section.get("code", "")) or _join_section_codes(aliases)
+    def register(section: dict[str, Any], priority: int = 50) -> dict[str, Any]:
+        aliases = [
+            clean_text(value).upper()
+            for value in section.get("aliases", [])
+            if clean_text(value)
+        ]
+        code = clean_text(section.get("code", "")).upper() or _join_section_codes(aliases)
+        if not aliases and code:
+            aliases = _section_code_tokens(code, permissive=True) or [code]
+        aliases = list(dict.fromkeys(aliases))
         name = clean_text(section.get("name", "")).upper()
-        existing = next((by_alias.get(normalize_key(alias)) for alias in aliases if by_alias.get(normalize_key(alias))), None)
+        existing = next(
+            (
+                by_alias.get(normalize_key(alias))
+                for alias in aliases
+                if by_alias.get(normalize_key(alias)) is not None
+            ),
+            None,
+        )
         if existing is None:
             existing = {
                 "code": code,
@@ -1466,49 +1669,62 @@ def build_section_catalog(
                 "maker": clean_text(section.get("maker", "")).upper(),
                 "model": clean_text(section.get("model", "")).upper(),
                 "pages": set(section.get("pages", set())),
+                "_name_priority": int(priority if name else -1),
+                "_maker_priority": int(priority if clean_text(section.get("maker", "")) else -1),
+                "_model_priority": int(priority if clean_text(section.get("model", "")) else -1),
             }
-            sections.append(existing) if existing not in sections else None
+            sections.append(existing)
         else:
-            if name and (not existing.get("name") or len(name) < len(existing.get("name", ""))):
+            if name and int(priority) > int(existing.get("_name_priority", -1)):
                 existing["name"] = name
-            if clean_text(section.get("maker", "")):
-                existing["maker"] = clean_text(section.get("maker", "")).upper()
-            if clean_text(section.get("model", "")):
-                existing["model"] = clean_text(section.get("model", "")).upper()
+                existing["_name_priority"] = int(priority)
+            maker = clean_text(section.get("maker", "")).upper()
+            if maker and int(priority) > int(existing.get("_maker_priority", -1)):
+                existing["maker"] = maker
+                existing["_maker_priority"] = int(priority)
+            model = clean_text(section.get("model", "")).upper()
+            if model and int(priority) > int(existing.get("_model_priority", -1)):
+                existing["model"] = model
+                existing["_model_priority"] = int(priority)
             existing["pages"].update(section.get("pages", set()))
             for alias in aliases:
                 if alias not in existing["aliases"]:
                     existing["aliases"].append(alias)
+            if not existing.get("code") and code:
+                existing["code"] = code
         for alias in existing.get("aliases", []):
             by_alias[normalize_key(alias)] = existing
         return existing
 
-    # Re-register index entries in a clean map.
-    original_sections = list(sections)
-    sections = []
-    for section in original_sections:
-        register(section)
+    # Printed index/catalogue entries are reliable, but an exact page header is
+    # stronger and is therefore registered with a higher priority below.
+    for section in index_sections:
+        register(section, priority=80)
 
     page_metadata: dict[int, dict[str, Any]] = {}
     for page_number, markdown in extracted_pages:
-        metadata = _page_metadata(int(page_number), markdown)
-        page_metadata[int(page_number)] = metadata
-        if int(page_number) in index_pages:
+        page = int(page_number)
+        metadata = _page_metadata(page, markdown)
+        page_metadata[page] = metadata
+        if page in index_pages:
             continue
         code_tokens = _section_code_tokens(metadata.get("section_code", ""), permissive=True)
         if code_tokens:
-            section = register(
+            registered = register(
                 {
                     "code": _join_section_codes(code_tokens),
                     "aliases": code_tokens,
                     "name": metadata.get("section_name_english", ""),
                     "maker": metadata.get("maker", ""),
                     "model": metadata.get("model", ""),
-                    "pages": {int(page_number)},
-                }
+                    "pages": {page},
+                },
+                priority=100,
             )
-            section["pages"].add(int(page_number))
+            registered["pages"].add(page)
 
+    # AI catalogue values can fill gaps but must never overwrite an exact printed
+    # header title such as RESILIENT MOUNTING with a paraphrase such as ELASTIC MOUNTING.
     for row in extracted_rows or []:
         code_tokens = _section_code_tokens(row.get("section_code", ""), permissive=True)
         if not code_tokens:
@@ -1518,21 +1734,50 @@ def build_section_catalog(
             {
                 "code": _join_section_codes(code_tokens),
                 "aliases": code_tokens,
-                "name": clean_text(row.get("section_name_english", row.get("detected_machinery", ""))).upper(),
+                "name": clean_text(
+                    row.get("section_name_english", row.get("detected_machinery", ""))
+                ).upper(),
                 "maker": clean_text(row.get("section_maker", "")).upper(),
                 "model": clean_text(row.get("section_model", "")).upper(),
-                "pages": {int(source_page)} if source_page is not None else set(),
-            }
+                # AI rows may contain stale section context. They can define a
+                # missing catalogue alias, but never claim authoritative pages.
+                "pages": set(),
+            },
+            priority=30,
         )
 
-    # Exact code appearances include drawing pages and are the authoritative start.
-    page_text_lookup = {int(page): clean_text(markdown).upper() for page, markdown in extracted_pages}
-    for page, text in page_text_lookup.items():
-        if page in index_pages:
-            continue
-        for section in sections:
-            if any(alias and alias in text for alias in section.get("aliases", [])):
-                section["pages"].add(page)
+    def unique_sections(values: Sequence[dict[str, Any] | None]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for value in values:
+            if value is not None and id(value) not in seen_ids:
+                result.append(value)
+                seen_ids.add(id(value))
+        return result
+
+    def sections_for_codes(value: Any) -> list[dict[str, Any]]:
+        return unique_sections(
+            [
+                by_alias.get(normalize_key(token))
+                for token in _section_code_tokens(value, permissive=True)
+            ]
+        )
+
+    def normalized_code_text(value: Any) -> str:
+        text_value = clean_text(value).upper()
+        return re.sub(r"\s*([./_-])\s*", r"\1", text_value)
+
+    def alias_in_header(alias: str, header_text: str) -> bool:
+        alias_text = normalized_code_text(alias)
+        source_text = normalized_code_text(header_text)
+        if not alias_text or not source_text:
+            return False
+        return bool(
+            re.search(
+                rf"(?<![A-Z0-9]){re.escape(alias_text)}(?![A-Z0-9])",
+                source_text,
+            )
+        )
 
     parts_pages = {
         int(page)
@@ -1540,24 +1785,100 @@ def build_section_catalog(
         if int(page) not in index_pages and _looks_like_spare_table_page(markdown)
     }
     page_map: dict[int, dict[str, Any]] = {}
+    page_map_sources: dict[int, str] = {}
+    ambiguous_pages: set[int] = set()
+    unmapped_parts_pages: set[int] = set()
     active: dict[str, Any] | None = None
-    for page in sorted(page_text_lookup):
-        matches = []
-        text = page_text_lookup[page]
-        for section in sections:
-            if any(alias and alias in text for alias in section.get("aliases", [])):
-                matches.append(section)
-        unique_matches = []
-        seen_ids = set()
-        for match in matches:
-            if id(match) not in seen_ids:
-                unique_matches.append(match)
-                seen_ids.add(id(match))
-        if len(unique_matches) == 1:
-            active = unique_matches[0]
-        if page in parts_pages and active is not None:
-            page_map[page] = active
-            active["pages"].add(page)
+    active_anchor_page: int | None = None
+
+    for page in sorted(page_metadata):
+        if page in index_pages:
+            continue
+        metadata = page_metadata[page]
+        explicit_matches = sections_for_codes(metadata.get("section_code", ""))
+        resolved: dict[str, Any] | None = None
+        resolved_source = ""
+
+        if len(explicit_matches) == 1:
+            resolved = explicit_matches[0]
+            resolved_source = "exact page-header code"
+        elif len(explicit_matches) > 1:
+            # Multiple aliases are fine when they resolve to one section; reaching
+            # this branch means genuinely conflicting sections on the same header.
+            ambiguous_pages.add(page)
+            active = None
+            active_anchor_page = None
+        else:
+            header_text = metadata.get("header_text", "")
+            header_matches = unique_sections(
+                [
+                    section
+                    for section in sections
+                    if any(
+                        alias_in_header(alias, header_text)
+                        for alias in section.get("aliases", [])
+                    )
+                ]
+            )
+            if len(header_matches) == 1:
+                resolved = header_matches[0]
+                resolved_source = "exact code in page header area"
+            elif len(header_matches) > 1:
+                ambiguous_pages.add(page)
+                active = None
+                active_anchor_page = None
+            else:
+                # Use a very strong title match only when no code is available.
+                name_key = normalize_key(metadata.get("section_name_english", ""))
+                if name_key:
+                    scored = sorted(
+                        (
+                            (
+                                SequenceMatcher(
+                                    None,
+                                    name_key,
+                                    normalize_key(section.get("name", "")),
+                                ).ratio(),
+                                section,
+                            )
+                            for section in sections
+                            if clean_text(section.get("name", ""))
+                        ),
+                        key=lambda pair: pair[0],
+                        reverse=True,
+                    )
+                    if scored and scored[0][0] >= 0.96:
+                        second_score = scored[1][0] if len(scored) > 1 else 0.0
+                        if scored[0][0] - second_score >= 0.03:
+                            resolved = scored[0][1]
+                            resolved_source = "exact page-header title"
+
+        if resolved is not None:
+            active = resolved
+            active_anchor_page = page
+            resolved["pages"].add(page)
+        elif (
+            page in parts_pages
+            and active is not None
+            and active_anchor_page is not None
+            and page - active_anchor_page == 1
+            and page not in ambiguous_pages
+            and not clean_text(metadata.get("section_code", ""))
+        ):
+            # Carry forward only to an immediately consecutive continuation page
+            # that has no new header code. This cannot jump across ambiguous pages.
+            resolved = active
+            resolved_source = "confirmed consecutive continuation"
+            active_anchor_page = page
+            resolved["pages"].add(page)
+        elif page in parts_pages:
+            unmapped_parts_pages.add(page)
+            active = None
+            active_anchor_page = None
+
+        if page in parts_pages and resolved is not None:
+            page_map[page] = resolved
+            page_map_sources[page] = resolved_source
 
     fallback_maker = global_maker or clean_text(main_row.get("MAKER", "")).upper()
     fallback_model = global_model or clean_text(main_row.get("MODEL", "")).upper()
@@ -1567,23 +1888,39 @@ def build_section_catalog(
         if id(section) in seen_section_ids:
             continue
         seen_section_ids.add(id(section))
-        pages = sorted(int(page) for page in section.get("pages", set()) if int(page) not in index_pages)
+        pages = sorted(
+            int(page)
+            for page in section.get("pages", set())
+            if int(page) not in index_pages
+        )
         section["name"] = clean_text(section.get("name", "")).upper()
         section["maker"] = clean_text(section.get("maker", "")).upper() or fallback_maker
         section["model"] = clean_text(section.get("model", "")).upper() or fallback_model
         section["first_page"] = min(pages) if pages else None
         section["last_page"] = max(pages) if pages else None
         section["pages"] = pages
+        section.pop("_name_priority", None)
+        section.pop("_maker_priority", None)
+        section.pop("_model_priority", None)
         if section.get("code") or section.get("name"):
             final_sections.append(section)
-    final_sections.sort(key=lambda item: (item.get("first_page") is None, item.get("first_page") or 10**9, item.get("name", "")))
+    final_sections.sort(
+        key=lambda item: (
+            item.get("first_page") is None,
+            item.get("first_page") or 10**9,
+            item.get("name", ""),
+        )
+    )
     return {
         "sections": final_sections,
         "page_map": page_map,
+        "page_map_sources": page_map_sources,
+        "page_metadata": page_metadata,
         "index_pages": index_pages,
         "parts_pages": parts_pages,
+        "ambiguous_pages": ambiguous_pages,
+        "unmapped_parts_pages": unmapped_parts_pages,
     }
-
 
 def _catalog_prompt_hint(sections: Sequence[dict[str, Any]]) -> str:
     lines: list[str] = []
@@ -1684,87 +2021,205 @@ def prepare_benefit_rows(
     default_unit: str = "PCS",
     catalog_pages: Sequence[tuple[int, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Repair and normalize extraction using exact PDF table structure and section codes."""
+    """Repair and normalize extraction using exact PDF table structure and page headers."""
     normalized_ai = [_normalized_ai_row(row) for row in ai_rows if isinstance(row, dict)]
     direct_rows = _direct_table_rows(extracted_pages)
     section_context_pages = list(catalog_pages) if catalog_pages is not None else list(extracted_pages)
     catalog = build_section_catalog(section_context_pages, normalized_ai, main_row)
     sections = catalog["sections"]
     page_map = catalog["page_map"]
+    page_map_sources = catalog.get("page_map_sources", {})
     index_pages = catalog["index_pages"]
     parts_pages = catalog["parts_pages"]
+    ambiguous_pages = catalog.get("ambiguous_pages", set())
+    unmapped_parts_pages = catalog.get("unmapped_parts_pages", set())
 
-    ai_by_page_item: dict[tuple[int | None, str], dict[str, Any]] = {}
-    ai_by_page_ident: dict[tuple[int | None, str], dict[str, Any]] = {}
+    by_alias: dict[str, dict[str, Any]] = {}
+    for section in sections:
+        for alias in section.get("aliases", []):
+            if normalize_key(alias):
+                by_alias[normalize_key(alias)] = section
+
+    def exact_sections_for_code(value: Any) -> list[dict[str, Any]]:
+        matches: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        for token in _section_code_tokens(value, permissive=True):
+            section = by_alias.get(normalize_key(token))
+            if section is not None and id(section) not in seen_ids:
+                matches.append(section)
+                seen_ids.add(id(section))
+        return matches
+
+    def fuzzy_section_for_name(value: Any) -> dict[str, Any] | None:
+        name_key = normalize_key(value)
+        if not name_key:
+            return None
+        scored = sorted(
+            (
+                (
+                    SequenceMatcher(
+                        None,
+                        name_key,
+                        normalize_key(section.get("name", "")),
+                    ).ratio(),
+                    section,
+                )
+                for section in sections
+                if clean_text(section.get("name", ""))
+            ),
+            key=lambda pair: pair[0],
+            reverse=True,
+        )
+        if not scored or scored[0][0] < 0.94:
+            return None
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        return scored[0][1] if scored[0][0] - second_score >= 0.03 else None
+
+    def section_for(
+        page: int | None,
+        direct_row: dict[str, Any] | None = None,
+        ai_row: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, str, bool]:
+        """Resolve a section with printed page context ahead of AI context."""
+        direct_row = direct_row or {}
+        ai_row = ai_row or {}
+        direct_matches = exact_sections_for_code(direct_row.get("section_code", ""))
+        page_section = page_map.get(page) if page is not None else None
+        ai_matches = exact_sections_for_code(ai_row.get("section_code", ""))
+        conflict = False
+
+        if len(direct_matches) == 1:
+            chosen = direct_matches[0]
+            if page_section is not None and id(page_section) != id(chosen):
+                conflict = True
+            if len(ai_matches) == 1 and id(ai_matches[0]) != id(chosen):
+                conflict = True
+            return chosen, "exact printed page-header code", conflict
+        if len(direct_matches) > 1:
+            conflict = True
+
+        if page_section is not None:
+            if len(ai_matches) == 1 and id(ai_matches[0]) != id(page_section):
+                conflict = True
+            return page_section, page_map_sources.get(page, "page-header map"), conflict
+
+        # AI section codes are only a fallback when no printed page/header mapping
+        # exists. They can no longer override a deterministic source code.
+        if len(ai_matches) == 1:
+            return ai_matches[0], "AI section code fallback", conflict
+        if len(ai_matches) > 1:
+            conflict = True
+
+        direct_name_match = fuzzy_section_for_name(direct_row.get("section_name_english", ""))
+        if direct_name_match is not None:
+            return direct_name_match, "printed page-title match", conflict
+        ai_name_match = fuzzy_section_for_name(ai_row.get("section_name_english", ""))
+        if ai_name_match is not None:
+            return ai_name_match, "AI title fallback", conflict
+        return None, "unconfirmed", True
+
+    # Match AI rows with the strongest available row identity. ITEM NO alone is not
+    # globally unique and could previously select a different row on the same page.
+    ai_by_full_key: dict[tuple[int | None, str, str], dict[str, Any]] = {}
+    ai_by_page_ident_lists: dict[tuple[int | None, str], list[dict[str, Any]]] = {}
+    ai_by_page_item_lists: dict[tuple[int | None, str], list[dict[str, Any]]] = {}
     for row in normalized_ai:
         page = row.get("source_page")
         item_key = normalize_key(row.get("item_no", ""))
         ident_key = normalize_key(row.get("ident_no", ""))
-        if item_key:
-            ai_by_page_item[(page, item_key)] = row
+        if item_key or ident_key:
+            ai_by_full_key[(page, item_key, ident_key)] = row
         if ident_key:
-            ai_by_page_ident[(page, ident_key)] = row
+            ai_by_page_ident_lists.setdefault((page, ident_key), []).append(row)
+        if item_key:
+            ai_by_page_item_lists.setdefault((page, item_key), []).append(row)
+
+    def matched_ai_row(page: int, item_key: str, ident_key: str) -> dict[str, Any] | None:
+        exact = ai_by_full_key.get((page, item_key, ident_key))
+        if exact is not None:
+            return exact
+        by_ident = ai_by_page_ident_lists.get((page, ident_key), []) if ident_key else []
+        if len(by_ident) == 1:
+            return by_ident[0]
+        by_item = ai_by_page_item_lists.get((page, item_key), []) if item_key else []
+        if len(by_item) == 1:
+            return by_item[0]
+        return None
 
     output: list[dict[str, Any]] = []
     matched_ai_ids: set[int] = set()
     language_exceptions = 0
-
-    def section_for(page: int | None, row: dict[str, Any]) -> dict[str, Any] | None:
-        code_tokens = _section_code_tokens(row.get("section_code", ""), permissive=True)
-        if code_tokens:
-            code_keys = {normalize_key(token) for token in code_tokens}
-            for section in sections:
-                if code_keys & {normalize_key(alias) for alias in section.get("aliases", [])}:
-                    return section
-        if page is not None and page in page_map:
-            return page_map[page]
-        name_key = normalize_key(row.get("section_name_english", ""))
-        if name_key:
-            scored = sorted(
-                ((SequenceMatcher(None, name_key, normalize_key(section.get("name", ""))).ratio(), section) for section in sections),
-                key=lambda pair: pair[0],
-                reverse=True,
-            )
-            if scored and scored[0][0] >= 0.90:
-                return scored[0][1]
-        return None
+    paraphrases_prevented = 0
+    section_conflicts = 0
+    unconfirmed_sections = 0
 
     if direct_rows:
         for direct in direct_rows:
             page = int(direct["source_page"])
             item_key = normalize_key(direct.get("item_no", ""))
             ident_key = normalize_key(direct.get("ident_no", ""))
-            ai = ai_by_page_item.get((page, item_key)) or ai_by_page_ident.get((page, ident_key))
+            ai = matched_ai_row(page, item_key, ident_key)
             if ai is not None:
                 matched_ai_ids.add(id(ai))
-            description_source = ""
+
+            ai_description_source = ""
             if ai is not None and not bool(ai.get("local_fallback", False)):
-                description_source = clean_text(ai.get("description_english", ""))
-            description, language_review = _best_effort_english_description(description_source)
-            if not description:
-                description, isolated_from_layout = _best_effort_english_description(
-                    direct.get("description_raw", "")
+                ai_description_source = ai.get("description_english", "")
+            description, language_review, ai_disagreed, description_source = (
+                _select_source_faithful_description(
+                    direct.get("description_raw", ""),
+                    ai_description_source,
                 )
-                # A flattened multilingual table cell cannot be trusted without the
-                # AI English selection. Slash/line-separated cells may still be exact.
-                raw_text = str(direct.get("description_raw", ""))
-                has_separable_layout = "/" in raw_text or "\n" in raw_text or "\r" in raw_text
-                language_review = bool(isolated_from_layout or not has_separable_layout)
+            )
             if language_review:
                 language_exceptions += 1
-            section = section_for(page, ai or direct)
-            section_code = clean_text((section or {}).get("code", "")) or clean_text((ai or {}).get("section_code", direct.get("section_code", "")))
-            section_name = clean_text((section or {}).get("name", "")) or clean_text((ai or {}).get("section_name_english", direct.get("section_name_english", "")))
-            section_maker = clean_text((ai or {}).get("section_maker", "")) or clean_text((section or {}).get("maker", "")) or clean_text(direct.get("section_maker", ""))
-            section_model = clean_text((ai or {}).get("section_model", "")) or clean_text((section or {}).get("model", "")) or clean_text(direct.get("section_model", ""))
+            if ai_disagreed:
+                paraphrases_prevented += 1
+
+            section, section_source, section_conflict = section_for(page, direct, ai)
+            if section_conflict:
+                section_conflicts += 1
+            if section is None:
+                unconfirmed_sections += 1
+
+            # Printed page data wins over AI fallbacks for section identity and title.
+            section_code = (
+                clean_text((section or {}).get("code", ""))
+                or clean_text(direct.get("section_code", ""))
+                or clean_text((ai or {}).get("section_code", ""))
+            )
+            section_name = (
+                clean_text((section or {}).get("name", ""))
+                or clean_text(direct.get("section_name_english", ""))
+                or clean_text((ai or {}).get("section_name_english", ""))
+            )
+            section_maker = (
+                clean_text((section or {}).get("maker", ""))
+                or clean_text(direct.get("section_maker", ""))
+                or clean_text((ai or {}).get("section_maker", ""))
+            )
+            section_model = (
+                clean_text((section or {}).get("model", ""))
+                or clean_text(direct.get("section_model", ""))
+                or clean_text((ai or {}).get("section_model", ""))
+            )
             first_page = (section or {}).get("first_page") or page
-            confidence = max(0.90, clamp_confidence((ai or {}).get("confidence", direct.get("confidence", 0.88))))
+
+            confidence = max(0.88, clamp_confidence(direct.get("confidence", 0.88)))
+            if description_source != "printed English":
+                confidence = min(
+                    confidence,
+                    clamp_confidence((ai or {}).get("confidence", 0.78), 0.78),
+                    0.82,
+                )
             if language_review:
                 confidence = min(confidence, 0.60)
+            if section_conflict:
+                confidence = min(confidence, 0.62)
+            if section is None:
+                confidence = min(confidence, 0.50)
+
             ident_no = clean_text(direct.get("ident_no", ""))
-            # Prefer the item number parsed directly from the table. When the
-            # source uses a vertically merged item-number cell, the AI may still
-            # repeat the governing position on the continuation record.
             resolved_item_no = clean_text(direct.get("item_no", "")) or clean_text(
                 (ai or {}).get("item_no", "")
             )
@@ -1788,69 +2243,122 @@ def prepare_benefit_rows(
                     "quantity": quantity_to_number(direct.get("quantity")),
                     "confidence": confidence,
                     "language_review": language_review,
+                    "description_source": description_source,
+                    "description_source_mismatch": ai_disagreed,
+                    "section_review": bool(section_conflict or section is None),
+                    "section_assignment_source": section_source,
                 }
             )
     else:
-        # Irregular/non-Markdown manuals still use the strict AI schema.
+        # Irregular/non-Markdown manuals still use the strict AI schema, but section
+        # assignment remains anchored to the page map whenever one exists.
         for ai in normalized_ai:
             page = ai.get("source_page")
             if page in index_pages:
                 continue
-            section = section_for(page, ai)
+            section, section_source, section_conflict = section_for(page, None, ai)
             ident_no = clean_text(ai.get("ident_no", ""))
-            description = clean_text(ai.get("description_english", "")).upper()
+            description, language_review = _best_effort_english_description(
+                ai.get("description_english", "")
+            )
             if not description or not (ident_no or clean_text(ai.get("item_no", ""))):
                 continue
+            confidence = clamp_confidence(ai.get("confidence", 0.70))
+            if language_review:
+                confidence = min(confidence, 0.60)
+                language_exceptions += 1
+            if section_conflict:
+                confidence = min(confidence, 0.62)
+                section_conflicts += 1
+            if section is None:
+                confidence = min(confidence, 0.50)
+                unconfirmed_sections += 1
             output.append(
                 {
                     **ai,
                     "section_code": clean_text((section or {}).get("code", ai.get("section_code", ""))),
                     "section_name_english": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
                     "detected_machinery": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
-                    "section_maker": clean_text(ai.get("section_maker", "")) or clean_text((section or {}).get("maker", "")),
-                    "section_model": clean_text(ai.get("section_model", "")) or clean_text((section or {}).get("model", "")),
+                    "section_maker": clean_text((section or {}).get("maker", "")) or clean_text(ai.get("section_maker", "")),
+                    "section_model": clean_text((section or {}).get("model", "")) or clean_text(ai.get("section_model", "")),
                     "section_start_page": (section or {}).get("first_page") or ai.get("section_start_page") or page,
                     "part_no": ident_no,
                     "code": ident_no,
+                    "description_english": description,
                     "description": description,
+                    "confidence": confidence,
+                    "language_review": language_review,
+                    "description_source": "AI English/translation",
+                    "description_source_mismatch": False,
+                    "section_review": bool(section_conflict or section is None),
+                    "section_assignment_source": section_source,
                 }
             )
 
     # AI-only rows are accepted only on pages that contain an actual parts table.
     if direct_rows:
         existing_keys = {
-            (int(row.get("source_page") or 0), normalize_key(row.get("item_no", "")), normalize_key(row.get("ident_no", "")))
+            (
+                int(row.get("source_page") or 0),
+                normalize_key(row.get("item_no", "")),
+                normalize_key(row.get("ident_no", "")),
+            )
             for row in output
         }
         for ai in normalized_ai:
             if id(ai) in matched_ai_ids or ai.get("source_page") not in parts_pages:
                 continue
-            key = (int(ai.get("source_page") or 0), normalize_key(ai.get("item_no", "")), normalize_key(ai.get("ident_no", "")))
+            key = (
+                int(ai.get("source_page") or 0),
+                normalize_key(ai.get("item_no", "")),
+                normalize_key(ai.get("ident_no", "")),
+            )
             if key in existing_keys:
                 continue
-            if clean_text(ai.get("description_english", "")) and (clean_text(ai.get("ident_no", "")) or clean_text(ai.get("item_no", ""))):
-                section = section_for(ai.get("source_page"), ai)
+            description, language_review = _best_effort_english_description(
+                ai.get("description_english", "")
+            )
+            if description and (clean_text(ai.get("ident_no", "")) or clean_text(ai.get("item_no", ""))):
+                section, section_source, section_conflict = section_for(
+                    ai.get("source_page"), None, ai
+                )
                 ident_no = clean_text(ai.get("ident_no", ""))
+                confidence = min(clamp_confidence(ai.get("confidence", 0.70)), 0.82)
+                if language_review:
+                    confidence = min(confidence, 0.60)
+                    language_exceptions += 1
+                if section_conflict:
+                    confidence = min(confidence, 0.62)
+                    section_conflicts += 1
+                if section is None:
+                    confidence = min(confidence, 0.50)
+                    unconfirmed_sections += 1
                 output.append(
                     {
                         **ai,
                         "section_code": clean_text((section or {}).get("code", ai.get("section_code", ""))),
                         "section_name_english": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
                         "detected_machinery": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
-                        "section_maker": clean_text(ai.get("section_maker", "")) or clean_text((section or {}).get("maker", "")),
-                        "section_model": clean_text(ai.get("section_model", "")) or clean_text((section or {}).get("model", "")),
+                        "section_maker": clean_text((section or {}).get("maker", "")) or clean_text(ai.get("section_maker", "")),
+                        "section_model": clean_text((section or {}).get("model", "")) or clean_text(ai.get("section_model", "")),
                         "section_start_page": (section or {}).get("first_page") or ai.get("source_page"),
                         "part_no": ident_no,
                         "code": ident_no,
-                        "description": clean_text(ai.get("description_english", "")).upper(),
+                        "description_english": description,
+                        "description": description,
+                        "confidence": confidence,
+                        "language_review": language_review,
+                        "description_source": "AI-only row",
+                        "description_source_mismatch": False,
+                        "section_review": bool(section_conflict or section is None),
+                        "section_assignment_source": section_source,
                     }
                 )
 
-    # Repair vertically merged/continuation ITEM NO cells before row identity
-    # and duplicate checks are calculated.
     output, inherited_item_count = _carry_forward_merged_item_numbers(output)
 
-    # Deterministic de-duplication by source page + item + identifier.
+    # Deterministic de-duplication by source page + item + identifier. PART NO alone
+    # is intentionally not treated as globally unique across a technical manual.
     deduplicated: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for row in output:
@@ -1872,9 +2380,33 @@ def prepare_benefit_rows(
         messages.append(
             f"Repeated {inherited_item_count} merged/continuation ITEM NO value(s) on linked spare-part rows."
         )
+    if paraphrases_prevented:
+        messages.append(
+            f"Kept the exact printed English wording for {paraphrases_prevented} row(s) where the AI proposed a different phrase."
+        )
     if language_exceptions:
         messages.append(
-            f"{language_exceptions} description(s) could not be confidently isolated as English and remain in the exception review queue."
+            f"{language_exceptions} description(s) could not be confidently isolated as English and remain low-confidence review items."
+        )
+    if section_conflicts:
+        messages.append(
+            f"Resolved {section_conflicts} section conflict(s) by giving the printed page header priority over AI context."
+        )
+    if ambiguous_pages:
+        messages.append(
+            "Ambiguous section headers detected on PDF page(s): "
+            + ", ".join(str(page) for page in sorted(ambiguous_pages))
+            + ". Previous section context was not carried across those pages."
+        )
+    if unmapped_parts_pages:
+        messages.append(
+            "No confirmed section mapping was available for parts-table page(s): "
+            + ", ".join(str(page) for page in sorted(unmapped_parts_pages))
+            + ". Those rows were kept at low confidence instead of inheriting a stale section."
+        )
+    if unconfirmed_sections:
+        messages.append(
+            f"{unconfirmed_sections} row(s) remain without a fully confirmed source section."
         )
     return deduplicated, messages
 
@@ -2262,6 +2794,21 @@ def rows_to_review_dataframe(
             continue
         seen.add(duplicate_key)
         useful = bool(description and (identifier or item_no))
+        source_warnings: list[str] = []
+        if bool(raw.get("description_source_mismatch", False)):
+            source_warnings.append(
+                "Source: AI wording differed - exact printed English was kept"
+            )
+        if bool(raw.get("language_review", False)):
+            source_warnings.append("Source: English wording was not fully confirmed")
+        section_assignment_source = clean_text(raw.get("section_assignment_source", ""))
+        if bool(raw.get("section_review", False)):
+            if section_assignment_source == "unconfirmed":
+                source_warnings.append("Source: section could not be confirmed")
+            else:
+                source_warnings.append(
+                    "Source: AI/page section conflict - printed page header was kept"
+                )
         normalized.append(
             {
                 "INCLUDE": useful,
@@ -2282,7 +2829,7 @@ def rows_to_review_dataframe(
                 "CONFIDENCE": confidence,
                 "DETECTED MACHINERY": detected_machinery,
                 "ASSIGNMENT SOURCE": "Main machinery default",
-                "WARNING": "",
+                "WARNING": "; ".join(source_warnings),
             }
         )
     if not normalized:
@@ -2429,7 +2976,12 @@ def recalculate_review_status(
             warnings.append("Excluded from export")
             ready_values.append(False)
             continue
-        row_messages: list[str] = []
+        existing_warning = clean_text(row.get("WARNING", ""))
+        row_messages: list[str] = [
+            message.strip()
+            for message in existing_warning.split(";")
+            if message.strip().startswith("Source:")
+        ]
         blocking = False
         machinery = clean_text(row.get("MACHINERY", ""))
         part_no = clean_text(row.get("PART NO", ""))
