@@ -54,7 +54,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.5"
+APP_VERSION = "4.6"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -417,7 +417,7 @@ def require_authentication() -> None:
     session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
 
     st.title("📄 Spare Parts OCR Import Builder")
-    st.caption("Restricted access · Build 4.5")
+    st.caption("Restricted access · Build 4.6")
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
@@ -865,7 +865,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.5 — source-code matching, English uppercase normalization, and exception-only review")
+st.caption("Build 4.6 — page-header section locking, source-faithful English wording, and exception-only review")
 
 
 # ---------------------------------------------------------------------------
@@ -897,8 +897,10 @@ with st.sidebar:
 
 ### Automatic sub-machinery detection
 
-The app uses the PDF drawing/table code as the internal key, creates one canonical ENGLISH UPPERCASE sub-machinery name, and assigns every spare by that exact key.
+The app uses the drawing/table code printed in each PDF page header as the internal key and assigns every spare by that exact key. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
 
+- The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
+- A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
 - **PARTS FOUND:** number of spare-part rows linked to the proposal.
 - **CONFIDENCE:** average extraction confidence for that detected section.
