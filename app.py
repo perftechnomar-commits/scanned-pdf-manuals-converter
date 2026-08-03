@@ -55,7 +55,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.7"
+APP_VERSION = "4.7.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -418,7 +418,7 @@ def require_authentication() -> None:
     session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
 
     st.title("📄 Spare Parts OCR Import Builder")
-    st.caption("Restricted access · Build 4.7")
+    st.caption("Restricted access · Build 4.7.1")
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
@@ -861,12 +861,24 @@ def apply_processing_preset() -> None:
     st.session_state.setting_default_unit = preset["default_unit"]
 
 
+def select_processing_preset(preset_name: str) -> None:
+    """Apply an OCR preset without interrupting the current UI render.
+
+    Streamlit button callbacks run before the normal script rerun. Using a callback
+    avoids calling ``st.rerun()`` from the middle of the sidebar, which previously
+    stopped the run before the machinery and vessel widgets were rendered and could
+    cause their widget values to be cleaned from session state.
+    """
+    st.session_state.processing_preset = preset_name
+    apply_processing_preset()
+
+
 require_authentication()
 initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.7 — English-only isolation/translation, page-header section locking, and exception review")
+st.caption("Build 4.7.1 — OCR mode changes preserve all vessel and machinery inputs")
 
 
 # ---------------------------------------------------------------------------
@@ -1073,15 +1085,14 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
     for column, preset_name in zip(mode_columns, PROCESSING_PRESETS):
         selected = st.session_state.processing_preset == preset_name
         label = f"✓ {preset_name}" if selected else preset_name
-        if column.button(
+        column.button(
             label,
             key=f"preset_button_{preset_name.lower()}",
             use_container_width=True,
             help=PROCESSING_PRESETS[preset_name]["description"],
-        ):
-            st.session_state.processing_preset = preset_name
-            apply_processing_preset()
-            st.rerun()
+            on_click=select_processing_preset,
+            args=(preset_name,),
+        )
 
     active_preset = PROCESSING_PRESETS.get(
         st.session_state.processing_preset, PROCESSING_PRESETS["Balanced"]
