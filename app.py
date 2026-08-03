@@ -878,7 +878,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.7.1 — OCR mode changes preserve all vessel and machinery inputs")
+st.caption("Build 4.7.1")
 
 
 # ---------------------------------------------------------------------------
