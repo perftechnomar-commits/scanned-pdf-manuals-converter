@@ -953,7 +953,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.7.2 — lazy workflow navigation, paginated tables, and explicit low-confidence verification")
+st.caption("Build 4.7.2")
 
 
 # ---------------------------------------------------------------------------
