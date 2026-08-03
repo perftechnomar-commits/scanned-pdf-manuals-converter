@@ -55,7 +55,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.7.2"
+APP_VERSION = "4.7.3"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -418,7 +418,7 @@ def require_authentication() -> None:
     session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
 
     st.title("📄 Spare Parts OCR Import Builder")
-    st.caption("Restricted access · Build 4.7.2")
+    st.caption("Restricted access · Build 4.7.3")
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
@@ -587,6 +587,8 @@ def require_authentication() -> None:
 
 def initialize_state() -> None:
     defaults = {
+        "input_type": "PDF",
+        "manual_mistral_api_key": "",
         "extracted_pages": [],
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
@@ -871,291 +873,84 @@ def apply_processing_preset() -> None:
 
 
 def select_processing_preset(preset_name: str) -> None:
-    """Apply an OCR preset without interrupting the current UI render.
-
-    Streamlit button callbacks run before the normal script rerun. Using a callback
-    avoids calling ``st.rerun()`` from the middle of the sidebar, which previously
-    stopped the run before the machinery and vessel widgets were rendered and could
-    cause their widget values to be cleaned from session state.
-    """
+    """Apply an OCR preset inside the isolated processing-settings fragment."""
     st.session_state.processing_preset = preset_name
     apply_processing_preset()
 
 
-LOW_CONFIDENCE_REVIEW_WARNING = "Low confidence - manual verification required"
+PERSISTENT_INPUT_KEYS = [
+    "input_type",
+    "selected_vessels",
+    "additional_vessels_text",
+    "main_code",
+    "main_name",
+    "main_maker",
+    "main_model",
+    "main_type",
+    "main_instruction_book",
+    "main_specifications",
+    "active_page_spec",
+    "append_results",
+    "processing_preset",
+    "setting_structure_mode",
+    "setting_page_filter_mode",
+    "setting_extraction_model",
+    "setting_ocr_pages_per_request",
+    "setting_extraction_pages_per_batch",
+    "setting_extraction_max_chars",
+    "setting_default_unit",
+    "setting_extra_prompt",
+    "manual_mistral_api_key",
+    "review_filter",
+    "review_sort",
+    "review_confidence_threshold",
+    "source_page_lookup",
+    "active_workflow_step",
+]
 
 
-def _review_row_id(row: pd.Series | dict) -> str:
-    """Return a stable identifier for manual verification of a spare-part row."""
-    values = [
-        str(row.get("SOURCE PAGE", "")),
-        str(row.get("SECTION START PAGE", "")),
-        str(row.get("SECTION CODE", "")).strip().upper(),
-        str(row.get("ITEM NO", "")).strip().upper(),
-        str(row.get("CODE", row.get("PART NO", ""))).strip().upper(),
-    ]
-    if not any(values[2:]):
-        values.append(str(row.get("DESCRIPTION", "")).strip().upper())
-    return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()[:24]
+def restore_missing_loaded_job_state() -> None:
+    """Restore job values removed by Streamlit's unrendered-widget cleanup.
+
+    Build 4.7.2 renders only the active workflow section. Streamlit may remove the
+    state of widgets that are not rendered in a particular run. Restore a missing
+    value from the active document job before defaults can replace it with blanks.
+    """
+    jobs = st.session_state.get("document_jobs", {})
+    job_id = str(st.session_state.get("loaded_job_id", ""))
+    job = jobs.get(job_id) if isinstance(jobs, dict) and job_id else None
+    if not isinstance(job, dict):
+        return
+    for field in JOB_STATE_FIELDS:
+        if field not in st.session_state and field in job:
+            st.session_state[field] = _clone_state_value(job[field])
 
 
-def _verified_ids(value) -> set[str]:
-    if isinstance(value, set):
-        return {str(item) for item in value if str(item)}
-    if isinstance(value, (list, tuple)):
-        return {str(item) for item in value if str(item)}
-    return set()
+def pin_persistent_input_state() -> None:
+    """Prevent values from being deleted when their workflow section is hidden."""
+    for key in PERSISTENT_INPUT_KEYS:
+        if key in st.session_state:
+            # Reassigning a key marks it as application-owned state, so Streamlit
+            # does not discard it merely because its widget is not rendered.
+            st.session_state[key] = st.session_state[key]
 
 
-def recalculate_review_with_verification(
-    frame: pd.DataFrame,
-    valid_machinery_names,
-    verified_rows,
-    allow_duplicates: bool = False,
-    confidence_threshold: float = 0.75,
-) -> pd.DataFrame:
-    """Validate Benefit fields and keep low-confidence rows blocked until checked."""
-    result = recalculate_review_status(
-        frame,
-        valid_machinery_names=valid_machinery_names,
-        allow_duplicates=allow_duplicates,
-    )
-    if result.empty:
-        return result
-
-    verified = _verified_ids(verified_rows)
-    confidence = pd.to_numeric(result["CONFIDENCE"], errors="coerce").fillna(0.0)
-    included = result["INCLUDE"].astype(bool)
-    low_confidence = included & (confidence < float(confidence_threshold))
-
-    for index in result.index[low_confidence]:
-        row_id = _review_row_id(result.loc[index])
-        if row_id in verified:
-            continue
-        result.at[index, "READY"] = False
-        current_warning = str(result.at[index, "WARNING"] or "").strip()
-        warning_parts = [part.strip() for part in current_warning.split(";") if part.strip()]
-        warning_parts = [
-            part for part in warning_parts
-            if part not in {
-                "Very low OCR confidence - manually verified fields recommended",
-                "Low OCR confidence - verify when practical",
-                LOW_CONFIDENCE_REVIEW_WARNING,
-            }
-        ]
-        warning_parts.append(LOW_CONFIDENCE_REVIEW_WARNING)
-        result.at[index, "WARNING"] = "; ".join(dict.fromkeys(warning_parts))
-    return result
+_fragment = getattr(st, "fragment", lambda function: function)
 
 
-require_authentication()
-initialize_state()
-save_loaded_job_state()
+@_fragment
+def render_processing_mode_controls() -> None:
+    """Render OCR mode/settings with fragment-only reruns.
 
-st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.7.2")
-
-
-# ---------------------------------------------------------------------------
-# Sidebar settings
-# ---------------------------------------------------------------------------
-
-with st.sidebar:
-    with st.expander("📖 Instructions & Help", expanded=False):
-        st.markdown(
-            """
-### Quick start
-
-1. Under **Documents**, upload one or more PDF manuals and select the active document.
-2. Open **1. Machinery**, assign vessel(s) to that PDF, and complete its main machinery fields.
-3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
-4. The app automatically matches each spare to a source-coded sub-machinery and fills its maker, model, first PDF page, and source filename.
-5. Open **3. Sub-machineries** only to inspect or override exceptions.
-6. Open **4. Review spare parts**; normally only genuine exceptions are shown.
-7. Open **5. Export** to create the active document workbook or a ZIP package for every ready document.
-
-### Multiple documents and vessel assignment
-
-- Every uploaded PDF keeps its own machinery, vessel, OCR, review, and export state.
-- Switch the **Active document** in the sidebar to configure another PDF.
-- Select one or more vessels from the searchable list for the active PDF.
-- Vessel names are used in the export filename, audit workbook, and email draft.
-- Vessel names are **not written into the import template**, because vessel assignment is completed during the ERP process.
-- Use **Additional vessel(s)** only when a vessel is not yet available in the master list.
-
-### Automatic sub-machinery detection
-
-The app uses the drawing/table code printed in each PDF page header as the internal key and assigns every spare by that exact key. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
-
-- The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
-- A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
-- **FIRST PAGE / LAST PAGE:** where the detected table section appears.
-- **PARTS FOUND:** number of spare-part rows linked to the proposal.
-- **CONFIDENCE:** average extraction confidence for that detected section.
-- **VARIANTS:** different spellings found in the manual.
-- Maker/model printed in the section override the manually entered main-machinery defaults.
-- Edit several cells without interruption, then select **Save sub-machinery changes**.
-- INSTR.BOOK is filled as the first PDF page of the section; SPECIFICATIONS stores the source PDF filename.
-
-### Processing modes
-
-**Balanced — recommended**  
-Best for most manuals. Good balance of speed, stability, and extraction accuracy.
-
-**Fast**  
-For clean, consistent scans and regular tables. Larger batches are faster but may need more review.
-
-**Careful**  
-For poor scans, complex layouts, OCR timeouts, or repeated recovery messages. Smaller batches are slower but more stable.
-
-### Advanced Mistral settings
-
-Normal users only need a processing mode. Open **Advanced Mistral settings** for difficult manuals. Re-selecting a mode restores that mode's default values.
-
-### Review dashboard
-
-- **Needs correction** opens by default.
-- Filter by low confidence, unassigned sub-machinery, ready, excluded, or all rows.
-- Sort by issues, confidence, source page, section start page, sub-machinery, part number, or description.
-- **SUB-MACHINERY** is the approved machinery record assigned to that spare-part row. It may show the main machinery only when no sub-machinery applies.
-- **SOURCE PAGE** is the exact page containing the spare-part row.
-- **SECTION START PAGE** is where the detected sub-machinery/table section began.
-- Use **Source page quick lookup** to display the OCR text for a page while the original PDF is open on a second monitor.
-- Corrections are saved to the full dataset even when only a filtered subset is visible.
-
-### Large manuals
-
-For very large books, process page ranges such as `1-100`, `101-200`, and so on. Each PDF is processed independently. Enable **Append to current review table** after the first range. Download the audit workbook regularly because an app restart clears in-memory data.
-
-### Data handling
-
-Uploaded pages are sent to the configured Mistral service when OCR or AI extraction runs. Use the tool only for documents approved for that processing.
-            """
-        )
-
-    st.header("Documents")
-    input_type = st.radio(
-        "Choose input type",
-        ["PDF", "Document URL", "Image", "Image URL"],
-        index=0,
-        help=(
-            "Multi-document job management is available for PDF manuals. "
-            "URL and image sources continue to use the current single workspace."
-        ),
-    )
-
-    source_file = None
-    document_url = ""
-    image_url = ""
-    page_spec = "all"
-    append_results = False
-
-    if input_type == "PDF":
-        uploaded_pdf_files = st.file_uploader(
-            "Upload one or more scanned PDFs",
-            type=["pdf"],
-            accept_multiple_files=True,
-            key="multi_pdf_uploader",
-            help=(
-                "Each unique PDF becomes an independent job. A PDF is OCR-processed once, "
-                "even when it is assigned to several vessels."
-            ),
-        )
-        register_uploaded_pdfs(uploaded_pdf_files)
-        jobs = st.session_state.document_jobs
-
-        if jobs:
-            job_ids = list(jobs)
-            if st.session_state.get("active_document_selector") not in jobs:
-                st.session_state.active_document_selector = job_ids[0]
-
-            selected_job_id = st.selectbox(
-                "Active document",
-                options=job_ids,
-                key="active_document_selector",
-                format_func=lambda value: jobs[value]["file_name"],
-                help="Switch documents without losing the OCR, review, vessel, or export state of the other jobs.",
-            )
-
-            if st.session_state.get("loaded_job_id") != selected_job_id:
-                save_loaded_job_state()
-                load_document_job(selected_job_id)
-                st.rerun()
-
-            active_job = jobs[selected_job_id]
-            source_file = StoredPdf(active_job["file_name"], active_job["pdf_path"])
-            page_spec = st.text_input(
-                "Pages to process for active document",
-                key="active_page_spec",
-                help="Examples: all, 1-20, 25, 30-35.",
-            )
-            append_results = st.checkbox(
-                "Append to this document's review table",
-                key="append_results",
-                help="Use when processing additional page ranges from the same PDF.",
-            )
-            active_status, active_rows, active_subs = _job_status(active_job)
-            st.caption(
-                f"{active_status} · {active_rows} spare-part row(s) · "
-                f"{active_subs} sub-machinery proposal(s)"
-            )
-            st.button(
-                "Remove active document",
-                use_container_width=True,
-                on_click=remove_document_job,
-                args=(selected_job_id,),
-            )
-        else:
-            st.info("Upload one or more PDFs to create document jobs.")
-    elif input_type == "Document URL":
-        document_url = st.text_input(
-            "Document URL",
-            help="Enter a direct, publicly accessible PDF URL.",
-        )
-        append_results = st.checkbox(
-            "Append to current review table",
-            value=False,
-            help="Single-workspace behavior for URL sources.",
-        )
-    elif input_type == "Image":
-        source_file = st.file_uploader(
-            "Upload an image",
-            type=["png", "jpg", "jpeg"],
-            help="Use this for a single scanned page or photograph.",
-        )
-        append_results = st.checkbox(
-            "Append to current review table",
-            value=False,
-            help="Single-workspace behavior for image sources.",
-        )
-    else:
-        image_url = st.text_input(
-            "Image URL",
-            help="Enter a direct, publicly accessible image URL.",
-        )
-        append_results = st.checkbox(
-            "Append to current review table",
-            value=False,
-            help="Single-workspace behavior for image URL sources.",
-        )
-
-    st.divider()
+    A click on Balanced, Fast, or Careful now reruns only this small sidebar
+    fragment instead of rerunning the complete application.
+    """
     st.header("Processing mode")
-    secret_api_key = get_secret("MISTRAL_API_KEY")
-    if secret_api_key:
-        entered_api_key = ""
-    else:
-        entered_api_key = st.text_input(
-            "Mistral API key",
-            type="password",
-            help="For local testing only. Prefer .streamlit/secrets.toml for deployment.",
-        )
-    api_key = secret_api_key or entered_api_key
-
     st.caption(
         "Choose one mode. Balanced is recommended for normal use; Advanced settings "
         "remain available below for fine-tuning."
     )
+
     mode_columns = st.columns(3)
     for column, preset_name in zip(mode_columns, PROCESSING_PRESETS):
         selected = st.session_state.processing_preset == preset_name
@@ -1267,6 +1062,280 @@ Uploaded pages are sent to the configured Mistral service when OCR or AI extract
             """
         )
 
+
+LOW_CONFIDENCE_REVIEW_WARNING = "Low confidence - manual verification required"
+
+
+def _review_row_id(row: pd.Series | dict) -> str:
+    """Return a stable identifier for manual verification of a spare-part row."""
+    values = [
+        str(row.get("SOURCE PAGE", "")),
+        str(row.get("SECTION START PAGE", "")),
+        str(row.get("SECTION CODE", "")).strip().upper(),
+        str(row.get("ITEM NO", "")).strip().upper(),
+        str(row.get("CODE", row.get("PART NO", ""))).strip().upper(),
+    ]
+    if not any(values[2:]):
+        values.append(str(row.get("DESCRIPTION", "")).strip().upper())
+    return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()[:24]
+
+
+def _verified_ids(value) -> set[str]:
+    if isinstance(value, set):
+        return {str(item) for item in value if str(item)}
+    if isinstance(value, (list, tuple)):
+        return {str(item) for item in value if str(item)}
+    return set()
+
+
+def recalculate_review_with_verification(
+    frame: pd.DataFrame,
+    valid_machinery_names,
+    verified_rows,
+    allow_duplicates: bool = False,
+    confidence_threshold: float = 0.75,
+) -> pd.DataFrame:
+    """Validate Benefit fields and keep low-confidence rows blocked until checked."""
+    result = recalculate_review_status(
+        frame,
+        valid_machinery_names=valid_machinery_names,
+        allow_duplicates=allow_duplicates,
+    )
+    if result.empty:
+        return result
+
+    verified = _verified_ids(verified_rows)
+    confidence = pd.to_numeric(result["CONFIDENCE"], errors="coerce").fillna(0.0)
+    included = result["INCLUDE"].astype(bool)
+    low_confidence = included & (confidence < float(confidence_threshold))
+
+    for index in result.index[low_confidence]:
+        row_id = _review_row_id(result.loc[index])
+        if row_id in verified:
+            continue
+        result.at[index, "READY"] = False
+        current_warning = str(result.at[index, "WARNING"] or "").strip()
+        warning_parts = [part.strip() for part in current_warning.split(";") if part.strip()]
+        warning_parts = [
+            part for part in warning_parts
+            if part not in {
+                "Very low OCR confidence - manually verified fields recommended",
+                "Low OCR confidence - verify when practical",
+                LOW_CONFIDENCE_REVIEW_WARNING,
+            }
+        ]
+        warning_parts.append(LOW_CONFIDENCE_REVIEW_WARNING)
+        result.at[index, "WARNING"] = "; ".join(dict.fromkeys(warning_parts))
+    return result
+
+
+require_authentication()
+restore_missing_loaded_job_state()
+initialize_state()
+pin_persistent_input_state()
+save_loaded_job_state()
+
+st.title("📄 Spare Parts OCR Import Builder")
+st.caption("Build 4.7.3 — isolated OCR mode controls and persistent workflow inputs")
+
+
+# ---------------------------------------------------------------------------
+# Sidebar settings
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    with st.expander("📖 Instructions & Help", expanded=False):
+        st.markdown(
+            """
+### Quick start
+
+1. Under **Documents**, upload one or more PDF manuals and select the active document.
+2. Open **1. Machinery**, assign vessel(s) to that PDF, and complete its main machinery fields.
+3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
+4. The app automatically matches each spare to a source-coded sub-machinery and fills its maker, model, first PDF page, and source filename.
+5. Open **3. Sub-machineries** only to inspect or override exceptions.
+6. Open **4. Review spare parts**; normally only genuine exceptions are shown.
+7. Open **5. Export** to create the active document workbook or a ZIP package for every ready document.
+
+### Multiple documents and vessel assignment
+
+- Every uploaded PDF keeps its own machinery, vessel, OCR, review, and export state.
+- Switch the **Active document** in the sidebar to configure another PDF.
+- Select one or more vessels from the searchable list for the active PDF.
+- Vessel names are used in the export filename, audit workbook, and email draft.
+- Vessel names are **not written into the import template**, because vessel assignment is completed during the ERP process.
+- Use **Additional vessel(s)** only when a vessel is not yet available in the master list.
+
+### Automatic sub-machinery detection
+
+The app uses the drawing/table code printed in each PDF page header as the internal key and assigns every spare by that exact key. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
+
+- The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
+- A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
+- **FIRST PAGE / LAST PAGE:** where the detected table section appears.
+- **PARTS FOUND:** number of spare-part rows linked to the proposal.
+- **CONFIDENCE:** average extraction confidence for that detected section.
+- **VARIANTS:** different spellings found in the manual.
+- Maker/model printed in the section override the manually entered main-machinery defaults.
+- Edit several cells without interruption, then select **Save sub-machinery changes**.
+- INSTR.BOOK is filled as the first PDF page of the section; SPECIFICATIONS stores the source PDF filename.
+
+### Processing modes
+
+**Balanced — recommended**  
+Best for most manuals. Good balance of speed, stability, and extraction accuracy.
+
+**Fast**  
+For clean, consistent scans and regular tables. Larger batches are faster but may need more review.
+
+**Careful**  
+For poor scans, complex layouts, OCR timeouts, or repeated recovery messages. Smaller batches are slower but more stable.
+
+### Advanced Mistral settings
+
+Normal users only need a processing mode. Mode changes rerun only the settings panel and preserve all vessel, machinery, page-range, and review inputs. Open **Advanced Mistral settings** for difficult manuals.
+
+### Review dashboard
+
+- **Needs correction** opens by default.
+- Filter by low confidence, unassigned sub-machinery, ready, excluded, or all rows.
+- Sort by issues, confidence, source page, section start page, sub-machinery, part number, or description.
+- **SUB-MACHINERY** is the approved machinery record assigned to that spare-part row. It may show the main machinery only when no sub-machinery applies.
+- **SOURCE PAGE** is the exact page containing the spare-part row.
+- **SECTION START PAGE** is where the detected sub-machinery/table section began.
+- Use **Source page quick lookup** to display the OCR text for a page while the original PDF is open on a second monitor.
+- Corrections are saved to the full dataset even when only a filtered subset is visible.
+
+### Large manuals
+
+For very large books, process page ranges such as `1-100`, `101-200`, and so on. Each PDF is processed independently. Enable **Append to current review table** after the first range. Download the audit workbook regularly because an app restart clears in-memory data.
+
+### Data handling
+
+Uploaded pages are sent to the configured Mistral service when OCR or AI extraction runs. Use the tool only for documents approved for that processing.
+            """
+        )
+
+    st.header("Documents")
+    input_type = st.radio(
+        "Choose input type",
+        ["PDF", "Document URL", "Image", "Image URL"],
+        key="input_type",
+        help=(
+            "Multi-document job management is available for PDF manuals. "
+            "URL and image sources continue to use the current single workspace."
+        ),
+    )
+
+    source_file = None
+    document_url = ""
+    image_url = ""
+    page_spec = "all"
+    append_results = False
+
+    if input_type == "PDF":
+        uploaded_pdf_files = st.file_uploader(
+            "Upload one or more scanned PDFs",
+            type=["pdf"],
+            accept_multiple_files=True,
+            key="multi_pdf_uploader",
+            help=(
+                "Each unique PDF becomes an independent job. A PDF is OCR-processed once, "
+                "even when it is assigned to several vessels."
+            ),
+        )
+        register_uploaded_pdfs(uploaded_pdf_files)
+        jobs = st.session_state.document_jobs
+
+        if jobs:
+            job_ids = list(jobs)
+            if st.session_state.get("active_document_selector") not in jobs:
+                st.session_state.active_document_selector = job_ids[0]
+
+            selected_job_id = st.selectbox(
+                "Active document",
+                options=job_ids,
+                key="active_document_selector",
+                format_func=lambda value: jobs[value]["file_name"],
+                help="Switch documents without losing the OCR, review, vessel, or export state of the other jobs.",
+            )
+
+            if st.session_state.get("loaded_job_id") != selected_job_id:
+                save_loaded_job_state()
+                load_document_job(selected_job_id)
+                st.rerun()
+
+            active_job = jobs[selected_job_id]
+            source_file = StoredPdf(active_job["file_name"], active_job["pdf_path"])
+            page_spec = st.text_input(
+                "Pages to process for active document",
+                key="active_page_spec",
+                help="Examples: all, 1-20, 25, 30-35.",
+            )
+            append_results = st.checkbox(
+                "Append to this document's review table",
+                key="append_results",
+                help="Use when processing additional page ranges from the same PDF.",
+            )
+            active_status, active_rows, active_subs = _job_status(active_job)
+            st.caption(
+                f"{active_status} · {active_rows} spare-part row(s) · "
+                f"{active_subs} sub-machinery proposal(s)"
+            )
+            st.button(
+                "Remove active document",
+                use_container_width=True,
+                on_click=remove_document_job,
+                args=(selected_job_id,),
+            )
+        else:
+            st.info("Upload one or more PDFs to create document jobs.")
+    elif input_type == "Document URL":
+        document_url = st.text_input(
+            "Document URL",
+            help="Enter a direct, publicly accessible PDF URL.",
+        )
+        append_results = st.checkbox(
+            "Append to current review table",
+            value=False,
+            help="Single-workspace behavior for URL sources.",
+        )
+    elif input_type == "Image":
+        source_file = st.file_uploader(
+            "Upload an image",
+            type=["png", "jpg", "jpeg"],
+            help="Use this for a single scanned page or photograph.",
+        )
+        append_results = st.checkbox(
+            "Append to current review table",
+            value=False,
+            help="Single-workspace behavior for image sources.",
+        )
+    else:
+        image_url = st.text_input(
+            "Image URL",
+            help="Enter a direct, publicly accessible image URL.",
+        )
+        append_results = st.checkbox(
+            "Append to current review table",
+            value=False,
+            help="Single-workspace behavior for image URL sources.",
+        )
+
+    st.divider()
+    secret_api_key = get_secret("MISTRAL_API_KEY")
+    if secret_api_key:
+        st.session_state.manual_mistral_api_key = ""
+    else:
+        st.text_input(
+            "Mistral API key",
+            type="password",
+            key="manual_mistral_api_key",
+            help="For local testing only. Prefer .streamlit/secrets.toml for deployment.",
+        )
+
+    render_processing_mode_controls()
+
     st.divider()
     st.header("Template")
     custom_template = st.file_uploader(
@@ -1324,6 +1393,22 @@ Scanned PDFs, document URLs, images and image URLs.
 The generated workbook should be tested with a small import batch before production use.
             """
         )
+
+
+# Read processing values from persistent session state. The OCR mode fragment may
+# rerun independently, so downstream processing must not depend on fragment-local
+# Python variables.
+api_key = get_secret("MISTRAL_API_KEY") or str(
+    st.session_state.get("manual_mistral_api_key", "")
+).strip()
+structure_mode = str(st.session_state.setting_structure_mode)
+page_filter_mode = str(st.session_state.setting_page_filter_mode)
+extraction_model = str(st.session_state.setting_extraction_model)
+ocr_pages_per_request = int(st.session_state.setting_ocr_pages_per_request)
+extraction_pages_per_batch = int(st.session_state.setting_extraction_pages_per_batch)
+extraction_max_chars = int(st.session_state.setting_extraction_max_chars)
+default_unit = str(st.session_state.setting_default_unit)
+extra_prompt = str(st.session_state.setting_extra_prompt)
 
 
 # ---------------------------------------------------------------------------
