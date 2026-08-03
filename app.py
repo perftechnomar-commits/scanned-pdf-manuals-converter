@@ -241,6 +241,12 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    /* Streamlit Cloud uses this element as the primary scroll surface. Keep it
+       scrollable; the workflow panel itself deliberately has no fixed height. */
+    [data-testid="stMain"] {
+        overflow-y: auto !important;
+        overscroll-behavior-y: auto !important;
+    }
     [data-testid="stMainBlockContainer"],
     .block-container {
         padding-bottom: 6rem !important;
