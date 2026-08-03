@@ -31,6 +31,7 @@ from tools import (
     classify_ocr_pages,
     empty_review_dataframe,
     empty_submachinery_review_dataframe,
+    enforce_english_only_with_ai,
     extract_spare_parts_from_markdown_tables,
     extract_spare_parts_with_ai,
     included_submachinery_rows,
@@ -54,7 +55,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.6"
+APP_VERSION = "4.7"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -417,7 +418,7 @@ def require_authentication() -> None:
     session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
 
     st.title("📄 Spare Parts OCR Import Builder")
-    st.caption("Restricted access · Build 4.6")
+    st.caption("Restricted access · Build 4.7")
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
@@ -865,7 +866,7 @@ initialize_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.6 — page-header section locking, source-faithful English wording, and exception-only review")
+st.caption("Build 4.7 — English-only isolation/translation, page-header section locking, and exception review")
 
 
 # ---------------------------------------------------------------------------
@@ -1829,11 +1830,25 @@ with input_tab:
                     catalog_pages=catalog_context_pages,
                 )
                 extraction_messages.extend(automation_messages)
+
                 if not rows:
                     rows = extract_spare_parts_from_markdown_tables(structure_pages)
                     extraction_messages.append(
                         "The deterministic local parser was used because no structured rows were returned."
                     )
+
+                # Mandatory second pass: isolate the printed English phrase when OCR
+                # flattened German/English/French together; otherwise translate the
+                # complete technical term into English. The same canonical English
+                # title is propagated to every row of a source-coded sub-machinery.
+                if rows:
+                    rows, english_messages = enforce_english_only_with_ai(
+                        api_key=api_key,
+                        model=extraction_model.strip() or "mistral-small-latest",
+                        rows=rows,
+                        progress=show_progress,
+                    )
+                    extraction_messages.extend(english_messages)
 
                 new_review = rows_to_review_dataframe(
                     rows,
