@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.6"
+TOOLS_VERSION = "4.7"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -745,11 +745,20 @@ Benefit mapping rules:
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
-   UPPERCASE. When German/English/French are printed together, return the EXACT
-   printed English phrase. Do not paraphrase, modernize, shorten, expand, or replace
-   it with a synonym. Preserve the source wording, dimensions, standards, stage
-   numbers, punctuation, and symbols. Translate only when no English phrase is
-   printed on the source page, and lower confidence when translation is required.
+   UPPERCASE. When German/English/French are printed together, return ONLY the EXACT
+   printed English phrase. Never concatenate the language variants. OCR may flatten
+   the three printed lines into one string; still identify and isolate the English
+   span. Do not paraphrase, modernize, shorten, expand, or replace it with a synonym.
+   Preserve source dimensions, standards, stage numbers, punctuation, and symbols.
+   When no English phrase is printed, translate the complete term into precise
+   technical English and lower confidence because translation was required.
+8a. Apply the same language rule to section_name_english: isolate the printed English
+   title when present; otherwise translate the complete section title into English.
+8b. Flattened OCR examples that MUST be cleaned:
+   KURBELGEHÄUSE CRANK CASE CARTER -> CRANK CASE
+   WELLENDICHTRING RADIAL PACKING RING BAGUE D'ETANCHEITE -> RADIAL PACKING RING
+   LEISTUNGSSCHILD MANUFACTURER'S NAME PLATE PLAQUE SIGNALETIQUE -> MANUFACTURER'S NAME PLATE
+   MANOMETER 1. STUFE PRESSURE GAUGE 1ST STAGE MANOMETRE 1ER ETAGE -> PRESSURE GAUGE 1ST STAGE
 9. quantity must be numeric or null. unit is PCS, SET, or an empty string.
 10. source_page is the PAGE marker supplied in the user message.
 11. section_start_page is the first PDF page where the section begins, including
@@ -1135,6 +1144,276 @@ def extract_spare_parts_with_ai(
     return rows, deduplicated_messages
 
 
+
+
+ENGLISH_NORMALIZATION_SYSTEM_PROMPT = """
+You are a strict technical-language normalizer for marine and industrial spare-parts
+manuals. Return one JSON object with exactly this structure:
+{
+  "items": [
+    {"id": "D0", "english": ""}
+  ]
+}
+
+For every input item:
+1. Return only the English technical term in UPPERCASE.
+2. The source may contain German, English, and French concatenated because OCR removed
+   line breaks. Isolate the English wording; do not return all languages together.
+3. When an English phrase is already printed, reproduce that phrase faithfully rather
+   than replacing it with a synonym or paraphrase.
+4. When no English wording is present, translate the complete term into precise
+   technical English.
+5. Remove German and French wording from the result. Keep proper names, maker/model
+   names, dimensions, standards, symbols, stage numbers, and forms such as 2/2-WAY.
+6. Never change identifiers, codes, item numbers, quantities, or dimensions.
+7. Return exactly one result for every supplied id and no additional commentary.
+
+Examples:
+KURBELGEHÄUSE CRANK CASE CARTER -> CRANK CASE
+WELLENDICHTRING RADIAL PACKING RING BAGUE D'ETANCHEITE -> RADIAL PACKING RING
+LEISTUNGSSCHILD MANUFACTURER'S NAME PLATE PLAQUE SIGNALETIQUE -> MANUFACTURER'S NAME PLATE
+MANOMETER 1. STUFE PRESSURE GAUGE 1ST STAGE MANOMETRE 1ER ETAGE -> PRESSURE GAUGE 1ST STAGE
+ÖLSTANDSAUGE MIT DICHTRING -> OIL LEVEL SIGHT GLASS WITH SEALING RING
+""".strip()
+
+
+def _english_normalization_batches(
+    items: Sequence[dict[str, Any]],
+    max_items: int = 40,
+    max_chars: int = 22000,
+) -> list[list[dict[str, Any]]]:
+    batches: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_chars = 0
+    for item in items:
+        item_chars = len(json.dumps(item, ensure_ascii=False))
+        if current and (
+            len(current) >= max(1, int(max_items))
+            or current_chars + item_chars > max(2000, int(max_chars))
+        ):
+            batches.append(current)
+            current = []
+            current_chars = 0
+        current.append(item)
+        current_chars += item_chars
+    if current:
+        batches.append(current)
+    return batches
+
+
+def enforce_english_only_with_ai(
+    api_key: str,
+    model: str,
+    rows: Sequence[dict[str, Any]],
+    progress: ProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Isolate printed English or translate unresolved text before review/export.
+
+    Descriptions are sent only when they are foreign, flattened multilingual text,
+    or not confidently English. Every unique sub-machinery title is normalized once
+    and then propagated by section code so one section cannot receive several names.
+    """
+    normalized_rows = [dict(row) for row in rows if isinstance(row, dict)]
+    if not normalized_rows:
+        return normalized_rows, []
+
+    key = _normalize_api_key(api_key)
+    request_items: list[dict[str, Any]] = []
+    description_targets: dict[str, int] = {}
+    section_targets: dict[str, str] = {}
+    section_item_by_key: dict[str, str] = {}
+    section_rows: dict[str, list[int]] = {}
+
+    for row_index, row in enumerate(normalized_rows):
+        current_description = clean_text(
+            row.get("description_english", row.get("description", ""))
+        )
+        source_description = _clean_markdown_cell(
+            row.get("source_description_raw", current_description)
+        )
+        if (
+            clean_text(row.get("description_source", "")).lower() != "printed english"
+            and (
+                _text_needs_english_normalization(source_description)
+                or _text_needs_english_normalization(current_description)
+            )
+        ):
+            item_id = f"D{row_index}"
+            request_items.append(
+                {
+                    "id": item_id,
+                    "kind": "spare_part_description",
+                    "source_text": source_description,
+                    "current_text": current_description,
+                    "section_code": clean_text(row.get("section_code", "")),
+                    "item_no": clean_text(row.get("item_no", "")),
+                    "ident_no": clean_text(row.get("ident_no", row.get("code", ""))),
+                }
+            )
+            description_targets[item_id] = row_index
+
+        section_code = clean_text(row.get("section_code", ""))
+        current_section = clean_text(
+            row.get("section_name_english", row.get("detected_machinery", ""))
+        )
+        source_section = _clean_markdown_cell(
+            row.get("source_section_name_raw", row.get("table_title", current_section))
+        )
+        section_key = normalize_key(section_code) or f"NAME{normalize_key(current_section)}"
+        section_rows.setdefault(section_key, []).append(row_index)
+        section_needs_cleanup = (
+            _text_needs_english_normalization(source_section)
+            or _text_needs_english_normalization(current_section)
+        )
+        if (
+            section_needs_cleanup
+            and section_key not in section_item_by_key
+            and (source_section or current_section)
+        ):
+            item_id = f"S{len(section_item_by_key)}"
+            request_items.append(
+                {
+                    "id": item_id,
+                    "kind": "sub_machinery_title",
+                    "source_text": source_section or current_section,
+                    "current_text": current_section,
+                    "section_code": section_code,
+                }
+            )
+            section_item_by_key[section_key] = item_id
+            section_targets[item_id] = section_key
+
+    if not request_items:
+        return normalized_rows, [
+            "All descriptions and sub-machinery titles were already confidently English."
+        ]
+
+    batches = _english_normalization_batches(request_items)
+    returned: dict[str, str] = {}
+    failed_ids: set[str] = set()
+
+    def process_batch(batch: list[dict[str, Any]], label: str) -> None:
+        try:
+            result = _mistral_json_request(
+                api_key=key,
+                model=model or "mistral-small-latest",
+                messages=[
+                    {"role": "system", "content": ENGLISH_NORMALIZATION_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Normalize the following technical terms. Return only the required JSON object.\n\n"
+                            + json.dumps({"items": batch}, ensure_ascii=False)
+                        ),
+                    },
+                ],
+                timeout_seconds=300,
+                max_retries=3,
+            )
+            result_items = result.get("items", [])
+            if not isinstance(result_items, list):
+                raise ValueError("English normalization JSON did not contain an items list")
+            batch_ids = {str(item.get("id", "")) for item in batch}
+            seen_ids: set[str] = set()
+            for result_item in result_items:
+                if not isinstance(result_item, dict):
+                    continue
+                item_id = clean_text(result_item.get("id", ""))
+                english = clean_text(result_item.get("english", "")).upper()
+                if item_id in batch_ids and english:
+                    returned[item_id] = english
+                    seen_ids.add(item_id)
+            missing = batch_ids - seen_ids
+            if missing:
+                raise ValueError(
+                    "English normalization omitted item(s): " + ", ".join(sorted(missing))
+                )
+        except Exception:
+            if len(batch) > 1:
+                midpoint = max(1, len(batch) // 2)
+                process_batch(batch[:midpoint], f"{label}.1")
+                process_batch(batch[midpoint:], f"{label}.2")
+            else:
+                failed_ids.add(str(batch[0].get("id", "")))
+
+    for batch_index, batch in enumerate(batches, start=1):
+        if progress:
+            progress(
+                batch_index - 1,
+                len(batches),
+                f"English-only cleanup {batch_index}/{len(batches)}",
+            )
+        process_batch(batch, f"English batch {batch_index}")
+        if progress:
+            progress(
+                batch_index,
+                len(batches),
+                f"English-only cleanup {batch_index}/{len(batches)} complete",
+            )
+
+    cleaned_descriptions = 0
+    cleaned_sections = 0
+    unresolved = 0
+
+    for item_id, row_index in description_targets.items():
+        english = returned.get(item_id, "")
+        if not english:
+            normalized_rows[row_index]["language_review"] = True
+            unresolved += 1
+            continue
+        normalized_rows[row_index]["description_english"] = english
+        normalized_rows[row_index]["description"] = english
+        still_suspect = (
+            _looks_likely_non_english(english)
+            or len(_language_segments(english)) > 1
+        )
+        normalized_rows[row_index]["language_review"] = bool(still_suspect)
+        normalized_rows[row_index]["english_cleanup_applied"] = True
+        normalized_rows[row_index]["description_source"] = "AI English isolation/translation"
+        if still_suspect:
+            normalized_rows[row_index]["confidence"] = min(
+                clamp_confidence(normalized_rows[row_index].get("confidence", 0.60)),
+                0.55,
+            )
+            unresolved += 1
+        else:
+            # Translation improves language certainty but must not hide unrelated
+            # section or OCR uncertainty.
+            normalized_rows[row_index]["confidence"] = max(
+                clamp_confidence(normalized_rows[row_index].get("confidence", 0.70)),
+                0.72,
+            )
+            cleaned_descriptions += 1
+
+    for item_id, section_key in section_targets.items():
+        english = returned.get(item_id, "")
+        if not english:
+            unresolved += 1
+            continue
+        still_suspect = (
+            _looks_likely_non_english(english)
+            or len(_language_segments(english)) > 1
+        )
+        if still_suspect:
+            unresolved += 1
+            continue
+        for row_index in section_rows.get(section_key, []):
+            normalized_rows[row_index]["section_name_english"] = english
+            normalized_rows[row_index]["detected_machinery"] = english
+            normalized_rows[row_index]["section_english_cleanup_applied"] = True
+        cleaned_sections += 1
+
+    messages = [
+        f"English-only cleanup normalized {cleaned_descriptions} spare-part description(s).",
+        f"English-only cleanup normalized {cleaned_sections} unique sub-machinery title(s).",
+    ]
+    if unresolved or failed_ids:
+        messages.append(
+            f"{max(unresolved, len(failed_ids))} English cleanup item(s) remain flagged for review."
+        )
+    return normalized_rows, messages
+
+
 # ---------------------------------------------------------------------------
 # Deterministic Benefit table parsing and section catalogue
 # ---------------------------------------------------------------------------
@@ -1268,10 +1547,21 @@ def _language_segments(value: Any) -> list[str]:
 def _looks_likely_non_english(value: Any) -> bool:
     text = clean_text(value).lower()
     markers = (
+        # German
         "schraube", "mutter", "dichtung", "gleitlager", "stufe", "zylinder",
-        "halter", "kupplung", "scheibe", "leitung", "gehäuse", "manometer",
-        "pièce", "soupape", "tuyau", "arbre", "carter", "écrou", "palier",
-        "étage", "raccord", "support pour", "vis hexagonale", "joint de",
+        "halter", "kupplung", "scheibe", "leitung", "gehäuse", "gehaeuse",
+        "kurbelgehäuse", "kurbelgehaeuse", "kurbelwelle", "wellendichtring",
+        "leistungs", "drehrichtung", "einschraub", "ölstand", "oelstand",
+        "dichtring", "passfeder", "spannhülse", "spannhuelse", "deckel",
+        "lager", "welle", "stutzen", "druckluft", "sicherungsring",
+        "sechskant", "manometer", "benennung", "abdeckung", "drossel",
+        # French
+        "pièce", "piece de", "soupape", "tuyau", "arbre", "carter", "écrou",
+        "ecrou", "palier", "étage", "etage", "raccord", "support pour",
+        "vis hexagonale", "joint de", "bague", "couvercle", "plaque",
+        "flèche", "fleche", "rondelle", "clavette", "manchon", "vilebrequin",
+        "étanch", "etanch", "graisseur", "ressort", "tôle", "tole",
+        "désignation", "designation française", "quantité", "quantite",
     )
     return any(marker in text for marker in markers)
 
@@ -1287,14 +1577,34 @@ def _looks_likely_english(value: Any) -> bool:
         "disc", "cylinder", "head", "pressure", "suction", "flywheel",
         "socket", "clip", "flange", "fitting", "thermometer", "gasket",
         "joint", "seal", "spring", "shaft", "cover", "piston", "liner",
-        "screw", "washer", "nozzle", "support", "bracket", "cartridge",
+        "screw", "washer", "nozzle", "bracket", "cartridge", "crank",
+        "case", "radial", "packing", "inspection", "hole", "manufacturer",
+        "name", "arrow", "direction", "oil", "level", "sight", "glass",
+        "straight", "male", "union", "gear", "wheel", "complete", "dowel",
+        "key", "cap", "tube", "sieve", "seat", "guide", "rod", "lever",
+        "handle", "body", "housing", "insert", "bush", "bushing", "pin",
+        "plug", "stud", "panel", "rubber", "metal", "foot", "inside",
+        "outside", "adjustable", "protecting", "line", "air", "compressed",
+        "elbow", "reduction", "reducing", "threaded", "filter", "cartridge",
     )
     padded = f" {text} "
-    if any(marker in padded for marker in markers):
+    return any(marker in padded for marker in markers)
+
+
+def _text_needs_english_normalization(value: Any) -> bool:
+    """Return True when text is foreign, multilingual, or not confidently English."""
+    raw = _clean_markdown_cell(value)
+    text = clean_text(raw)
+    if not text:
         return True
-    # Short plain-ASCII technical labels are usually the English line after OCR.
-    # Known German/French terms were rejected above.
-    return bool(re.fullmatch(r"[a-z0-9 .,+()'°%/_-]{2,80}", text))
+    if len(_language_segments(raw)) >= 2:
+        return True
+    if _looks_likely_non_english(text):
+        return True
+    # Accented Latin characters are a strong signal in German/French/English manuals.
+    if re.search(r"[À-ÿ]", text):
+        return True
+    return not _looks_likely_english(text)
 
 def _english_variant(value: Any) -> str:
     segments = _language_segments(value)
@@ -1632,7 +1942,7 @@ def build_section_catalog(
 ) -> dict[str, Any]:
     """Build a section catalogue anchored to codes printed in each page header.
 
-    Version 4.6 deliberately avoids scanning the spare-parts table body for section
+    Version 4.7 continues to avoid scanning the spare-parts table body for section
     codes. Body identifiers and cross-references previously produced multiple matches,
     leaving the previous ``active`` section stuck while the spare rows moved on.
     """
@@ -2239,6 +2549,8 @@ def prepare_benefit_rows(
                     "item_no": resolved_item_no,
                     "description_english": description.upper(),
                     "description": description.upper(),
+                    "source_description_raw": _clean_markdown_cell(direct.get("description_raw", "")),
+                    "source_section_name_raw": _clean_markdown_cell(direct.get("table_title", "")),
                     "unit": normalize_unit((ai or {}).get("unit", ""), default_unit),
                     "quantity": quantity_to_number(direct.get("quantity")),
                     "confidence": confidence,
@@ -2286,6 +2598,8 @@ def prepare_benefit_rows(
                     "code": ident_no,
                     "description_english": description,
                     "description": description,
+                    "source_description_raw": clean_text(ai.get("description_english", "")),
+                    "source_section_name_raw": clean_text(ai.get("section_name_english", "")),
                     "confidence": confidence,
                     "language_review": language_review,
                     "description_source": "AI English/translation",
@@ -2346,6 +2660,8 @@ def prepare_benefit_rows(
                         "code": ident_no,
                         "description_english": description,
                         "description": description,
+                        "source_description_raw": clean_text(ai.get("description_english", "")),
+                        "source_section_name_raw": clean_text(ai.get("section_name_english", "")),
                         "confidence": confidence,
                         "language_review": language_review,
                         "description_source": "AI-only row",
