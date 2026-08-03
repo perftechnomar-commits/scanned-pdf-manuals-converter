@@ -3124,185 +3124,185 @@ if active_workflow_step == "4. Review spare parts":
     # ---------------------------------------------------------------------------
 
 
-    def export_filename(vessels: list[str], machinery_code: str, machinery_name: str) -> str:
-        machinery_part = safe_filename(machinery_code or machinery_name or "spare_parts")
-        if len(vessels) == 1:
-            vessel_part = safe_filename(vessels[0])
-        elif len(vessels) == 2:
-            vessel_part = "_".join(safe_filename(value) for value in vessels)
-        else:
-            vessel_part = f"{len(vessels)}_vessels"
-        return f"{vessel_part}_{machinery_part}_import.xlsx"
+def export_filename(vessels: list[str], machinery_code: str, machinery_name: str) -> str:
+    machinery_part = safe_filename(machinery_code or machinery_name or "spare_parts")
+    if len(vessels) == 1:
+        vessel_part = safe_filename(vessels[0])
+    elif len(vessels) == 2:
+        vessel_part = "_".join(safe_filename(value) for value in vessels)
+    else:
+        vessel_part = f"{len(vessels)}_vessels"
+    return f"{vessel_part}_{machinery_part}_import.xlsx"
 
 
-    def build_email_content(
-        vessels: list[str],
-        machinery_frame: pd.DataFrame,
-        ready_rows: int,
-    ) -> tuple[str, str]:
-        vessel_subject = vessels[0] if len(vessels) == 1 else f"{len(vessels)} vessels"
-        machinery_name = st.session_state.main_name or st.session_state.main_code
-        subject = f"Spare Parts Import - {machinery_name} - {vessel_subject}"
-        vessel_lines = "\n".join(f"- {vessel}" for vessel in vessels)
-        sub_count = max(0, len(machinery_frame) - 1)
-        body = f"""Dear Support Team,
+def build_email_content(
+    vessels: list[str],
+    machinery_frame: pd.DataFrame,
+    ready_rows: int,
+) -> tuple[str, str]:
+    vessel_subject = vessels[0] if len(vessels) == 1 else f"{len(vessels)} vessels"
+    machinery_name = st.session_state.main_name or st.session_state.main_code
+    subject = f"Spare Parts Import - {machinery_name} - {vessel_subject}"
+    vessel_lines = "\n".join(f"- {vessel}" for vessel in vessels)
+    sub_count = max(0, len(machinery_frame) - 1)
+    body = f"""Dear Support Team,
 
-    Please find attached the spare-parts import workbook applicable to the following vessel(s):
+Please find attached the spare-parts import workbook applicable to the following vessel(s):
 
-    {vessel_lines}
+{vessel_lines}
 
-    Main machinery: {st.session_state.main_name}
-    Code: {st.session_state.main_code}
-    Maker: {st.session_state.main_maker}
-    Model: {st.session_state.main_model}
-    Type: {st.session_state.main_type or '-'}
-    Instruction book: {st.session_state.main_instruction_book or '-'}
-    Included sub-machineries: {sub_count}
-    Ready spare-part rows: {ready_rows}
+Main machinery: {st.session_state.main_name}
+Code: {st.session_state.main_code}
+Maker: {st.session_state.main_maker}
+Model: {st.session_state.main_model}
+Type: {st.session_state.main_type or '-'}
+Instruction book: {st.session_state.main_instruction_book or '-'}
+Included sub-machineries: {sub_count}
+Ready spare-part rows: {ready_rows}
 
-    Please proceed with the corresponding import and let us know if any correction is required.
+Please proceed with the corresponding import and let us know if any correction is required.
 
-    Best regards,
-    """
-        return subject, body
+Best regards,
+"""
+    return subject, body
 
 
 
-    def build_multi_document_package(
-        template_bytes: bytes,
-        clear_existing: bool,
-        allow_duplicates: bool,
-    ) -> tuple[bytes | None, list[dict[str, str]]]:
-        save_loaded_job_state()
-        package = io.BytesIO()
-        report: list[dict[str, str]] = []
-        manifest_rows: list[dict[str, str | int]] = []
-        email_sections: list[str] = []
-        created_count = 0
+def build_multi_document_package(
+    template_bytes: bytes,
+    clear_existing: bool,
+    allow_duplicates: bool,
+) -> tuple[bytes | None, list[dict[str, str]]]:
+    save_loaded_job_state()
+    package = io.BytesIO()
+    report: list[dict[str, str]] = []
+    manifest_rows: list[dict[str, str | int]] = []
+    email_sections: list[str] = []
+    created_count = 0
 
-        with zipfile.ZipFile(package, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for position, (job_id, job) in enumerate(st.session_state.document_jobs.items(), start=1):
-                vessels = _job_vessels(job)
-                machinery_frame = _job_machinery_frame(job)
-                machinery_errors = validate_machinery_dataframe(machinery_frame)
-                valid_names = machinery_frame["NAME"].tolist() if not machinery_frame.empty else []
-                review = recalculate_review_with_verification(
-                    job.get("spare_review", empty_review_dataframe()),
-                    valid_machinery_names=valid_names,
-                    verified_rows=job.get("verified_review_rows", []),
-                    allow_duplicates=allow_duplicates,
-                    confidence_threshold=float(job.get("review_confidence_threshold", 0.75)),
+    with zipfile.ZipFile(package, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for position, (job_id, job) in enumerate(st.session_state.document_jobs.items(), start=1):
+            vessels = _job_vessels(job)
+            machinery_frame = _job_machinery_frame(job)
+            machinery_errors = validate_machinery_dataframe(machinery_frame)
+            valid_names = machinery_frame["NAME"].tolist() if not machinery_frame.empty else []
+            review = recalculate_review_with_verification(
+                job.get("spare_review", empty_review_dataframe()),
+                valid_machinery_names=valid_names,
+                verified_rows=job.get("verified_review_rows", []),
+                allow_duplicates=allow_duplicates,
+                confidence_threshold=float(job.get("review_confidence_threshold", 0.75)),
+            )
+            included = review[review["INCLUDE"].astype(bool)] if not review.empty else review
+            blocked = included[~included["READY"].astype(bool)] if not included.empty else included
+
+            reasons = []
+            if not vessels:
+                reasons.append("no vessels assigned")
+            reasons.extend(machinery_errors)
+            if included.empty:
+                reasons.append("no included spare-part rows")
+            elif not blocked.empty:
+                reasons.append(f"{len(blocked)} row(s) still need correction")
+
+            if reasons:
+                report.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Result": "Skipped",
+                        "Details": "; ".join(reasons),
+                    }
                 )
-                included = review[review["INCLUDE"].astype(bool)] if not review.empty else review
-                blocked = included[~included["READY"].astype(bool)] if not included.empty else included
+                continue
 
-                reasons = []
-                if not vessels:
-                    reasons.append("no vessels assigned")
-                reasons.extend(machinery_errors)
-                if included.empty:
-                    reasons.append("no included spare-part rows")
-                elif not blocked.empty:
-                    reasons.append(f"{len(blocked)} row(s) still need correction")
-
-                if reasons:
-                    report.append(
-                        {
-                            "Document": job.get("file_name", ""),
-                            "Result": "Skipped",
-                            "Details": "; ".join(reasons),
-                        }
-                    )
-                    continue
-
-                try:
-                    workbook_bytes = build_workbook(
-                        template_bytes=template_bytes,
-                        machinery_frame=machinery_frame,
-                        review_frame=review,
-                        clear_existing=clear_existing,
-                    )
-                    file_name = export_filename(
-                        vessels,
-                        str(job.get("main_code", "")),
-                        str(job.get("main_name", "")),
-                    )
-                    archive.writestr(f"imports/{position:02d}_{file_name}", workbook_bytes)
-
-                    audit_bytes = build_audit_workbook(
-                        job.get("extracted_pages", []),
-                        machinery_frame,
-                        review,
-                        page_classification=job.get("page_classification", pd.DataFrame()),
-                        extraction_log=job.get("extraction_log", []),
-                        vessels=vessels,
-                        submachinery_review=job.get("submachinery_review", empty_submachinery_review_dataframe()),
-                        job_metadata={
-                            "Source document": job.get("file_name", ""),
-                            "Main machinery code": job.get("main_code", ""),
-                            "Main machinery name": job.get("main_name", ""),
-                            "Maker": job.get("main_maker", ""),
-                            "Model": job.get("main_model", ""),
-                            "OCR pages": len(job.get("extracted_pages", [])),
-                            "Included spare parts": len(included),
-                        },
-                    )
-                    audit_name = safe_filename(Path(job.get("file_name", "document")).stem) + "_OCR_audit.xlsx"
-                    archive.writestr(f"audit/{position:02d}_{audit_name}", audit_bytes)
-
-                    vessel_lines = "\n".join(f"- {value}" for value in vessels)
-                    email_sections.append(
-                        f"{position}. {file_name}\n"
-                        f"Source PDF: {job.get('file_name', '')}\n"
-                        f"Main machinery: {job.get('main_name', '')}\n"
-                        f"Applicable vessels:\n{vessel_lines}\n"
-                    )
-                    manifest_rows.append(
-                        {
-                            "Document": job.get("file_name", ""),
-                            "Import workbook": file_name,
-                            "Vessels": "; ".join(vessels),
-                            "Main machinery": job.get("main_name", ""),
-                            "Maker": job.get("main_maker", ""),
-                            "Model": job.get("main_model", ""),
-                            "Sub-machineries": max(0, len(machinery_frame) - 1),
-                            "Spare-part rows": len(included),
-                        }
-                    )
-                    report.append(
-                        {
-                            "Document": job.get("file_name", ""),
-                            "Result": "Included",
-                            "Details": file_name,
-                        }
-                    )
-                    created_count += 1
-                except Exception as exc:
-                    report.append(
-                        {
-                            "Document": job.get("file_name", ""),
-                            "Result": "Error",
-                            "Details": str(exc),
-                        }
-                    )
-
-            if created_count:
-                manifest = pd.DataFrame(manifest_rows)
-                archive.writestr("document_vessel_assignments.csv", manifest.to_csv(index=False).encode("utf-8-sig"))
-                email_body = (
-                    "Dear Support Team,\n\n"
-                    "Please find attached the import workbooks listed below. Each workbook "
-                    "applies only to the corresponding vessel(s).\n\n"
-                    + "\n".join(email_sections)
-                    + "\nPlease proceed with the corresponding imports and let us know if any correction is required.\n\n"
-                    "Best regards,\n"
+            try:
+                workbook_bytes = build_workbook(
+                    template_bytes=template_bytes,
+                    machinery_frame=machinery_frame,
+                    review_frame=review,
+                    clear_existing=clear_existing,
                 )
-                archive.writestr("email_draft.txt", email_body.encode("utf-8"))
+                file_name = export_filename(
+                    vessels,
+                    str(job.get("main_code", "")),
+                    str(job.get("main_name", "")),
+                )
+                archive.writestr(f"imports/{position:02d}_{file_name}", workbook_bytes)
 
-        if created_count == 0:
-            return None, report
-        package.seek(0)
-        return package.getvalue(), report
+                audit_bytes = build_audit_workbook(
+                    job.get("extracted_pages", []),
+                    machinery_frame,
+                    review,
+                    page_classification=job.get("page_classification", pd.DataFrame()),
+                    extraction_log=job.get("extraction_log", []),
+                    vessels=vessels,
+                    submachinery_review=job.get("submachinery_review", empty_submachinery_review_dataframe()),
+                    job_metadata={
+                        "Source document": job.get("file_name", ""),
+                        "Main machinery code": job.get("main_code", ""),
+                        "Main machinery name": job.get("main_name", ""),
+                        "Maker": job.get("main_maker", ""),
+                        "Model": job.get("main_model", ""),
+                        "OCR pages": len(job.get("extracted_pages", [])),
+                        "Included spare parts": len(included),
+                    },
+                )
+                audit_name = safe_filename(Path(job.get("file_name", "document")).stem) + "_OCR_audit.xlsx"
+                archive.writestr(f"audit/{position:02d}_{audit_name}", audit_bytes)
+
+                vessel_lines = "\n".join(f"- {value}" for value in vessels)
+                email_sections.append(
+                    f"{position}. {file_name}\n"
+                    f"Source PDF: {job.get('file_name', '')}\n"
+                    f"Main machinery: {job.get('main_name', '')}\n"
+                    f"Applicable vessels:\n{vessel_lines}\n"
+                )
+                manifest_rows.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Import workbook": file_name,
+                        "Vessels": "; ".join(vessels),
+                        "Main machinery": job.get("main_name", ""),
+                        "Maker": job.get("main_maker", ""),
+                        "Model": job.get("main_model", ""),
+                        "Sub-machineries": max(0, len(machinery_frame) - 1),
+                        "Spare-part rows": len(included),
+                    }
+                )
+                report.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Result": "Included",
+                        "Details": file_name,
+                    }
+                )
+                created_count += 1
+            except Exception as exc:
+                report.append(
+                    {
+                        "Document": job.get("file_name", ""),
+                        "Result": "Error",
+                        "Details": str(exc),
+                    }
+                )
+
+        if created_count:
+            manifest = pd.DataFrame(manifest_rows)
+            archive.writestr("document_vessel_assignments.csv", manifest.to_csv(index=False).encode("utf-8-sig"))
+            email_body = (
+                "Dear Support Team,\n\n"
+                "Please find attached the import workbooks listed below. Each workbook "
+                "applies only to the corresponding vessel(s).\n\n"
+                + "\n".join(email_sections)
+                + "\nPlease proceed with the corresponding imports and let us know if any correction is required.\n\n"
+                "Best regards,\n"
+            )
+            archive.writestr("email_draft.txt", email_body.encode("utf-8"))
+
+    if created_count == 0:
+        return None, report
+    package.seek(0)
+    return package.getvalue(), report
 
 
 if active_workflow_step == "5. Export":
