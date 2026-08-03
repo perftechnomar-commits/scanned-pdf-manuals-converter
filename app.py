@@ -38,6 +38,7 @@ from tools import (
     machinery_rows_from_main_and_additional,
     merge_review_dataframes,
     merge_submachinery_candidates,
+    normalize_key,
     ocr_document_url,
     ocr_image_bytes,
     ocr_image_url,
@@ -55,7 +56,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.7.3"
+APP_VERSION = "4.7.4"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -418,7 +419,7 @@ def require_authentication() -> None:
     session_hours = max(1, _auth_int_secret("AUTH_SESSION_HOURS", 8))
 
     st.title("📄 Spare Parts OCR Import Builder")
-    st.caption("Restricted access · Build 4.7.3")
+    st.caption("Restricted access · Build 4.7.4")
 
     left, centre, right = st.columns([1, 1.35, 1])
     with centre:
@@ -636,6 +637,7 @@ def initialize_state() -> None:
         "multi_package_output": None,
         "multi_package_name": "multi_document_import_package.zip",
         "multi_package_report": [],
+        "submachinery_flash": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -1136,7 +1138,7 @@ pin_persistent_input_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
-st.caption("Build 4.7.3 — isolated OCR mode controls and persistent workflow inputs")
+st.caption("Build 4.7.4 — clear sub-machinery editing with automatic spare-part updates")
 
 
 # ---------------------------------------------------------------------------
@@ -1177,7 +1179,7 @@ The app uses the drawing/table code printed in each PDF page header as the inter
 - **CONFIDENCE:** average extraction confidence for that detected section.
 - **VARIANTS:** different spellings found in the manual.
 - Maker/model printed in the section override the manually entered main-machinery defaults.
-- Edit several cells without interruption, then select **Save sub-machinery changes**.
+- Edit several cells without interruption, then select **Save changes and update spare parts**. Renames, exclusions, and corrected details are applied automatically.
 - INSTR.BOOK is filled as the first PDF page of the section; SPECIFICATIONS stores the source PDF filename.
 
 ### Processing modes
@@ -1505,6 +1507,85 @@ def current_machinery_frame() -> pd.DataFrame:
     )
 
 
+def _apply_submachinery_changes_to_spares(
+    previous_frame: pd.DataFrame,
+    saved_frame: pd.DataFrame,
+) -> tuple[int, int]:
+    """Apply saved sub-machinery edits to every linked spare-part row.
+
+    Renamed included rows are propagated by source section code. Excluded rows
+    are moved back to the main machinery so an obsolete sub-machinery name does
+    not remain in the spare-parts table.
+    """
+    review = st.session_state.spare_review.copy()
+    if review.empty:
+        st.session_state.spare_review = review
+        return 0, 0
+
+    all_frames = [
+        frame for frame in (previous_frame, saved_frame)
+        if frame is not None and not frame.empty
+    ]
+    proposal_code_keys: set[str] = set()
+    proposal_detection_keys: set[str] = set()
+    proposal_name_keys: set[str] = set()
+
+    for frame in all_frames:
+        for _, proposal in frame.iterrows():
+            code_key = normalize_key(proposal.get("CODE", ""))
+            name_key = normalize_key(proposal.get("NAME", ""))
+            if code_key:
+                proposal_code_keys.add(code_key)
+            if name_key:
+                proposal_name_keys.add(name_key)
+            for key in str(proposal.get("DETECTION KEYS", "")).split("|"):
+                normalized = normalize_key(key)
+                if normalized:
+                    proposal_detection_keys.add(normalized)
+
+    main_name = str(st.session_state.main_name or "").strip()
+    reset_count = 0
+    for index, row in review.iterrows():
+        section_key = normalize_key(row.get("SECTION CODE", ""))
+        detected_key = normalize_key(row.get("DETECTED MACHINERY", ""))
+        current_key = normalize_key(row.get("MACHINERY", ""))
+        linked = (
+            (section_key and section_key in proposal_code_keys)
+            or (detected_key and detected_key in proposal_detection_keys)
+            or (current_key and current_key in proposal_name_keys)
+        )
+        if linked:
+            if str(row.get("MACHINERY", "")).strip() != main_name:
+                reset_count += 1
+            review.at[index, "MACHINERY"] = main_name
+            review.at[index, "ASSIGNMENT SOURCE"] = "Main machinery fallback after sub-machinery edit"
+
+    before_assignments = review["MACHINERY"].astype(str).copy()
+    review = apply_submachinery_assignments(
+        review,
+        saved_frame,
+        main_name,
+        overwrite_auto_assignments=True,
+    )
+    changed_count = int(
+        (review["MACHINERY"].astype(str) != before_assignments).sum()
+    )
+
+    valid_names = [main_name] + [
+        str(value).strip()
+        for value in included_submachinery_rows(saved_frame)["NAME"].tolist()
+        if str(value).strip()
+    ]
+    st.session_state.spare_review = recalculate_review_status(
+        review,
+        valid_machinery_names=valid_names,
+        allow_duplicates=False,
+    )
+    st.session_state.output = None
+    st.session_state.editor_version += 1
+    return changed_count, reset_count
+
+
 def main_machinery_is_ready() -> bool:
     required_keys = ("main_code", "main_name", "main_maker", "main_model")
     return bool(selected_vessel_names()) and all(
@@ -1625,10 +1706,21 @@ if active_workflow_step == "3. Sub-machineries":
     active_job = active_document_job()
     if active_job:
         st.caption(f"Active document: **{active_job['file_name']}**")
-    st.subheader("Step 3 — Detected sub-machineries")
+    st.subheader("Step 3 — Review sub-machineries")
     st.caption(
-        "The app matches sections by their source drawing/table code, uses ENGLISH "
-        "UPPERCASE names, and applies the exact same NAME to the spare-parts MACHINERY column."
+        "Each source drawing/table code creates one sub-machinery. The exact saved "
+        "NAME is also used in the spare-parts MACHINERY column."
+    )
+
+    flash_message = str(st.session_state.pop("submachinery_flash", "") or "")
+    if flash_message:
+        st.success(flash_message)
+
+    st.info(
+        "**Simple workflow:** 1) Edit the required cells below. "
+        "2) Select **Save changes and update spare parts**. "
+        "The app then updates the machinery sheet, renames all linked spare-part "
+        "rows, handles excluded proposals, recalculates READY status, and saves the document job."
     )
 
     # Normalize state after upgrades or older sessions.
@@ -1641,102 +1733,109 @@ if active_workflow_step == "3. Sub-machineries":
         sub_frame["MCH_TP(M/S/U)"] = "SubMachinery"
     st.session_state.submachinery_review = sub_frame
 
-    sub_action_cols = st.columns([1.25, 1.5, 1.5, 1.1])
-    with sub_action_cols[0]:
-        if st.button("Add manual sub-machinery", use_container_width=True):
-            st.session_state.submachinery_review = add_manual_submachinery_candidate(
-                st.session_state.submachinery_review,
-                current_main_row(),
-            )
-            st.session_state.submachinery_editor_version += 1
-            st.rerun()
-    with sub_action_cols[1]:
-        if st.button(
-            "Fill missing maker/model from main",
-            use_container_width=True,
-            disabled=st.session_state.submachinery_review.empty,
-        ):
-            frame = st.session_state.submachinery_review.copy()
-            defaults = current_main_row()
-            for column in ("MAKER", "MODEL"):
-                blank = frame[column].astype(str).str.strip().eq("")
-                frame.loc[blank, column] = defaults[column]
-            frame["MCH_TP(M/S/U)"] = "SubMachinery"
-            st.session_state.submachinery_review = frame
-            st.session_state.submachinery_editor_version += 1
-            st.rerun()
-    with sub_action_cols[2]:
-        if st.button(
-            "Reapply assignments after manual changes",
-            use_container_width=True,
-            disabled=(
-                st.session_state.submachinery_review.empty
-                or st.session_state.spare_review.empty
-            ),
-            help=(
-                "Applies included proposal names to linked spare-part rows. Run this "
-                "after renaming or excluding sub-machineries."
-            ),
-        ):
-            st.session_state.spare_review = apply_submachinery_assignments(
-                st.session_state.spare_review,
-                st.session_state.submachinery_review,
-                st.session_state.main_name,
-                overwrite_auto_assignments=True,
-            )
-            st.session_state.editor_version += 1
-            st.success("Approved sub-machinery assignments were applied.")
-    with sub_action_cols[3]:
-        if st.button(
-            "Clear proposals",
-            use_container_width=True,
-            disabled=st.session_state.submachinery_review.empty,
-        ):
-            st.session_state.submachinery_review = empty_submachinery_review_dataframe()
-            st.session_state.submachinery_editor_version += 1
-            st.rerun()
-
     if st.session_state.submachinery_review.empty:
         st.info(
-            "No sub-machineries detected yet. Complete the main machinery, upload the "
-            "manual, and run OCR. Proposals will appear here automatically."
+            "No sub-machineries detected yet. Complete the main machinery and run OCR first."
         )
     else:
-        candidate_frame = st.session_state.submachinery_review
+        candidate_frame = st.session_state.submachinery_review.copy()
         candidate_metrics = st.columns(4)
-        candidate_metrics[0].metric("Proposals", len(candidate_frame))
+        candidate_metrics[0].metric("Detected", len(candidate_frame))
         candidate_metrics[1].metric(
             "Included", int(candidate_frame["INCLUDE"].astype(bool).sum())
         )
         candidate_metrics[2].metric(
-            "Linked parts",
+            "Linked spare parts",
             int(pd.to_numeric(candidate_frame["PARTS FOUND"], errors="coerce").fillna(0).sum()),
         )
         candidate_metrics[3].metric(
-            "Low confidence",
+            "Missing required details",
             int(
-                (
-                    pd.to_numeric(candidate_frame["CONFIDENCE"], errors="coerce").fillna(0)
-                    < 0.75
-                ).sum()
+                candidate_frame[["CODE", "NAME", "MAKER", "MODEL"]]
+                .astype(str)
+                .apply(lambda column: column.str.strip().eq(""))
+                .any(axis=1)
+                .sum()
             ),
         )
 
-        required_sub_fields = ["CODE", "NAME", "MAKER", "MODEL"]
-        incomplete_sub_mask = pd.Series(False, index=candidate_frame.index)
-        for required_column in required_sub_fields:
-            incomplete_sub_mask |= candidate_frame[required_column].astype(str).str.strip().eq("")
-        incomplete_sub_count = int(incomplete_sub_mask.sum())
-        if incomplete_sub_count == 0:
-            st.success(
-                "All detected sections contain CODE, English NAME, MAKER, and MODEL. "
-                "Sub-machinery review is optional unless you want to override a source value."
-            )
-        else:
-            st.warning(
-                f"{incomplete_sub_count} detected section(s) are missing a required source value "
-                "and need review."
-            )
+        quick_actions = st.columns([1.15, 1.45, 1.1])
+        with quick_actions[0]:
+            if st.button("Add manual row", use_container_width=True):
+                st.session_state.submachinery_review = add_manual_submachinery_candidate(
+                    st.session_state.submachinery_review,
+                    current_main_row(),
+                )
+                st.session_state.submachinery_editor_version += 1
+                save_loaded_job_state()
+                st.rerun()
+        with quick_actions[1]:
+            if st.button(
+                "Fill missing maker/model",
+                use_container_width=True,
+                disabled=st.session_state.submachinery_review.empty,
+            ):
+                frame = st.session_state.submachinery_review.copy()
+                defaults = current_main_row()
+                for column in ("MAKER", "MODEL"):
+                    blank = frame[column].astype(str).str.strip().eq("")
+                    frame.loc[blank, column] = defaults[column]
+                frame["MCH_TP(M/S/U)"] = "SubMachinery"
+                st.session_state.submachinery_review = frame
+                st.session_state.submachinery_editor_version += 1
+                save_loaded_job_state()
+                st.rerun()
+        with quick_actions[2]:
+            with st.popover("More actions", use_container_width=True):
+                st.caption(
+                    "Use these actions only when needed. Saving the table already applies assignments automatically."
+                )
+                if st.button(
+                    "Apply current assignments again",
+                    use_container_width=True,
+                    disabled=(
+                        st.session_state.submachinery_review.empty
+                        or st.session_state.spare_review.empty
+                    ),
+                ):
+                    changed, reset = _apply_submachinery_changes_to_spares(
+                        st.session_state.submachinery_review,
+                        st.session_state.submachinery_review,
+                    )
+                    save_loaded_job_state()
+                    st.session_state.submachinery_flash = (
+                        f"Assignments refreshed. {changed} linked spare-part row(s) were assigned; "
+                        f"{reset} row(s) were reset before rematching."
+                    )
+                    st.rerun()
+                confirm_clear = st.checkbox(
+                    "I understand that this removes all proposals",
+                    key="confirm_clear_submachineries",
+                )
+                if st.button(
+                    "Clear all proposals",
+                    use_container_width=True,
+                    disabled=not confirm_clear,
+                ):
+                    previous = st.session_state.submachinery_review.copy()
+                    empty = empty_submachinery_review_dataframe()
+                    st.session_state.submachinery_review = empty
+                    _apply_submachinery_changes_to_spares(previous, empty)
+                    st.session_state.submachinery_editor_version += 1
+                    save_loaded_job_state()
+                    st.session_state.submachinery_flash = (
+                        "All proposals were removed. Previously linked spare-part rows now use the main machinery."
+                    )
+                    st.rerun()
+
+        st.markdown(
+            "**Editable fields:** INCLUDE, CODE, NAME, MAKER, MODEL, TYPE, "
+            "INSTR.BOOK, and SPECIFICATIONS. Source-page and confidence columns are read-only."
+        )
+        st.caption(
+            "Uncheck INCLUDE to reject a false sub-machinery. Its linked spare rows will "
+            "automatically return to the main machinery when you save."
+        )
 
         active_job_id = str(st.session_state.get("loaded_job_id", "single"))
         form_key = (
@@ -1748,20 +1847,14 @@ if active_workflow_step == "3. Sub-machineries":
             f"{st.session_state.submachinery_editor_version}"
         )
 
-        st.info(
-            "Edit as many cells as needed, including in full-screen view. Cell edits "
-            "are held without rerunning the app. Exit full-screen and select "
-            "**Save sub-machinery changes** once when finished."
-        )
-
-        with st.form(form_key, clear_on_submit=False, border=False):
+        with st.form(form_key, clear_on_submit=False, border=True):
             edited_submachineries = st.data_editor(
                 candidate_frame,
                 key=editor_key,
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
-                height=min(500, max(190, 42 + 35 * len(candidate_frame))),
+                height=min(560, max(220, 48 + 35 * len(candidate_frame))),
                 disabled=[
                     "MCH_TP(M/S/U)",
                     "FIRST PAGE",
@@ -1769,26 +1862,39 @@ if active_workflow_step == "3. Sub-machineries":
                     "PARTS FOUND",
                     "CONFIDENCE",
                     "VARIANTS",
+                    "DETECTION KEYS",
                     "ORIGIN",
                 ],
                 column_config={
                     "INCLUDE": st.column_config.CheckboxColumn(
                         "INCLUDE",
-                        help="Only included rows are written to the machinery sheet.",
+                        help="Included rows are exported and used for automatic spare-part assignment.",
                         default=True,
+                        width="small",
                     ),
-                    "CODE": st.column_config.TextColumn("CODE", width=_content_column_width(candidate_frame, "CODE", 95, 230)),
+                    "CODE": st.column_config.TextColumn(
+                        "CODE", width=_content_column_width(candidate_frame, "CODE", 95, 210)
+                    ),
                     "NAME": st.column_config.TextColumn(
                         "NAME",
-                        width=_content_column_width(candidate_frame, "NAME", 160, 420),
-                        help="Canonical sub-machinery name used by linked spare parts.",
+                        width=_content_column_width(candidate_frame, "NAME", 180, 420),
+                        help="This exact value is propagated to every linked spare-part MACHINERY cell.",
                     ),
-                    "MAKER": st.column_config.TextColumn("MAKER", width=_content_column_width(candidate_frame, "MAKER", 110, 280)),
-                    "MODEL": st.column_config.TextColumn("MODEL", width=_content_column_width(candidate_frame, "MODEL", 100, 240)),
-                    "TYPE": st.column_config.TextColumn("TYPE", width=_content_column_width(candidate_frame, "TYPE", 90, 220)),
-                    "INSTR.BOOK": st.column_config.TextColumn("INSTR.BOOK", width=_content_column_width(candidate_frame, "INSTR.BOOK", 110, 260)),
+                    "MAKER": st.column_config.TextColumn(
+                        "MAKER", width=_content_column_width(candidate_frame, "MAKER", 115, 260)
+                    ),
+                    "MODEL": st.column_config.TextColumn(
+                        "MODEL", width=_content_column_width(candidate_frame, "MODEL", 110, 240)
+                    ),
+                    "TYPE": st.column_config.TextColumn(
+                        "TYPE", width=_content_column_width(candidate_frame, "TYPE", 90, 210)
+                    ),
+                    "INSTR.BOOK": st.column_config.TextColumn(
+                        "INSTR.BOOK", width=_content_column_width(candidate_frame, "INSTR.BOOK", 115, 240)
+                    ),
                     "SPECIFICATIONS": st.column_config.TextColumn(
-                        "SPECIFICATIONS", width=_content_column_width(candidate_frame, "SPECIFICATIONS", 150, 420)
+                        "SPECIFICATIONS",
+                        width=_content_column_width(candidate_frame, "SPECIFICATIONS", 170, 420),
                     ),
                     "MCH_TP(M/S/U)": st.column_config.TextColumn(
                         "MCH_TP(M/S/U)", width="small"
@@ -1805,17 +1911,21 @@ if active_workflow_step == "3. Sub-machineries":
                     "CONFIDENCE": st.column_config.ProgressColumn(
                         "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
                     ),
-                    "VARIANTS": st.column_config.TextColumn(
-                        "VARIANTS", width=_content_column_width(candidate_frame, "VARIANTS", 160, 420)
-                    ),
+                    "VARIANTS": None,
                     "DETECTION KEYS": None,
-                    "ORIGIN": st.column_config.TextColumn("ORIGIN", width=_content_column_width(candidate_frame, "ORIGIN", 110, 260)),
+                    "ORIGIN": st.column_config.TextColumn(
+                        "ORIGIN", width=_content_column_width(candidate_frame, "ORIGIN", 110, 240)
+                    ),
                 },
             )
             save_submachinery_changes = st.form_submit_button(
-                "Save sub-machinery changes",
+                "Save changes and update spare parts",
                 type="primary",
                 use_container_width=True,
+                help=(
+                    "Saves the table, propagates renamed sub-machineries to linked spare parts, "
+                    "handles excluded rows, recalculates READY status, and persists the document job."
+                ),
             )
 
         if save_submachinery_changes:
@@ -1827,10 +1937,15 @@ if active_workflow_step == "3. Sub-machineries":
                     if pd.isna(value)
                     else str(value).strip().upper()
                 )
+            edited_submachineries["CODE"] = edited_submachineries["CODE"].map(
+                lambda value: "" if pd.isna(value) else str(value).strip().upper()
+            )
+
             user_controlled_columns = [
                 "INCLUDE", "CODE", "NAME", "MAKER", "MODEL", "TYPE",
                 "INSTR.BOOK", "SPECIFICATIONS",
             ]
+            changed_proposals = 0
             for row_position in range(len(edited_submachineries)):
                 changed = any(
                     str(edited_submachineries.iloc[row_position].get(column, "")).strip()
@@ -1838,22 +1953,31 @@ if active_workflow_step == "3. Sub-machineries":
                     for column in user_controlled_columns
                 )
                 if changed:
+                    changed_proposals += 1
                     edited_submachineries.iat[
                         row_position,
                         edited_submachineries.columns.get_loc("ORIGIN"),
                     ] = "Manual override"
+
             edited_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
-            st.session_state.submachinery_review = edited_submachineries[
-                SUBMACHINERY_REVIEW_COLUMNS
-            ].copy()
+            saved_frame = edited_submachineries[SUBMACHINERY_REVIEW_COLUMNS].copy()
+            st.session_state.submachinery_review = saved_frame
+            assigned_count, reset_count = _apply_submachinery_changes_to_spares(
+                candidate_frame,
+                saved_frame,
+            )
             st.session_state.submachinery_editor_version += 1
             save_loaded_job_state()
-            st.success("Sub-machinery changes saved.")
+            st.session_state.submachinery_flash = (
+                f"Saved {changed_proposals} edited proposal(s). "
+                f"Updated {assigned_count} linked spare-part assignment(s); "
+                f"{reset_count} previous assignment(s) were reset before rematching."
+            )
             st.rerun()
 
         st.caption(
-            "The page range lets the reviewer open the same location in the original "
-            "PDF on a second monitor. Save edits before using the action buttons above."
+            "After saving, open **4. Review spare parts** to inspect any remaining exceptions, "
+            "or continue directly to **5. Export** when all rows are ready."
         )
 
 
