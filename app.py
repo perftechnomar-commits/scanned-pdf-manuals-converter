@@ -2328,18 +2328,17 @@ if active_workflow_step == "3. Sub-machineries":
             )
 
             st.caption(
-                "Edits are saved when you finish a cell. Renames and exclusions are "
-                "immediately propagated to linked spare-part rows."
+                "Edit as many cells as you need without leaving this table. Select Save changes "
+                "when you are ready to apply renames and exclusions to linked spare-part rows."
             )
-            st.data_editor(
+            editor_form = st.form(key=f"{editor_key}_form", border=False)
+            editor_form.data_editor(
                 page_frame,
                 key=editor_key,
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
                 height=max(220, 48 + 35 * len(page_frame)),
-                on_change=_autosave_submachinery_page,
-                args=(editor_key, page_indexes),
                 disabled=[
                     "MCH_TP(M/S/U)",
                     "FIRST PAGE",
@@ -2402,6 +2401,13 @@ if active_workflow_step == "3. Sub-machineries":
                         "ORIGIN", width=_content_column_width(page_frame, "ORIGIN", 110, 240)
                     ),
                 },
+            )
+            editor_form.form_submit_button(
+                "Save sub-machinery changes",
+                type="primary",
+                use_container_width=True,
+                on_click=_autosave_submachinery_page,
+                args=(editor_key, page_indexes),
             )
 
             st.caption(
@@ -3065,17 +3071,17 @@ if active_workflow_step == "4. Review spare parts":
                 )
 
                 st.caption(
-                    "Edits and manual-verification checks save automatically when you finish a cell."
+                    "Edit as many cells as needed without leaving this table. Select Save changes "
+                    "when you are ready to validate the page."
                 )
-                st.data_editor(
+                editor_form = st.form(key=f"{editor_key}_form", border=False)
+                editor_form.data_editor(
                     editor_source,
                     key=editor_key,
                     num_rows="fixed",
                     use_container_width=True,
                     hide_index=True,
                     height=min(500, max(180, 42 + 35 * len(editor_source))),
-                    on_change=_autosave_spare_review_page,
-                    args=(editor_key, target_indexes),
                     disabled=[
                         "READY",
                         "SOURCE PAGE",
@@ -3130,6 +3136,13 @@ if active_workflow_step == "4. Review spare parts":
                             "ISSUE", width=_content_column_width(editor_source, "WARNING", 160, 420)
                         ),
                     },
+                )
+                editor_form.form_submit_button(
+                    "Save review changes",
+                    type="primary",
+                    use_container_width=True,
+                    on_click=_autosave_spare_review_page,
+                    args=(editor_key, target_indexes),
                 )
 
                 st.caption(
