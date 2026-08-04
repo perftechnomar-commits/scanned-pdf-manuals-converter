@@ -1265,14 +1265,13 @@ def recalculate_review_with_verification(
     frame: pd.DataFrame,
     valid_machinery_names,
     verified_rows,
-    allow_duplicates: bool = False,
     confidence_threshold: float = 0.75,
 ) -> pd.DataFrame:
-    """Validate Benefit fields and keep low-confidence rows blocked until checked."""
+    """Validate rows, always reject duplicate codes, and enforce verification."""
     result = recalculate_review_status(
         frame,
         valid_machinery_names=valid_machinery_names,
-        allow_duplicates=allow_duplicates,
+        allow_duplicates=False,
     )
     if result.empty:
         return result
@@ -1281,6 +1280,22 @@ def recalculate_review_with_verification(
     confidence = pd.to_numeric(result["CONFIDENCE"], errors="coerce").fillna(0.0)
     included = result["INCLUDE"].astype(bool)
     low_confidence = included & (confidence < float(confidence_threshold))
+
+    # Business rule: a spare-part CODE must be unique across the complete import.
+    code_values = result["CODE"].fillna("").astype(str).map(_normalise_source_code)
+    duplicate_codes = included & code_values.ne("") & code_values.duplicated(keep=False)
+    for index in result.index[duplicate_codes]:
+        result.at[index, "READY"] = False
+        current_warning = result.at[index, "WARNING"]
+        warning_parts = [
+            part.strip()
+            for part in ("" if pd.isna(current_warning) else str(current_warning)).split(";")
+            if part.strip()
+        ]
+        warning_parts.append(
+            f"Duplicate spare-part CODE '{str(result.at[index, 'CODE']).strip()}' - every code must be unique"
+        )
+        result.at[index, "WARNING"] = "; ".join(dict.fromkeys(warning_parts))
 
     for index in result.index[low_confidence]:
         row_id = _review_row_id(result.loc[index])
@@ -1841,7 +1856,6 @@ def _apply_submachinery_changes_to_spares(
         review,
         valid_machinery_names=valid_names,
         verified_rows=st.session_state.get("verified_review_rows", []),
-        allow_duplicates=False,
         confidence_threshold=float(
             st.session_state.get("review_confidence_threshold", 0.75)
         ),
@@ -1980,7 +1994,6 @@ def _autosave_spare_review_page(editor_key: str, target_indexes: list[object]) -
         updated_full,
         valid_machinery_names=valid_machinery_names,
         verified_rows=st.session_state.verified_review_rows,
-        allow_duplicates=False,
         confidence_threshold=float(st.session_state.review_confidence_threshold),
     )
     st.session_state.output = None
@@ -2850,7 +2863,6 @@ if active_workflow_step == "2. OCR":
                         assigned_review,
                         valid_machinery_names=[st.session_state.main_name] + valid_auto_names,
                         verified_rows=st.session_state.verified_review_rows,
-                        allow_duplicates=False,
                         confidence_threshold=float(st.session_state.review_confidence_threshold),
                     )
                     st.session_state.submachinery_review = merged_candidates
@@ -3009,7 +3021,6 @@ if active_workflow_step == "4. Review spare parts":
                 st.session_state.spare_review,
                 valid_machinery_names=valid_machinery_names,
                 verified_rows=st.session_state.verified_review_rows,
-                allow_duplicates=False,
                 confidence_threshold=threshold,
             )
             st.session_state.spare_review = full_status.copy()
@@ -3530,7 +3541,6 @@ Best regards,
 def build_multi_document_package(
     template_bytes: bytes,
     clear_existing: bool,
-    allow_duplicates: bool,
 ) -> tuple[bytes | None, list[dict[str, str]]]:
     save_loaded_job_state()
     package = io.BytesIO()
@@ -3549,7 +3559,6 @@ def build_multi_document_package(
                 job.get("spare_review", empty_review_dataframe()),
                 valid_machinery_names=valid_names,
                 verified_rows=job.get("verified_review_rows", []),
-                allow_duplicates=allow_duplicates,
                 confidence_threshold=float(job.get("review_confidence_threshold", 0.75)),
             )
             included = review[review["INCLUDE"].astype(bool)] if not review.empty else review
@@ -3698,12 +3707,6 @@ if active_workflow_step == "5. Export":
                 "adding to records already stored in a replacement template."
             ),
         )
-        allow_duplicates = st.checkbox(
-            "Allow possible duplicate spare-part rows",
-            value=False,
-            help="Keep this off unless repeated rows are intentional.",
-        )
-
         machinery_frame = current_machinery_frame()
         machinery_errors = validate_machinery_dataframe(machinery_frame)
         valid_machinery_names = machinery_frame["NAME"].tolist()
@@ -3711,7 +3714,6 @@ if active_workflow_step == "5. Export":
             st.session_state.spare_review,
             valid_machinery_names=valid_machinery_names,
             verified_rows=st.session_state.verified_review_rows,
-            allow_duplicates=allow_duplicates,
             confidence_threshold=float(st.session_state.review_confidence_threshold),
         )
         st.session_state.spare_review = export_review
@@ -3843,7 +3845,6 @@ if active_workflow_step == "5. Export":
                 package_bytes, package_report = build_multi_document_package(
                     template_bytes=template_bytes,
                     clear_existing=clear_existing,
-                    allow_duplicates=allow_duplicates,
                 )
                 st.session_state.multi_package_output = package_bytes
                 st.session_state.multi_package_report = package_report
