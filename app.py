@@ -4,6 +4,7 @@ import copy
 import hashlib
 import hmac
 import io
+import re
 import secrets
 import smtplib
 import ssl
@@ -3155,6 +3156,29 @@ if active_workflow_step == "4. Review spare parts":
     # ---------------------------------------------------------------------------
 
 
+def remove_excel_protection(workbook_bytes: bytes) -> bytes:
+    """Remove worksheet and workbook protection inherited from the Excel template."""
+    protection_pattern = re.compile(
+        rb"<(?:[A-Za-z_][\w.-]*:)?(?:sheetProtection|workbookProtection)\b[^>]*(?:/>|>.*?</(?:[A-Za-z_][\w.-]*:)?(?:sheetProtection|workbookProtection)>)",
+        flags=re.DOTALL,
+    )
+    source = io.BytesIO(workbook_bytes)
+    target = io.BytesIO()
+    with zipfile.ZipFile(source, "r") as source_zip, zipfile.ZipFile(
+        target, "w", compression=zipfile.ZIP_DEFLATED
+    ) as target_zip:
+        for entry in source_zip.infolist():
+            payload = source_zip.read(entry.filename)
+            is_worksheet = (
+                entry.filename.startswith("xl/worksheets/")
+                and entry.filename.endswith(".xml")
+            )
+            if is_worksheet or entry.filename == "xl/workbook.xml":
+                payload = protection_pattern.sub(b"", payload)
+            target_zip.writestr(entry, payload)
+    return target.getvalue()
+
+
 def export_filename(vessels: list[str], machinery_code: str, machinery_name: str) -> str:
     machinery_part = safe_filename(machinery_code or machinery_name or "spare_parts")
     if len(vessels) == 1:
@@ -3247,12 +3271,12 @@ def build_multi_document_package(
                 continue
 
             try:
-                workbook_bytes = build_workbook(
+                workbook_bytes = remove_excel_protection(build_workbook(
                     template_bytes=template_bytes,
                     machinery_frame=machinery_frame,
                     review_frame=review,
                     clear_existing=clear_existing,
-                )
+                ))
                 file_name = export_filename(
                     vessels,
                     str(job.get("main_code", "")),
@@ -3437,12 +3461,12 @@ if active_workflow_step == "5. Export":
             use_container_width=True,
         ):
             try:
-                output_bytes = build_workbook(
+                output_bytes = remove_excel_protection(build_workbook(
                     template_bytes=template_bytes,
                     machinery_frame=machinery_frame,
                     review_frame=export_review,
                     clear_existing=clear_existing,
-                )
+                ))
                 st.session_state.output_name = export_filename(
                     vessels,
                     st.session_state.main_code,
