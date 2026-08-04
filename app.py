@@ -243,10 +243,21 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Streamlit Cloud uses this element as the primary scroll surface. Keep it
-       scrollable; the workflow panel itself deliberately has no fixed height. */
+    /* Make the browser page, not an individual workflow block, the only vertical
+       scroll surface. This avoids Cloud layouts that clip the bottom of a long
+       review or export screen. */
+    html, body {
+        height: auto !important;
+        overflow-y: auto !important;
+    }
+    [data-testid="stAppViewContainer"] {
+        height: 100vh !important;
+        overflow: visible !important;
+    }
     [data-testid="stMain"] {
         overflow-y: auto !important;
+        height: 100vh !important;
+        max-height: none !important;
         overscroll-behavior-y: auto !important;
     }
     [data-testid="stMainBlockContainer"],
@@ -1121,6 +1132,151 @@ def _review_row_id(row: pd.Series | dict) -> str:
     if not any(values[2:]):
         values.append(str(row.get("DESCRIPTION", "")).strip().upper())
     return hashlib.sha256("|".join(values).encode("utf-8")).hexdigest()[:24]
+
+
+def _normalise_source_code(value: object) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+
+def _extract_printed_english_from_pdf(pdf_bytes: bytes) -> tuple[dict[str, dict[str, object]], dict[str, str]]:
+    """Read table rows directly from text-based PDFs with multilingual designations.
+
+    In the L350 layout the part row contains position, ident number, source-language
+    title and quantity; the next printed line is the English designation. This is
+    more reliable than translating an already available English label.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return {}, {}
+
+    row_pattern = re.compile(
+        r"^\s*(?P<item>\d+)\s+(?P<code>[0-9][0-9A-Z.\-/]*)\s+.+?\s+(?P<quantity>\d+(?:[.,]\d+)?)\s*$",
+        re.IGNORECASE,
+    )
+    section_code_pattern = re.compile(r"\d+-\d+-\d+")
+    part_overrides: dict[str, dict[str, object]] = {}
+    section_names: dict[str, str] = {}
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return {}, {}
+
+    for page in reader.pages:
+        try:
+            lines = [line.strip() for line in (page.extract_text(extraction_mode="layout") or "").splitlines()]
+        except Exception:
+            continue
+        nonempty = [(index, line) for index, line in enumerate(lines) if line]
+        table_index = next((index for index, line in nonempty if "Tafel / Table / Planche" in line), None)
+        if table_index is not None:
+            # In layout extraction, the English section heading shares the line with
+            # "Tafel / Table / Planche"; the source code may share the French line.
+            english_title = lines[table_index].split("Tafel / Table / Planche", 1)[0].strip()
+            source_codes = []
+            for header_line in lines[max(0, table_index - 2): table_index + 3]:
+                source_codes.extend(section_code_pattern.findall(header_line))
+            if english_title:
+                for source_code in source_codes:
+                    normalised = _normalise_source_code(source_code)
+                    if normalised:
+                        section_names[normalised] = english_title
+
+        for line_index, line in nonempty:
+            match = row_pattern.fullmatch(line)
+            if not match:
+                continue
+            english_line = next(
+                (
+                    candidate
+                    for candidate_index, candidate in nonempty
+                    if candidate_index > line_index and candidate_index <= line_index + 4
+                    and not row_pattern.fullmatch(candidate)
+                ),
+                "",
+            )
+            # A direct source value must contain letters; otherwise leave the AI result intact.
+            if not re.search(r"[A-Za-z]", english_line):
+                continue
+            quantity = match.group("quantity").replace(",", ".")
+            part_overrides[_normalise_source_code(match.group("code"))] = {
+                "DESCRIPTION": re.sub(r"\s+", " ", english_line).strip(),
+                "ITEM NO": int(match.group("item")),
+                "QNT": float(quantity) if "." in quantity else int(quantity),
+            }
+    return part_overrides, section_names
+
+
+def _apply_printed_pdf_overrides(
+    review: pd.DataFrame,
+    pdf_bytes: bytes,
+) -> tuple[pd.DataFrame, dict[str, str], int]:
+    """Apply verified printed English descriptions and source item numbers to review rows."""
+    overrides, section_names = _extract_printed_english_from_pdf(pdf_bytes)
+    if review.empty or not overrides:
+        return review, section_names, 0
+
+    updated = review.copy()
+    changed = 0
+    for index, row in updated.iterrows():
+        source_code = _normalise_source_code(row.get("CODE") or row.get("PART NO"))
+        override = overrides.get(source_code)
+        if not override:
+            continue
+        row_changed = False
+        for column in ("DESCRIPTION", "ITEM NO", "QNT"):
+            if column in updated.columns and updated.at[index, column] != override[column]:
+                updated.at[index, column] = override[column]
+                row_changed = True
+        changed += int(row_changed)
+    return updated, section_names, changed
+
+
+def _remove_source_confirmed_duplicates(
+    review: pd.DataFrame,
+    pdf_bytes: bytes,
+) -> tuple[pd.DataFrame, int]:
+    """Drop duplicate OCR rows only when the PDF confirms one unique source record."""
+    overrides, _ = _extract_printed_english_from_pdf(pdf_bytes)
+    if review.empty or not overrides or "CODE" not in review.columns:
+        return review, 0
+    scope_column = next(
+        (column for column in ("SECTION CODE", "MACHINERY", "SOURCE PAGE") if column in review.columns),
+        None,
+    )
+    if scope_column is None:
+        return review, 0
+
+    updated = review.copy()
+    updated["_PDF_CODE"] = updated["CODE"].map(_normalise_source_code)
+    duplicate_mask = updated.duplicated(subset=[scope_column, "_PDF_CODE"], keep="first")
+    removable = duplicate_mask & updated["_PDF_CODE"].isin(overrides)
+    removed = int(removable.sum())
+    updated = updated.loc[~removable].drop(columns=["_PDF_CODE"])
+    return updated, removed
+
+
+def _apply_printed_section_names(
+    candidates: pd.DataFrame,
+    section_names: dict[str, str],
+) -> pd.DataFrame:
+    """Keep a PDF's explicit English section name instead of a generated translation."""
+    if candidates.empty or not section_names or not {"CODE", "NAME"}.issubset(candidates.columns):
+        return candidates
+    updated = candidates.copy()
+    for index, row in updated.iterrows():
+        code = str(row.get("CODE", "")).strip()
+        matched_name = next(
+            (
+                name
+                for source_code, name in section_names.items()
+                if source_code and source_code in _normalise_source_code(code)
+            ),
+            "",
+        )
+        if matched_name:
+            updated.at[index, "NAME"] = f"{matched_name.upper()} ({code})"
+    return updated
 
 
 def _verified_ids(value) -> set[str]:
@@ -2616,6 +2772,25 @@ if active_workflow_step == "2. OCR":
                         default_machinery=st.session_state.main_name,
                         default_unit=default_unit,
                     )
+                    printed_section_names: dict[str, str] = {}
+                    if input_type == "PDF" and source_file is not None:
+                        new_review, printed_section_names, printed_override_count = (
+                            _apply_printed_pdf_overrides(new_review, source_file.getvalue())
+                        )
+                        if printed_override_count:
+                            extraction_messages.append(
+                                f"Used printed English descriptions and source item values for "
+                                f"{printed_override_count} PDF row(s)."
+                            )
+                        new_review, source_duplicate_count = _remove_source_confirmed_duplicates(
+                            new_review,
+                            source_file.getvalue(),
+                        )
+                        if source_duplicate_count:
+                            extraction_messages.append(
+                                f"Removed {source_duplicate_count} duplicate OCR row(s) that conflicted "
+                                "with a unique source-PDF record."
+                            )
 
                     if append_results:
                         merged_pages = {
@@ -2674,6 +2849,10 @@ if active_workflow_step == "2. OCR":
                     merged_candidates = merge_submachinery_candidates(
                         previous_candidates,
                         detected_candidates,
+                    )
+                    merged_candidates = _apply_printed_section_names(
+                        merged_candidates,
+                        printed_section_names,
                     )
                     assigned_review = apply_submachinery_assignments(
                         combined_review,
@@ -3692,8 +3871,7 @@ if active_workflow_step == "5. Export":
             audit_name = (
                 safe_filename(st.session_state.output_name or st.session_state.main_name)
                 + "_OCR_audit.xlsx"
-            )  
-            
+            )
             st.download_button(
                 "Download OCR audit/review workbook",
                 data=audit_bytes,
