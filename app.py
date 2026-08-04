@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 import zipfile
+import xml.etree.ElementTree as ET
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -3179,6 +3180,106 @@ def remove_excel_protection(workbook_bytes: bytes) -> bytes:
     return target.getvalue()
 
 
+def convert_numeric_item_numbers(workbook_bytes: bytes) -> bytes:
+    """Store plain numeric values in 2.Spare Parts / ITEM NO as Excel numbers.
+
+    OCR identifiers such as ``1A`` and values with leading zeroes remain text because
+    converting them would change their meaning.
+    """
+    source = io.BytesIO(workbook_bytes)
+    target = io.BytesIO()
+    with zipfile.ZipFile(source, "r") as source_zip:
+        payloads = {entry.filename: source_zip.read(entry.filename) for entry in source_zip.infolist()}
+        entries = source_zip.infolist()
+
+    workbook_xml = payloads.get("xl/workbook.xml")
+    relationships_xml = payloads.get("xl/_rels/workbook.xml.rels")
+    if not workbook_xml or not relationships_xml:
+        return workbook_bytes
+
+    workbook_root = ET.fromstring(workbook_xml)
+    relationships_root = ET.fromstring(relationships_xml)
+    relationship_targets = {
+        relation.attrib.get("Id"): relation.attrib.get("Target", "")
+        for relation in relationships_root
+    }
+    spare_sheet_relationship = next(
+        (
+            sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+            for sheet in workbook_root.iter()
+            if sheet.tag.rsplit("}", 1)[-1] == "sheet"
+            and sheet.attrib.get("name") == "2.Spare Parts"
+        ),
+        None,
+    )
+    target_name = relationship_targets.get(spare_sheet_relationship, "")
+    worksheet_name = (
+        target_name.lstrip("/")
+        if target_name.startswith("xl/")
+        else f"xl/{target_name.lstrip('/')}"
+    )
+    worksheet_xml = payloads.get(worksheet_name)
+    if not worksheet_xml:
+        return workbook_bytes
+
+    shared_values: list[str] = []
+    if "xl/sharedStrings.xml" in payloads:
+        shared_root = ET.fromstring(payloads["xl/sharedStrings.xml"])
+        for item in shared_root:
+            shared_values.append(
+                "".join(
+                    text.text or ""
+                    for text in item.iter()
+                    if text.tag.rsplit("}", 1)[-1] == "t"
+                )
+            )
+
+    worksheet_root = ET.fromstring(worksheet_xml)
+    namespace = worksheet_root.tag.split("}", 1)[0] + "}"
+    changed = False
+    numeric_value = re.compile(r"^[+-]?(?:0|[1-9]\d*)(?:\.\d+)?$")
+    for cell in worksheet_root.iter(f"{namespace}c"):
+        reference = cell.attrib.get("r", "")
+        if not re.fullmatch(r"E[1-9]\d*", reference):
+            continue
+        cell_type = cell.attrib.get("t")
+        value_node = next((child for child in cell if child.tag == f"{namespace}v"), None)
+        if cell_type == "s" and value_node is not None:
+            try:
+                value = shared_values[int(value_node.text or "")]
+            except (ValueError, IndexError):
+                continue
+        elif cell_type == "inlineStr":
+            value = "".join(
+                text.text or ""
+                for child in cell
+                for text in child.iter()
+                if text.tag.rsplit("}", 1)[-1] == "t"
+            )
+        elif cell_type == "str" and value_node is not None:
+            value = value_node.text or ""
+        else:
+            continue
+        value = value.strip()
+        if not numeric_value.fullmatch(value):
+            continue
+        for child in list(cell):
+            cell.remove(child)
+        cell.attrib.pop("t", None)
+        ET.SubElement(cell, f"{namespace}v").text = value
+        changed = True
+
+    if not changed:
+        return workbook_bytes
+    payloads[worksheet_name] = ET.tostring(
+        worksheet_root, encoding="utf-8", xml_declaration=True
+    )
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as target_zip:
+        for entry in entries:
+            target_zip.writestr(entry, payloads[entry.filename])
+    return target.getvalue()
+
+
 def export_filename(vessels: list[str], machinery_code: str, machinery_name: str) -> str:
     machinery_part = safe_filename(machinery_code or machinery_name or "spare_parts")
     if len(vessels) == 1:
@@ -3271,12 +3372,12 @@ def build_multi_document_package(
                 continue
 
             try:
-                workbook_bytes = remove_excel_protection(build_workbook(
+                workbook_bytes = convert_numeric_item_numbers(remove_excel_protection(build_workbook(
                     template_bytes=template_bytes,
                     machinery_frame=machinery_frame,
                     review_frame=review,
                     clear_existing=clear_existing,
-                ))
+                )))
                 file_name = export_filename(
                     vessels,
                     str(job.get("main_code", "")),
@@ -3461,12 +3562,12 @@ if active_workflow_step == "5. Export":
             use_container_width=True,
         ):
             try:
-                output_bytes = remove_excel_protection(build_workbook(
+                output_bytes = convert_numeric_item_numbers(remove_excel_protection(build_workbook(
                     template_bytes=template_bytes,
                     machinery_frame=machinery_frame,
                     review_frame=export_review,
                     clear_existing=clear_existing,
-                ))
+                )))
                 st.session_state.output_name = export_filename(
                     vessels,
                     st.session_state.main_code,
