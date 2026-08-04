@@ -3225,6 +3225,32 @@ if active_workflow_step == "4. Review spare parts":
                         for _, row in page_visible.iterrows()
                     ],
                 )
+                # Streamlit requires the dataframe dtype to match each configured
+                # editor type. Keep identifiers as text (they may be numeric or
+                # alphanumeric) and normalize numeric/boolean fields explicitly.
+                for text_column in (
+                    "MACHINERY", "PART NO", "DESCRIPTION", "CODE", "ITEM NO", "UNIT"
+                ):
+                    if text_column in editor_source.columns:
+                        editor_source[text_column] = editor_source[text_column].map(
+                            lambda value: (
+                                ""
+                                if pd.isna(value)
+                                else str(int(value))
+                                if isinstance(value, float) and value.is_integer()
+                                else str(value)
+                            )
+                        )
+                for boolean_column in ("INCLUDE", "READY", "VERIFIED"):
+                    if boolean_column in editor_source.columns:
+                        editor_source[boolean_column] = (
+                            editor_source[boolean_column].fillna(False).astype(bool)
+                        )
+                for numeric_column in ("QNT", "SOURCE PAGE", "CONFIDENCE"):
+                    if numeric_column in editor_source.columns:
+                        editor_source[numeric_column] = pd.to_numeric(
+                            editor_source[numeric_column], errors="coerce"
+                        )
                 target_indexes = page_visible["_ROW_ID"].tolist()
                 editor_key = (
                     f"spare_review_editor_{st.session_state.get('loaded_job_id', 'single')}_"
