@@ -238,40 +238,14 @@ st.set_page_config(
     layout="wide",
 )
 
-# Keep the page comfortable to scroll without introducing a second, nested
-# workflow scrollbar.
+# Keep only generous bottom spacing. Streamlit's own page container must retain
+# its native scrolling behavior across Cloud/browser versions.
 st.markdown(
     """
     <style>
-    /* Make the browser page, not an individual workflow block, the only vertical
-       scroll surface. This avoids Cloud layouts that clip the bottom of a long
-       review or export screen. */
-    html, body {
-        height: auto !important;
-        overflow-y: auto !important;
-    }
-    [data-testid="stAppViewContainer"] {
-        height: 100vh !important;
-        overflow: visible !important;
-    }
-    [data-testid="stMain"] {
-        overflow-y: auto !important;
-        height: 100vh !important;
-        max-height: none !important;
-        overscroll-behavior-y: auto !important;
-    }
     [data-testid="stMainBlockContainer"],
     .block-container {
-        padding-bottom: 6rem !important;
-        min-height: 100vh !important;
-    }
-    .st-key-workflow_navigation {
-        position: sticky;
-        top: 0;
-        z-index: 20;
-        padding: 0.65rem 0 0.4rem 0;
-        background: var(--background-color);
-        border-bottom: 1px solid rgba(128, 128, 128, 0.2);
+        padding-bottom: 10rem !important;
     }
     </style>
     """,
