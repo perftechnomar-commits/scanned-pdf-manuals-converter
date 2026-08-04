@@ -900,8 +900,12 @@ def apply_processing_preset() -> None:
 
 def select_processing_preset(preset_name: str) -> None:
     """Apply an OCR preset inside the isolated processing-settings fragment."""
+    # Fragment reruns do not execute the main page, so explicitly retain every
+    # document input before changing OCR-only settings.
+    pin_persistent_input_state()
     st.session_state.processing_preset = preset_name
     apply_processing_preset()
+    save_loaded_job_state()
 
 
 PERSISTENT_INPUT_KEYS = [
@@ -973,6 +977,10 @@ def render_processing_mode_controls() -> None:
     A click on Balanced, Fast, or Careful now reruns only this small sidebar
     fragment instead of rerunning the complete application.
     """
+    # Streamlit cleans up widget state that is not rendered during a fragment
+    # rerun unless the application marks it as persistent. This protects vessels
+    # and machinery fields while the user changes any Mistral setting.
+    pin_persistent_input_state()
     st.header("Processing mode")
     st.caption(
         "Choose one mode. Balanced is recommended for normal use; Advanced settings "
@@ -1089,6 +1097,7 @@ def render_processing_mode_controls() -> None:
 - Default unit: `{default_unit or 'Blank'}`
             """
         )
+    save_loaded_job_state()
 
 
 LOW_CONFIDENCE_REVIEW_WARNING = "Low confidence - manual verification required"
