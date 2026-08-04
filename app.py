@@ -2125,6 +2125,18 @@ if active_workflow_step == "3. Sub-machineries":
             "proposals and recalculates READY status."
         )
 
+        render_workflow_actions(
+            previous_step="2. OCR",
+            next_step="4. Review spare parts",
+            next_label="Continue to spare-parts review →",
+            next_disabled=not workflow_sub_ready,
+            next_help=(
+                "Run document processing first."
+                if not workflow_ocr_ready
+                else f"Complete the required details for {workflow_missing_sub_details} included sub-machinery record(s)."
+            ) if not workflow_sub_ready else None,
+        )
+
         # Normalize state after upgrades or older sessions.
         sub_frame = st.session_state.submachinery_review.copy()
         for column in SUBMACHINERY_REVIEW_COLUMNS:
@@ -2397,19 +2409,6 @@ if active_workflow_step == "3. Sub-machineries":
                 "spare-parts review when the detected records look right."
             )
 
-        render_workflow_actions(
-            previous_step="2. OCR",
-            next_step="4. Review spare parts",
-            next_label="Continue to spare-parts review →",
-            next_disabled=not bool(st.session_state.extracted_pages),
-            next_help=(
-                "Run document processing first."
-                if not st.session_state.extracted_pages
-                else None
-            ),
-        )
-
-
     # ---------------------------------------------------------------------------
     # OCR and row extraction
     # ---------------------------------------------------------------------------
@@ -2453,6 +2452,22 @@ if active_workflow_step == "2. OCR":
                 else "Run OCR using the selected processing mode and active advanced settings."
             ),
         )
+        # Keep the normal workflow control above the optional diagnostics. A long
+        # manual can produce enough OCR content that a bottom-of-page Continue
+        # button becomes difficult to reach on smaller screens.
+        ocr_actions_slot = st.empty()
+        with ocr_actions_slot.container():
+            render_workflow_actions(
+                previous_step="1. Machinery",
+                next_step="3. Sub-machineries",
+                next_label="Review detected sub-machineries →",
+                next_disabled=not bool(st.session_state.extracted_pages),
+                next_help=(
+                    "Process the document successfully before continuing."
+                    if not st.session_state.extracted_pages
+                    else None
+                ),
+            )
 
         if process_button:
             source_error = ""
@@ -2681,6 +2696,15 @@ if active_workflow_step == "2. OCR":
                         f"matched {len(merged_candidates)} source-coded sub-machinery section(s), and marked "
                         f"{ready_count} row(s) ready. Exceptions requiring review: {exception_count}."
                     )
+                    # Replace the disabled control above with the enabled one as
+                    # soon as processing completes, without requiring a rerun.
+                    with ocr_actions_slot.container():
+                        render_workflow_actions(
+                            previous_step="1. Machinery",
+                            next_step="3. Sub-machineries",
+                            next_label="Review detected sub-machineries →",
+                            next_disabled=False,
+                        )
                     for message in extraction_messages:
                         lowered_message = message.lower()
                         if (
@@ -2703,18 +2727,21 @@ if active_workflow_step == "2. OCR":
                     st.error(f"Processing failed: {safe_message}")
 
         if st.session_state.extracted_pages:
-            st.subheader("Raw OCR output")
-            classification_lookup = {}
-            if (
-                st.session_state.page_classification is not None
-                and not st.session_state.page_classification.empty
-            ):
-                classification_lookup = {
-                    int(row["SOURCE PAGE"]): row
-                    for _, row in st.session_state.page_classification.iterrows()
-                }
+            with st.expander("OCR details and raw output", expanded=False):
+                st.caption(
+                    "Optional technical details. Open this only when you need to inspect OCR pages or download the raw text."
+                )
+                classification_lookup = {}
+                if (
+                    st.session_state.page_classification is not None
+                    and not st.session_state.page_classification.empty
+                ):
+                    classification_lookup = {
+                        int(row["SOURCE PAGE"]): row
+                        for _, row in st.session_state.page_classification.iterrows()
+                    }
 
-            page_summary = pd.DataFrame(
+                page_summary = pd.DataFrame(
                 [
                     {
                         "Page": page,
@@ -2727,51 +2754,39 @@ if active_workflow_step == "2. OCR":
                     }
                     for page, markdown in st.session_state.extracted_pages
                 ]
-            )
-            summary_metrics = st.columns(3)
-            summary_metrics[0].metric("OCR pages", len(page_summary))
-            summary_metrics[1].metric("Pages structured", int(page_summary["Process"].sum()))
-            summary_metrics[2].metric(
-                "Pages skipped",
-                int((~page_summary["Process"]).sum()),
-            )
-            st.dataframe(
-                page_summary,
-                use_container_width=True,
-                hide_index=True,
-                height=min(340, max(150, 42 + 35 * len(page_summary))),
-                column_config=_auto_dataframe_config(page_summary, maximums={"Preview": 520}),
-            )
+                )
+                summary_metrics = st.columns(3)
+                summary_metrics[0].metric("OCR pages", len(page_summary))
+                summary_metrics[1].metric("Pages structured", int(page_summary["Process"].sum()))
+                summary_metrics[2].metric(
+                    "Pages skipped",
+                    int((~page_summary["Process"]).sum()),
+                )
+                st.dataframe(
+                    page_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(340, max(150, 42 + 35 * len(page_summary))),
+                    column_config=_auto_dataframe_config(page_summary, maximums={"Preview": 520}),
+                )
 
-            raw_markdown = "\n\n".join(
-                f"# Page {page}\n\n{markdown}"
-                for page, markdown in st.session_state.extracted_pages
-            )
-            st.download_button(
-                "Download raw OCR markdown",
-                data=raw_markdown.encode("utf-8"),
-                file_name="raw_ocr.md",
-                mime="text/markdown",
-            )
-            with st.expander("View raw OCR markdown"):
-                st.markdown(raw_markdown)
+                raw_markdown = "\n\n".join(
+                    f"# Page {page}\n\n{markdown}"
+                    for page, markdown in st.session_state.extracted_pages
+                )
+                st.download_button(
+                    "Download raw OCR markdown",
+                    data=raw_markdown.encode("utf-8"),
+                    file_name="raw_ocr.md",
+                    mime="text/markdown",
+                )
+                with st.expander("View raw OCR markdown"):
+                    st.markdown(raw_markdown)
 
-            if st.session_state.extraction_log:
-                with st.expander("Extraction recovery log"):
-                    for message in st.session_state.extraction_log:
-                        st.write(f"- {message}")
-
-        render_workflow_actions(
-            previous_step="1. Machinery",
-            next_step="3. Sub-machineries",
-            next_label="Review detected sub-machineries →",
-            next_disabled=not bool(st.session_state.extracted_pages),
-            next_help=(
-                "Process the document successfully before continuing."
-                if not st.session_state.extracted_pages
-                else None
-            ),
-        )
+                if st.session_state.extraction_log:
+                    with st.expander("Extraction recovery log"):
+                        for message in st.session_state.extraction_log:
+                            st.write(f"- {message}")
 
 
     # ---------------------------------------------------------------------------
@@ -2796,6 +2811,18 @@ if active_workflow_step == "4. Review spare parts":
         review_flash = str(st.session_state.pop("review_flash", "") or "")
         if review_flash:
             st.success(review_flash)
+
+        render_workflow_actions(
+            previous_step="3. Sub-machineries",
+            next_step="5. Export",
+            next_label="Continue to export →",
+            next_disabled=not workflow_review_ready,
+            next_help=(
+                f"Resolve {workflow_blocked_count} included row(s) before export."
+                if workflow_blocked_count
+                else "Process and review at least one included spare-part row first."
+            ) if not workflow_review_ready else None,
+        )
 
         if st.session_state.spare_review.empty:
             st.info("Run OCR first. Candidate spare-parts rows will appear here.")
@@ -3106,19 +3133,6 @@ if active_workflow_step == "4. Review spare parts":
                     "Technical matching fields remain available in the OCR audit workbook."
                 )
 
-        render_workflow_actions(
-            previous_step="3. Sub-machineries",
-            next_step="5. Export",
-            next_label="Continue to export →",
-            next_disabled=not workflow_review_ready,
-            next_help=(
-                f"Resolve {workflow_blocked_count} included row(s) before export."
-                if workflow_blocked_count
-                else "Process and review at least one included spare-part row first."
-            ) if not workflow_review_ready else None,
-        )
-
-
     # ---------------------------------------------------------------------------
     # Template export, audit, and vessel email
     # ---------------------------------------------------------------------------
@@ -3311,6 +3325,7 @@ if active_workflow_step == "5. Export":
         if active_job:
             st.caption(f"Active document: **{active_job['file_name']}**")
         st.subheader("Step 5 — Build import workbook")
+        render_workflow_actions(previous_step="4. Review spare parts")
         vessels = selected_vessel_names()
         if vessels:
             st.info(
@@ -3543,10 +3558,6 @@ if active_workflow_step == "5. Export":
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-
-        render_workflow_actions(previous_step="4. Review spare parts")
-
-
 
 # Persist the active document workspace after every completed rerun.
 save_loaded_job_state()
