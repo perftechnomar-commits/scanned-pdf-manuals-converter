@@ -2456,18 +2456,22 @@ if active_workflow_step == "2. OCR":
         # manual can produce enough OCR content that a bottom-of-page Continue
         # button becomes difficult to reach on smaller screens.
         ocr_actions_slot = st.empty()
-        with ocr_actions_slot.container():
-            render_workflow_actions(
-                previous_step="1. Machinery",
-                next_step="3. Sub-machineries",
-                next_label="Review detected sub-machineries →",
-                next_disabled=not bool(st.session_state.extracted_pages),
-                next_help=(
-                    "Process the document successfully before continuing."
-                    if not st.session_state.extracted_pages
-                    else None
-                ),
-            )
+        # While processing, render the control only after success below. Rendering
+        # it both before and after the button click would create duplicate Streamlit
+        # widget keys in one script run.
+        if not process_button:
+            with ocr_actions_slot.container():
+                render_workflow_actions(
+                    previous_step="1. Machinery",
+                    next_step="3. Sub-machineries",
+                    next_label="Review detected sub-machineries →",
+                    next_disabled=not bool(st.session_state.extracted_pages),
+                    next_help=(
+                        "Process the document successfully before continuing."
+                        if not st.session_state.extracted_pages
+                        else None
+                    ),
+                )
 
         if process_button:
             source_error = ""
