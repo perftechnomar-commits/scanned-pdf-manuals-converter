@@ -2461,7 +2461,8 @@ if active_workflow_step == "3. Sub-machineries":
 
             st.caption(
                 "Edit as many cells as you need without leaving this table. Select Save changes "
-                "when you are ready to apply renames and exclusions to linked spare-part rows."
+                "when you are ready to apply renames and exclusions to linked spare-part rows. "
+                "Column widths automatically refit to the saved values."
             )
             editor_form = st.form(key=f"{editor_key}_form", border=False)
             editor_form.data_editor(
@@ -2486,7 +2487,7 @@ if active_workflow_step == "3. Sub-machineries":
                         "INCLUDE",
                         help="Included rows are exported and used for automatic spare-part assignment.",
                         default=True,
-                        width="small",
+                        width=_content_column_width(page_frame, "INCLUDE", 76, 105),
                     ),
                     "CODE": st.column_config.TextColumn(
                         "CODE", width=_content_column_width(page_frame, "CODE", 95, 210)
@@ -2513,19 +2514,24 @@ if active_workflow_step == "3. Sub-machineries":
                         width=_content_column_width(page_frame, "SPECIFICATIONS", 170, 420),
                     ),
                     "MCH_TP(M/S/U)": st.column_config.TextColumn(
-                        "MCH_TP(M/S/U)", width="small"
+                        "MCH_TP(M/S/U)",
+                        width=_content_column_width(page_frame, "MCH_TP(M/S/U)", 105, 180),
                     ),
                     "FIRST PAGE": st.column_config.NumberColumn(
-                        "FIRST PAGE", format="%d", width="small"
+                        "FIRST PAGE", format="%d",
+                        width=_content_column_width(page_frame, "FIRST PAGE", 82, 125),
                     ),
                     "LAST PAGE": st.column_config.NumberColumn(
-                        "LAST PAGE", format="%d", width="small"
+                        "LAST PAGE", format="%d",
+                        width=_content_column_width(page_frame, "LAST PAGE", 82, 125),
                     ),
                     "PARTS FOUND": st.column_config.NumberColumn(
-                        "PARTS FOUND", format="%d", width="small"
+                        "PARTS FOUND", format="%d",
+                        width=_content_column_width(page_frame, "PARTS FOUND", 92, 135),
                     ),
                     "CONFIDENCE": st.column_config.ProgressColumn(
-                        "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
+                        "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%",
+                        width=_content_column_width(page_frame, "CONFIDENCE", 95, 135),
                     ),
                     "VARIANTS": None,
                     "DETECTION KEYS": None,
@@ -3227,7 +3233,8 @@ if active_workflow_step == "4. Review spare parts":
 
                 st.caption(
                     "Edit as many cells as needed without leaving this table. Select Save changes "
-                    "when you are ready to validate the page."
+                    "when you are ready to validate the page. Column widths automatically refit "
+                    "to the saved values."
                 )
                 editor_form = st.form(key=f"{editor_key}_form", border=False)
                 editor_form.data_editor(
@@ -3251,11 +3258,18 @@ if active_workflow_step == "4. Review spare parts":
                         "WARNING",
                     ],
                     column_config={
-                        "INCLUDE": st.column_config.CheckboxColumn("INCLUDE", default=True),
-                        "READY": st.column_config.CheckboxColumn("READY", disabled=True),
+                        "INCLUDE": st.column_config.CheckboxColumn(
+                            "INCLUDE", default=True,
+                            width=_content_column_width(editor_source, "INCLUDE", 76, 105),
+                        ),
+                        "READY": st.column_config.CheckboxColumn(
+                            "READY", disabled=True,
+                            width=_content_column_width(editor_source, "READY", 72, 100),
+                        ),
                         "VERIFIED": st.column_config.CheckboxColumn(
                             "MANUALLY VERIFIED",
                             help="Tick after checking a low-confidence row against the PDF.",
+                            width=_content_column_width(editor_source, "VERIFIED", 135, 180),
                         ),
                         "MACHINERY": st.column_config.SelectboxColumn(
                             "SUB-MACHINERY",
@@ -3274,16 +3288,26 @@ if active_workflow_step == "4. Review spare parts":
                         "ITEM NO": st.column_config.TextColumn(
                             "ITEM NO", width=_content_column_width(editor_source, "ITEM NO", 80, 180)
                         ),
-                        "UNIT": st.column_config.SelectboxColumn("UNIT", options=UNIT_OPTIONS),
-                        "QNT": st.column_config.NumberColumn("QNT", min_value=0, step=1),
-                        "SOURCE PAGE": st.column_config.NumberColumn("SOURCE PAGE", format="%d", width="small"),
+                        "UNIT": st.column_config.SelectboxColumn(
+                            "UNIT", options=UNIT_OPTIONS,
+                            width=_content_column_width(editor_source, "UNIT", 75, 130),
+                        ),
+                        "QNT": st.column_config.NumberColumn(
+                            "QNT", min_value=0, step=1,
+                            width=_content_column_width(editor_source, "QNT", 68, 105),
+                        ),
+                        "SOURCE PAGE": st.column_config.NumberColumn(
+                            "SOURCE PAGE", format="%d",
+                            width=_content_column_width(editor_source, "SOURCE PAGE", 95, 135),
+                        ),
                         "SECTION START PAGE": None,
                         "TABLE TITLE": None,
                         "SECTION CODE": None,
                         "SECTION MAKER": None,
                         "SECTION MODEL": None,
                         "CONFIDENCE": st.column_config.ProgressColumn(
-                            "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%"
+                            "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%",
+                            width=_content_column_width(editor_source, "CONFIDENCE", 95, 135),
                         ),
                         "DETECTED MACHINERY": None,
                         "ASSIGNMENT SOURCE": None,
