@@ -26,6 +26,7 @@ from tools import (
     SUBMACHINERY_REVIEW_COLUMNS,
     UNIT_OPTIONS,
     add_manual_submachinery_candidate,
+    analyze_document_profile_with_ai,
     apply_submachinery_assignments,
     build_audit_workbook,
     build_submachinery_candidates,
@@ -58,7 +59,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.8.1"
+APP_VERSION = "4.9.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -199,6 +200,8 @@ PROCESSING_PRESETS = {
         "structure_mode": "AI JSON extraction (recommended)",
         "page_filter_mode": DEFAULT_PAGE_FILTER,
         "extraction_model": "mistral-small-latest",
+        "adaptive_analysis": True,
+        "analysis_model": "mistral-large-2512",
         "ocr_pages_per_request": 25,
         "extraction_pages_per_batch": 3,
         "extraction_max_chars": 12000,
@@ -212,6 +215,8 @@ PROCESSING_PRESETS = {
         "structure_mode": "AI JSON extraction (recommended)",
         "page_filter_mode": DEFAULT_PAGE_FILTER,
         "extraction_model": "mistral-small-latest",
+        "adaptive_analysis": True,
+        "analysis_model": "mistral-large-2512",
         "ocr_pages_per_request": 35,
         "extraction_pages_per_batch": 4,
         "extraction_max_chars": 16000,
@@ -225,6 +230,8 @@ PROCESSING_PRESETS = {
         "structure_mode": "AI JSON extraction (recommended)",
         "page_filter_mode": DEFAULT_PAGE_FILTER,
         "extraction_model": "mistral-small-latest",
+        "adaptive_analysis": True,
+        "analysis_model": "mistral-large-2512",
         "ocr_pages_per_request": 12,
         "extraction_pages_per_batch": 1,
         "extraction_max_chars": 8000,
@@ -609,6 +616,7 @@ def initialize_state() -> None:
         "extracted_pages": [],
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
+        "document_profile": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "selected_vessels": [],
@@ -628,6 +636,8 @@ def initialize_state() -> None:
         "setting_structure_mode": PROCESSING_PRESETS["Balanced"]["structure_mode"],
         "setting_page_filter_mode": PROCESSING_PRESETS["Balanced"]["page_filter_mode"],
         "setting_extraction_model": PROCESSING_PRESETS["Balanced"]["extraction_model"],
+        "setting_adaptive_analysis": PROCESSING_PRESETS["Balanced"]["adaptive_analysis"],
+        "setting_analysis_model": PROCESSING_PRESETS["Balanced"]["analysis_model"],
         "setting_ocr_pages_per_request": PROCESSING_PRESETS["Balanced"]["ocr_pages_per_request"],
         "setting_extraction_pages_per_batch": PROCESSING_PRESETS["Balanced"]["extraction_pages_per_batch"],
         "setting_extraction_max_chars": PROCESSING_PRESETS["Balanced"]["extraction_max_chars"],
@@ -668,6 +678,7 @@ JOB_STATE_FIELDS = [
     "extracted_pages",
     "page_classification",
     "extraction_log",
+    "document_profile",
     "spare_review",
     "submachinery_review",
     "selected_vessels",
@@ -719,6 +730,7 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "extracted_pages": [],
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
+        "document_profile": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "selected_vessels": [],
@@ -772,6 +784,10 @@ def load_document_job(job_id: str) -> None:
     for field in JOB_STATE_FIELDS:
         if field in job:
             st.session_state[field] = _clone_state_value(job[field])
+        elif field == "document_profile":
+            # Older in-memory jobs predate adaptive analysis. Never leak the
+            # previously active document's profile into another manual.
+            st.session_state.document_profile = {}
     st.session_state.loaded_job_id = job_id
     st.session_state.active_document_id = job_id
 
@@ -892,6 +908,8 @@ def apply_processing_preset() -> None:
     st.session_state.setting_structure_mode = preset["structure_mode"]
     st.session_state.setting_page_filter_mode = preset["page_filter_mode"]
     st.session_state.setting_extraction_model = preset["extraction_model"]
+    st.session_state.setting_adaptive_analysis = preset["adaptive_analysis"]
+    st.session_state.setting_analysis_model = preset["analysis_model"]
     st.session_state.setting_ocr_pages_per_request = preset["ocr_pages_per_request"]
     st.session_state.setting_extraction_pages_per_batch = preset["extraction_pages_per_batch"]
     st.session_state.setting_extraction_max_chars = preset["extraction_max_chars"]
@@ -922,6 +940,8 @@ PERSISTENT_INPUT_KEYS = [
     "setting_structure_mode",
     "setting_page_filter_mode",
     "setting_extraction_model",
+    "setting_adaptive_analysis",
+    "setting_analysis_model",
     "setting_ocr_pages_per_request",
     "setting_extraction_pages_per_batch",
     "setting_extraction_max_chars",
@@ -1021,6 +1041,28 @@ def render_processing_mode_controls() -> None:
             disabled=structure_mode != "AI JSON extraction (recommended)",
             help="Recommended default: mistral-small-latest.",
         )
+        adaptive_analysis = st.checkbox(
+            "Analyze each document's layout and language pattern first",
+            key="setting_adaptive_analysis",
+            disabled=structure_mode != "AI JSON extraction (recommended)",
+            help=(
+                "Runs one document-level reasoning pass before row extraction. It "
+                "detects hierarchy, column roles, continuation rules, and how English "
+                "is presented. The same Mistral API key is used."
+            ),
+        )
+        analysis_model = st.text_input(
+            "Document-analysis model",
+            key="setting_analysis_model",
+            disabled=(
+                structure_mode != "AI JSON extraction (recommended)"
+                or not adaptive_analysis
+            ),
+            help=(
+                "Recommended: mistral-large-2512. It is called once per OCR run and "
+                "also handles only the language terms that remain uncertain."
+            ),
+        )
         ocr_pages_per_request = st.number_input(
             "PDF pages per OCR request",
             min_value=1,
@@ -1075,7 +1117,9 @@ def render_processing_mode_controls() -> None:
 - Mode: `{st.session_state.processing_preset}`
 - Page filtering: `{page_filter_mode}`
 - Extraction method: `{structure_mode}`
-- Model: `{extraction_model}`
+- Row-extraction model: `{extraction_model}`
+- Adaptive document analysis: `{'On' if adaptive_analysis else 'Off'}`
+- Document-analysis model: `{analysis_model if adaptive_analysis else 'Not used'}`
 - OCR pages/request: `{int(ocr_pages_per_request)}`
 - Structuring pages/batch: `{int(extraction_pages_per_batch)}`
 - Maximum characters/batch: `{int(extraction_max_chars)}`
@@ -1352,6 +1396,12 @@ with st.sidebar:
 
 ### Automatic sub-machinery detection
 
+Before row extraction, the default adaptive analysis uses Mistral Large 3 once to
+identify the document-wide language order, column meanings, hierarchy patterns,
+and continuation rules. The saved profile guides every extraction batch. It is
+advisory only: printed source evidence, unique-code enforcement, and review checks
+remain authoritative, and processing safely continues if the analysis call fails.
+
 The app uses the drawing/table code printed in each PDF page header as the internal key and assigns every spare by that exact key. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
 
 For older German/English/French catalogues, the app also recognizes simple numbered
@@ -1609,6 +1659,7 @@ with st.expander("⚙️ Processing & export settings", expanded=False):
             st.session_state.extracted_pages = []
             st.session_state.page_classification = pd.DataFrame()
             st.session_state.extraction_log = []
+            st.session_state.document_profile = {}
             st.session_state.spare_review = empty_review_dataframe()
             st.session_state.submachinery_review = empty_submachinery_review_dataframe()
             st.session_state.output = None
@@ -1631,6 +1682,8 @@ api_key = get_secret("MISTRAL_API_KEY") or str(
 structure_mode = str(st.session_state.setting_structure_mode)
 page_filter_mode = str(st.session_state.setting_page_filter_mode)
 extraction_model = str(st.session_state.setting_extraction_model)
+adaptive_analysis = bool(st.session_state.setting_adaptive_analysis)
+analysis_model = str(st.session_state.setting_analysis_model)
 ocr_pages_per_request = int(st.session_state.setting_ocr_pages_per_request)
 extraction_pages_per_batch = int(st.session_state.setting_extraction_pages_per_batch)
 extraction_max_chars = int(st.session_state.setting_extraction_max_chars)
@@ -2707,16 +2760,56 @@ if active_workflow_step == "2. OCR":
                         ),
                     )
                     extraction_messages: list[str] = []
+                    profile_messages: list[str] = []
+                    document_profile: dict = {}
+                    if (
+                        adaptive_analysis
+                        and structure_mode == "AI JSON extraction (recommended)"
+                    ):
+                        progress_bar.progress(
+                            0.03,
+                            text="Analyzing document layout, hierarchy, and languages...",
+                        )
+                        try:
+                            document_profile, profile_messages = (
+                                analyze_document_profile_with_ai(
+                                    api_key=api_key,
+                                    model=analysis_model.strip() or "mistral-large-2512",
+                                    extracted_pages=extracted_pages,
+                                    additional_instructions=extra_prompt,
+                                )
+                            )
+                            extraction_messages.extend(profile_messages)
+                            if float(document_profile.get("confidence", 0.0)) < 0.60:
+                                extraction_messages.append(
+                                    "Adaptive document analysis reported low confidence. "
+                                    "Its profile was treated as guidance and all normal "
+                                    "validation/review controls remain active."
+                                )
+                        except Exception as profile_error:
+                            previous_profile = st.session_state.get(
+                                "document_profile", {}
+                            )
+                            if append_results and isinstance(previous_profile, dict):
+                                document_profile = dict(previous_profile)
+                            extraction_messages.append(
+                                "Adaptive document analysis was unavailable, so processing "
+                                "continued with the existing extraction and deterministic "
+                                f"validation path. Details: {profile_error}"
+                            )
                     if structure_mode == "AI JSON extraction (recommended)":
-                        ai_rows, extraction_messages = extract_spare_parts_with_ai(
+                        ai_rows, row_extraction_messages = extract_spare_parts_with_ai(
                             api_key=api_key,
                             model=extraction_model.strip() or "mistral-small-latest",
                             extracted_pages=structure_pages,
                             pages_per_batch=int(extraction_pages_per_batch),
                             max_chars_per_batch=int(extraction_max_chars),
                             additional_instructions=extra_prompt,
+                            document_profile=document_profile,
                             progress=show_progress,
                         )
+                        extraction_messages.extend(row_extraction_messages)
+                        extraction_messages = list(dict.fromkeys(extraction_messages))
                     else:
                         ai_rows = []
 
@@ -2756,9 +2849,14 @@ if active_workflow_step == "2. OCR":
                     # complete technical term into English. The same canonical English
                     # title is propagated to every row of a source-coded sub-machinery.
                     if rows:
+                        language_model = (
+                            (analysis_model.strip() or "mistral-large-2512")
+                            if adaptive_analysis and document_profile
+                            else (extraction_model.strip() or "mistral-small-latest")
+                        )
                         rows, english_messages = enforce_english_only_with_ai(
                             api_key=api_key,
-                            model=extraction_model.strip() or "mistral-small-latest",
+                            model=language_model,
                             rows=rows,
                             progress=show_progress,
                         )
@@ -2835,6 +2933,8 @@ if active_workflow_step == "2. OCR":
                         previous_candidates = empty_submachinery_review_dataframe()
                         st.session_state.verified_review_rows = []
                         st.session_state.review_page_number = 1
+
+                    st.session_state.document_profile = document_profile
 
                     detected_candidates = build_submachinery_candidates(
                         combined_review,
@@ -2914,6 +3014,48 @@ if active_workflow_step == "2. OCR":
                     st.error(f"Processing failed: {safe_message}")
 
         if st.session_state.extracted_pages:
+            saved_profile = st.session_state.get("document_profile", {})
+            if isinstance(saved_profile, dict) and saved_profile:
+                with st.expander("Adaptive document analysis", expanded=False):
+                    profile_metrics = st.columns(3)
+                    profile_metrics[0].metric(
+                        "Profile confidence",
+                        f"{float(saved_profile.get('confidence', 0.0)):.0%}",
+                    )
+                    profile_metrics[1].metric(
+                        "Languages",
+                        str(len(saved_profile.get("languages", []))),
+                    )
+                    profile_metrics[2].metric(
+                        "Pages sampled",
+                        str(len(saved_profile.get("analyzed_pages", []))),
+                    )
+                    st.caption(
+                        f"Model: `{saved_profile.get('analysis_model', '-')}` · "
+                        f"Document family: {saved_profile.get('document_family', 'Not identified')}"
+                    )
+                    st.write(
+                        "**English rule:** "
+                        + str(saved_profile.get("english_selection_rule", "Not identified"))
+                    )
+                    st.write(
+                        "**Part identifier:** "
+                        + str(saved_profile.get("part_identifier_header", "Not identified"))
+                    )
+                    st.write(
+                        "**Item number:** "
+                        + str(saved_profile.get("item_number_header", "Not identified"))
+                    )
+                    hierarchy = saved_profile.get("hierarchy", {})
+                    if isinstance(hierarchy, dict) and hierarchy.get("examples"):
+                        st.dataframe(
+                            pd.DataFrame(hierarchy["examples"]),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    with st.popover("View complete analysis profile"):
+                        st.json(saved_profile)
+
             with st.expander("OCR details and raw output", expanded=False):
                 st.caption(
                     "Optional technical details. Open this only when you need to inspect OCR pages or download the raw text."
