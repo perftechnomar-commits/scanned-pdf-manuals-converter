@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.8.1"
+TOOLS_VERSION = "4.9.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -992,11 +992,221 @@ def _mistral_json_request(
     raise RuntimeError(f"Mistral structured extraction failed: {last_error}")
 
 
+DOCUMENT_PROFILE_SYSTEM_PROMPT = """
+You are a technical-document layout analyst. Examine representative OCR pages from
+one marine or industrial spare-parts manual and describe the manual's extraction
+pattern. Return exactly one JSON object with this structure:
+{
+  "document_family": "",
+  "languages": [],
+  "english_selection_rule": "",
+  "part_identifier_header": "",
+  "part_identifier_rule": "",
+  "item_number_header": "",
+  "item_number_rule": "",
+  "quantity_header": "",
+  "quantity_rule": "",
+  "hierarchy": {
+    "major_code_pattern": "",
+    "subsection_code_pattern": "",
+    "heading_detection_rule": "",
+    "continuation_rule": "",
+    "examples": [{"code": "", "name_english": "", "page": 1}]
+  },
+  "table_rules": [],
+  "exclude_as_codes": [],
+  "uncertainties": [],
+  "confidence": 0.0
+}
+
+Rules:
+1. Base every conclusion on text visibly present in the supplied OCR pages. Do not
+   invent headings, translations, columns, codes, or page ranges.
+2. Distinguish hierarchy codes from spare-part identifiers, drawing positions,
+   burner/application variants, maker names, and model names such as SQM10 or ASZ12.
+3. Preserve printed punctuation and trailing zeroes in hierarchy examples.
+4. Explain how to select an already printed English phrase. Translation is allowed
+   only when no English wording is printed.
+5. Identify vertically merged cells, continuation pages, parallel language columns,
+   repeated headers, weight columns, and multi-value Order-No./Ident-No. cells when
+   the evidence supports them.
+6. Keep rules concise and operational. Put any doubtful conclusion in uncertainties
+   and lower confidence rather than guessing.
+7. confidence is from 0 to 1 and describes confidence in the overall profile.
+""".strip()
+
+
+def _representative_profile_pages(
+    extracted_pages: Sequence[tuple[int, str]],
+    max_pages: int = 24,
+    max_chars_per_page: int = 7000,
+) -> list[tuple[int, str]]:
+    """Select an evenly distributed, bounded sample for one document-level pass."""
+    pages = [(int(page), str(markdown or "")) for page, markdown in extracted_pages]
+    if len(pages) <= max(1, int(max_pages)):
+        selected = pages
+    else:
+        last = len(pages) - 1
+        indexes = {
+            round(position * last / (max(2, int(max_pages)) - 1))
+            for position in range(max(2, int(max_pages)))
+        }
+        selected = [pages[index] for index in sorted(indexes)]
+    character_limit = max(1000, int(max_chars_per_page))
+    return [
+        (page, markdown[:character_limit])
+        for page, markdown in selected
+        if clean_text(markdown)
+    ]
+
+
+def _profile_text_list(value: Any, maximum: int = 20) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = clean_text(item)
+        if text and text not in result:
+            result.append(text)
+        if len(result) >= maximum:
+            break
+    return result
+
+
+def _normalize_document_profile(
+    value: Any,
+    model: str,
+    analyzed_pages: Sequence[int],
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    hierarchy_source = value.get("hierarchy", {})
+    hierarchy_source = hierarchy_source if isinstance(hierarchy_source, dict) else {}
+    examples: list[dict[str, Any]] = []
+    for item in hierarchy_source.get("examples", []):
+        if not isinstance(item, dict):
+            continue
+        page_value = quantity_to_number(item.get("page"))
+        examples.append(
+            {
+                "code": clean_text(item.get("code", "")),
+                "name_english": clean_text(item.get("name_english", "")),
+                "page": int(page_value) if page_value is not None else None,
+            }
+        )
+        if len(examples) >= 30:
+            break
+    profile = {
+        "document_family": clean_text(value.get("document_family", "")),
+        "languages": _profile_text_list(value.get("languages", []), maximum=12),
+        "english_selection_rule": clean_text(value.get("english_selection_rule", "")),
+        "part_identifier_header": clean_text(value.get("part_identifier_header", "")),
+        "part_identifier_rule": clean_text(value.get("part_identifier_rule", "")),
+        "item_number_header": clean_text(value.get("item_number_header", "")),
+        "item_number_rule": clean_text(value.get("item_number_rule", "")),
+        "quantity_header": clean_text(value.get("quantity_header", "")),
+        "quantity_rule": clean_text(value.get("quantity_rule", "")),
+        "hierarchy": {
+            "major_code_pattern": clean_text(hierarchy_source.get("major_code_pattern", "")),
+            "subsection_code_pattern": clean_text(hierarchy_source.get("subsection_code_pattern", "")),
+            "heading_detection_rule": clean_text(hierarchy_source.get("heading_detection_rule", "")),
+            "continuation_rule": clean_text(hierarchy_source.get("continuation_rule", "")),
+            "examples": examples,
+        },
+        "table_rules": _profile_text_list(value.get("table_rules", [])),
+        "exclude_as_codes": _profile_text_list(value.get("exclude_as_codes", [])),
+        "uncertainties": _profile_text_list(value.get("uncertainties", [])),
+        "confidence": clamp_confidence(value.get("confidence"), fallback=0.0),
+        "analysis_model": clean_text(model),
+        "analyzed_pages": [int(page) for page in analyzed_pages],
+    }
+    meaningful = any(
+        profile.get(key)
+        for key in (
+            "document_family", "languages", "part_identifier_header",
+            "item_number_header", "table_rules",
+        )
+    ) or bool(examples)
+    return profile if meaningful else {}
+
+
+def analyze_document_profile_with_ai(
+    api_key: str,
+    model: str,
+    extracted_pages: Sequence[tuple[int, str]],
+    additional_instructions: str = "",
+) -> tuple[dict[str, Any], list[str]]:
+    """Create one evidence-based document profile before row extraction."""
+    sample = _representative_profile_pages(extracted_pages)
+    if not sample:
+        raise ValueError("No OCR text was available for adaptive document analysis.")
+    page_text = "\n\n".join(
+        f"===== PDF PAGE {page} =====\n{markdown}"
+        for page, markdown in sample
+    )
+    instruction_text = clean_text(additional_instructions)
+    user_prompt = (
+        "Analyze the following representative pages and return only the required "
+        "document-profile JSON.\n\n"
+    )
+    if instruction_text:
+        user_prompt += (
+            "User-supplied manual notes (treat as guidance and verify against the OCR):\n"
+            f"{instruction_text}\n\n"
+        )
+    user_prompt += page_text
+    result = _mistral_json_request(
+        api_key=api_key,
+        model=clean_text(model) or "mistral-large-2512",
+        messages=[
+            {"role": "system", "content": DOCUMENT_PROFILE_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        timeout_seconds=300,
+        max_retries=3,
+    )
+    profile = _normalize_document_profile(
+        result,
+        clean_text(model) or "mistral-large-2512",
+        [page for page, _ in sample],
+    )
+    if not profile:
+        raise ValueError("Large-model analysis returned an empty document profile.")
+    confidence = float(profile.get("confidence", 0.0))
+    return profile, [
+        "Adaptive document analysis completed with "
+        f"{profile['analysis_model']} across {len(sample)} representative page(s) "
+        f"(profile confidence {confidence:.0%})."
+    ]
+
+
+def _adaptive_profile_prompt(profile: dict[str, Any] | None) -> str:
+    if not isinstance(profile, dict) or not profile:
+        return ""
+    prompt_profile = {
+        key: profile.get(key)
+        for key in (
+            "document_family", "languages", "english_selection_rule",
+            "part_identifier_header", "part_identifier_rule",
+            "item_number_header", "item_number_rule", "quantity_header",
+            "quantity_rule", "hierarchy", "table_rules", "exclude_as_codes",
+            "uncertainties", "confidence",
+        )
+    }
+    return (
+        "ADAPTIVE DOCUMENT PROFILE (generated once from representative pages):\n"
+        + json.dumps(prompt_profile, ensure_ascii=False, indent=2)
+        + "\nUse this profile as document-wide guidance, but never override contradictory "
+        "evidence on the current page or invent a value that is not printed."
+    )
+
+
 def _build_extraction_prompt(
     batch: Sequence[tuple[int, str]],
     additional_instructions: str,
     catalog_hint: str = "",
     profile_hint: str = "",
+    adaptive_profile_hint: str = "",
 ) -> str:
     page_text = "\n\n".join(
         f"===== PAGE {page_number} =====\n{markdown}"
@@ -1009,6 +1219,8 @@ def _build_extraction_prompt(
     )
     if profile_hint:
         prompt += profile_hint + "\n\n"
+    if adaptive_profile_hint:
+        prompt += adaptive_profile_hint + "\n\n"
     if catalog_hint:
         prompt += (
             "Authoritative section catalogue detected from this same PDF. Use these "
@@ -1136,6 +1348,7 @@ def extract_spare_parts_with_ai(
     pages_per_batch: int = 3,
     max_chars_per_batch: int = 12000,
     additional_instructions: str = "",
+    document_profile: dict[str, Any] | None = None,
     progress: ProgressCallback | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """
@@ -1154,6 +1367,7 @@ def extract_spare_parts_with_ai(
     messages: list[str] = []
     extraction_profile = _document_extraction_profile(extracted_pages)
     profile_hint = _profile_prompt(extraction_profile)
+    adaptive_profile_hint = _adaptive_profile_prompt(document_profile)
     catalog_hint = _catalog_prompt_hint(
         build_section_catalog(extracted_pages).get("sections", [])
     )
@@ -1182,6 +1396,7 @@ def extract_spare_parts_with_ai(
                             additional_instructions,
                             catalog_hint,
                             profile_hint,
+                            adaptive_profile_hint,
                         ),
                     },
                 ],
@@ -1238,6 +1453,7 @@ def extract_spare_parts_with_ai(
                                 recovery_instructions,
                                 catalog_hint,
                                 profile_hint,
+                                adaptive_profile_hint,
                             ),
                         },
                     ],
@@ -1802,32 +2018,159 @@ def _english_variant(value: Any) -> str:
     return clean_text(segments[0]).upper()
 
 
+_CATALOG_HEADING_CODE_RE = re.compile(
+    r"^\s*(\d{1,2}(?:\.\d{1,2})?)\.?\s*$",
+    flags=re.IGNORECASE,
+)
 _SIMPLE_SECTION_HEADING_RE = re.compile(
-    r"^\s*(\d{1,2})\.\s+(.+?[A-Za-zÀ-ÿ].*)$",
+    r"^\s*(\d{1,2}(?:\.\d{1,2})?)\.?\s+(.+?[A-Za-zÀ-ÿ].*)$",
     flags=re.IGNORECASE,
 )
 
 
-def _classic_catalog_section_from_row(row: Sequence[Any]) -> dict[str, str]:
-    """Extract one simple numbered German/English/French section-heading row."""
+def _catalog_heading_title(value: Any) -> str:
+    """Return only the leading heading from a vertically merged title cell.
+
+    These catalogues frequently merge a section title with the first spare-part
+    description.  A wrapped title is joined only when the grammar clearly
+    continues (``Burner casing and`` + ``individual parts``); later notes such as
+    ``When ordering...`` or child descriptions such as ``Blower wheel`` are not.
+    """
+    lines = [
+        re.sub(_SIMPLE_SECTION_HEADING_RE, r"\2", line).strip(" -:;|")
+        for line in _catalog_cell_lines(value)
+    ]
+    lines = [line for line in lines if line and re.search(r"[A-Za-zÀ-ÿ]", line)]
+    if not lines:
+        return ""
+
+    title_parts = [lines[0]]
+    for line in lines[1:]:
+        current = title_parts[-1]
+        repeated = normalize_key(line).startswith(normalize_key(title_parts[0]))
+        continues = bool(
+            re.search(r"(?:\b(?:and|or|for|of|with|without|to)|[-/])$", current, re.I)
+            or re.match(r"^(?:and|or|for|of|with|without|to)\b", line, re.I)
+        )
+        if repeated or not continues:
+            break
+        title_parts.append(line)
+    return clean_text(" ".join(title_parts)).strip(" -:;|")
+
+
+def _catalog_row_without_heading(
+    row: Sequence[Any], mappings: Sequence[str | None], section: dict[str, str]
+) -> list[Any]:
+    """Remove a merged heading prefix while retaining the first spare row."""
+    values = list(row)
+    code_key = normalize_key(section.get("section_code", ""))
+    for index, canonical in enumerate(mappings):
+        if index >= len(values):
+            continue
+        if canonical in {"item_no", "source_part_no"}:
+            lines = _catalog_cell_lines(values[index])
+            if lines:
+                match = _CATALOG_HEADING_CODE_RE.fullmatch(lines[0])
+                if match and normalize_key(match.group(1)) == code_key:
+                    values[index] = "\n".join(lines[1:])
+        elif canonical == "description_raw":
+            lines = _catalog_cell_lines(values[index])
+            title = _catalog_heading_title(values[index])
+            if not lines or not title:
+                continue
+            consumed = 0
+            rebuilt = ""
+            for consumed_count in range(1, min(3, len(lines)) + 1):
+                rebuilt = clean_text(" ".join(lines[:consumed_count]))
+                if normalize_key(rebuilt) == normalize_key(title):
+                    consumed = consumed_count
+                    break
+            if consumed:
+                values[index] = "\n".join(lines[consumed:])
+    return values
+
+
+def _catalog_heading_code(value: Any) -> tuple[str, bool]:
+    """Return a printed hierarchy code and whether the cell is clearly a heading."""
+    lines = _catalog_cell_lines(value)
+    if not lines:
+        return "", False
+    embedded = _SIMPLE_SECTION_HEADING_RE.match(lines[0])
+    if embedded:
+        return embedded.group(1), True
+
+    codes: list[str] = []
+    for line in lines:
+        match = _CATALOG_HEADING_CODE_RE.fullmatch(line)
+        if match:
+            codes.append(match.group(1))
+    if not codes:
+        return "", False
+    # ``1.`` is an unambiguous major heading. A decimal such as ``3.30`` is a
+    # heading when its merged cell also contains child positions (3.31, 3.32...).
+    major_heading = bool(re.fullmatch(r"\s*\d{1,2}\.\s*", lines[0]))
+    return codes[0], bool(major_heading or len(codes) > 1)
+
+
+def _classic_catalog_section_from_row(
+    row: Sequence[Any], mappings: Sequence[str | None] | None = None
+) -> dict[str, str]:
+    """Extract one major/subsection heading from a multilingual catalogue row."""
+    values = list(row)
     code = ""
+    strong_heading = False
+    english = ""
+
+    if mappings:
+        item_indexes = [
+            index
+            for index, canonical in enumerate(mappings)
+            if canonical in {"item_no", "source_part_no"}
+        ]
+        for index in item_indexes:
+            if index >= len(values):
+                continue
+            candidate_code, candidate_is_heading = _catalog_heading_code(values[index])
+            if candidate_code:
+                code = candidate_code
+                strong_heading = candidate_is_heading
+                break
+
+        ident_indexes = [
+            index for index, canonical in enumerate(mappings) if canonical == "ident_no"
+        ]
+        has_order_number_text = any(
+            index < len(values) and bool(clean_text(values[index]))
+            for index in ident_indexes
+        )
+        # A decimal drawing position with an Order-No. is a spare row, not a
+        # subsection. Merged heading/child rows remain valid when their item cell
+        # proves that a heading precedes one or more child positions.
+        if not code or (has_order_number_text and not strong_heading):
+            return {}
+
+        english_index = _classic_english_description_index(values, mappings)
+        if english_index is not None and english_index < len(values):
+            english = _catalog_heading_title(values[english_index])
+
     raw_candidates: list[str] = []
-    for cell in row:
+    for cell in values:
         segments = _language_segments(cell)
         for segment in segments:
             match = _SIMPLE_SECTION_HEADING_RE.match(segment)
             if match:
-                code = match.group(1)
+                if not code:
+                    code = match.group(1)
                 title = clean_text(match.group(2))
                 if title:
                     raw_candidates.append(title)
-            elif re.fullmatch(r"\s*\d{1,2}\.\s*", segment):
+            elif not mappings and re.fullmatch(r"\s*\d{1,2}\.\s*", segment):
                 code = re.sub(r"\D", "", segment)
             elif code and re.search(r"[A-Za-zÀ-ÿ]", segment):
                 raw_candidates.append(clean_text(segment))
 
     if not code:
-        joined = " ".join(clean_text(cell) for cell in row if clean_text(cell))
+        joined = " ".join(clean_text(cell) for cell in values if clean_text(cell))
         match = _SIMPLE_SECTION_HEADING_RE.match(joined)
         if match:
             code = match.group(1)
@@ -1849,24 +2192,24 @@ def _classic_catalog_section_from_row(row: Sequence[Any]) -> dict[str, str]:
         if cleaned not in candidates:
             candidates.append(cleaned)
 
-    if not code or not candidates:
-        return {}
+    if not english:
+        english_candidates = [
+            value
+            for value in candidates
+            if _looks_likely_english(value) and not _looks_likely_non_english(value)
+        ]
+        if english_candidates:
+            english = english_candidates[0]
+        elif len(candidates) >= 3:
+            english = candidates[1]
+        elif candidates:
+            english = _english_variant("\n".join(candidates)) or candidates[0]
 
-    english_candidates = [
-        value
-        for value in candidates
-        if _looks_likely_english(value) and not _looks_likely_non_english(value)
-    ]
-    if english_candidates:
-        english = max(english_candidates, key=len)
-    elif len(candidates) >= 3:
-        # This catalogue family prints German, English, French in that order.
-        english = candidates[1]
-    else:
-        english = _english_variant("\n".join(candidates)) or candidates[0]
+    if not code or not english:
+        return {}
     return {
         "section_code": code,
-        "section_name_raw": "\n".join(candidates),
+        "section_name_raw": "\n".join(candidates) or english,
         "section_name_english": clean_text(english).upper(),
     }
 
@@ -1875,19 +2218,27 @@ def _classic_catalog_sections(markdown: str) -> list[dict[str, str]]:
     """Return every numbered section heading, including two sections on one page."""
     if not _is_multilingual_order_catalog(markdown):
         return []
-    candidate_rows: list[list[str]] = []
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
     for block in _markdown_table_blocks(markdown):
         header_index = _find_data_header_index(block)
-        start = (header_index + 1) if header_index is not None else 0
-        candidate_rows.extend(block[start:])
-    if not candidate_rows:
-        candidate_rows = [
+        if header_index is None:
+            continue
+        headers = block[header_index]
+        mappings = [_canonical_source_header(header) for header in headers]
+        for row in block[header_index + 1 :]:
+            section = _classic_catalog_section_from_row(row, mappings)
+            code = section.get("section_code", "")
+            if code and code not in seen:
+                seen.add(code)
+                result.append(section)
+    if result:
+        return result
+
+    candidate_rows = [
             [_clean_markdown_cell(line.lstrip("# "))]
             for line in str(markdown or "").splitlines()[:100]
         ]
-
-    result: list[dict[str, str]] = []
-    seen: set[str] = set()
     for row in candidate_rows:
         section = _classic_catalog_section_from_row(row)
         code = section.get("section_code", "")
@@ -2201,10 +2552,22 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
             active_metadata = dict(metadata)
             for values in block[header_index + 1 :]:
                 if classic_catalog:
-                    row_section = _classic_catalog_section_from_row(values)
+                    row_section = _classic_catalog_section_from_row(values, mappings)
                     if row_section:
                         active_metadata.update(row_section)
-                        continue
+                        ident_indexes = [
+                            index
+                            for index, canonical in enumerate(mappings)
+                            if canonical == "ident_no"
+                        ]
+                        if not any(
+                            index < len(values) and bool(clean_text(values[index]))
+                            for index in ident_indexes
+                        ):
+                            continue
+                        values = _catalog_row_without_heading(
+                            values, mappings, row_section
+                        )
                 padded = list(values) + [""] * max(0, len(headers) - len(values))
                 record: dict[str, Any] = {
                     "source_page": int(page_number),
@@ -2357,12 +2720,16 @@ def build_section_catalog(
     by_alias: dict[str, dict[str, Any]] = {}
 
     def catalog_code_tokens(value: Any) -> list[str]:
-        tokens = _section_code_tokens(value, permissive=True)
         text = clean_text(value).upper().strip().rstrip(".")
-        if allow_simple_section_codes and re.fullmatch(r"\d{1,2}", text):
-            if text not in tokens:
-                tokens.append(text)
-        return tokens
+        if allow_simple_section_codes:
+            # This profile prints numeric hierarchy codes. Model names such as
+            # SQM10 and ASZ12 are applicability data, never sub-machinery codes.
+            return (
+                [text]
+                if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text)
+                else []
+            )
+        return _section_code_tokens(value, permissive=True)
 
     def register(section: dict[str, Any], priority: int = 50) -> dict[str, Any]:
         aliases = [
@@ -2656,10 +3023,17 @@ def build_section_catalog(
         section.pop("_model_priority", None)
         if section.get("code") or section.get("name"):
             final_sections.append(section)
+    def section_sort_code(value: Any) -> tuple[Any, ...]:
+        code = clean_text(value).strip().rstrip(".")
+        if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", code):
+            return (0, *(int(part) for part in code.split(".")))
+        return (1, normalize_key(code))
+
     final_sections.sort(
         key=lambda item: (
             item.get("first_page") is None,
             item.get("first_page") or 10**9,
+            section_sort_code(item.get("code", "")),
             item.get("name", ""),
         )
     )
@@ -2801,12 +3175,14 @@ def prepare_benefit_rows(
                 by_alias[normalize_key(alias)] = section
 
     def benefit_code_tokens(value: Any) -> list[str]:
-        tokens = _section_code_tokens(value, permissive=True)
         text = clean_text(value).upper().strip().rstrip(".")
-        if allow_simple_section_codes and re.fullmatch(r"\d{1,2}", text):
-            if text not in tokens:
-                tokens.append(text)
-        return tokens
+        if allow_simple_section_codes:
+            return (
+                [text]
+                if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text)
+                else []
+            )
+        return _section_code_tokens(value, permissive=True)
 
     def exact_sections_for_code(value: Any) -> list[dict[str, Any]]:
         matches: list[dict[str, Any]] = []
