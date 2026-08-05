@@ -1,43 +1,91 @@
-Spare Parts OCR Import Builder — Build 4.7
+# Spare Parts OCR Import Builder — adaptive analysis update 4.9.0
 
-Main purpose
-============
-Build 4.7 addresses multilingual OCR output such as:
-- KURBELGEHÄUSE CRANK CASE CARTER
-- WELLENDICHTRING RADIAL PACKING RING BAGUE D'ÉTANCHÉITÉ
-- MANOMETER 1ST STAGE
+Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
+Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
+same locations.
 
-English handling
-================
-1. A mandatory English-only normalization pass now runs after row matching and before review/export.
-2. When German / English / French are printed together, the app isolates only the printed English wording.
-3. When OCR has flattened the three language lines into one string, the cleanup pass identifies the English span rather than exporting all languages together.
-4. When no English wording is present, the full technical term is translated into English.
-5. Correct printed English descriptions are not retranslated or paraphrased.
-6. Unique sub-machinery titles are normalized once per section code and propagated consistently to all linked spare rows.
-7. Source description and source section-title text are preserved internally for the English cleanup pass.
-8. The extraction prompt now explicitly forbids multilingual concatenation and includes examples from the reported manual.
-9. German/French detection was expanded and the previous permissive “any ASCII text is probably English” fallback was removed.
-10. Unresolved language cases remain low-confidence review items instead of silently passing as English.
+## What changed
 
-Section matching retained from Build 4.6
-========================================
-- Section/sub-machinery assignment remains anchored to the drawing/table code printed in each page header.
-- Codes in spare rows, descriptions, and cross-references cannot change the active section.
-- Previous section context is carried only to a confirmed consecutive continuation page.
-- Printed page-header context has priority over stale AI context.
+- Removed the fixed-height workflow scroll surface. Each step now uses the normal
+  browser page scroll.
+- Restored Streamlit Cloud's page-level scroll surface so review tables can extend
+  below the initial browser viewport.
+- Added a sticky, status-aware workflow navigator with completion marks, issue
+  counts, progress, and contextual Back/Continue actions.
+- Moved OCR tuning, API-key fallback, template replacement, and reset controls into
+  one collapsed **Processing & export settings** panel.
+- Added explicit confirmation before removing a document or resetting its OCR and
+  review state.
+- Fixed export helpers being scoped to the Review step, which could cause
+  `name 'export_filename' is not defined` when opening Export directly.
+- Replaced form-based review saving with per-cell autosave for sub-machinery and
+  spare-part editors.
+- Automatically recalculates readiness, invalidates stale exports, and persists the
+  active document after review edits.
+- Reduced the default spare-parts review grid to the fields needed for correction;
+  technical matching fields remain in the audit workbook.
+- Moved the build number into About and replaced the main caption with a user-facing
+  product description.
+- Added automatic detection for historical German/English/French catalogues headed
+  `Bestell-Nr. / Order-No. / No de commande`.
+- Maps every Order-No. to both PART NO and CODE, maps Bild/Pict./Photo to ITEM NO,
+  and expands vertically merged variant rows into one spare row per Order-No.
+- Selects the English Designation column deterministically and prevents the adjacent
+  German/French columns from replacing it.
+- Treats `ca. kg / appr. kg / env. kg` as weight, never as QNT.
+- Detects simple numbered catalogue sections inside table rows, carries them through
+  continuation pages, and handles two sections beginning on the same page.
+- Retries dense catalogue pages automatically when the AI returns valid but empty
+  JSON, then supplements extraction from the OCR table itself.
+- Applies strict global Order-No. de-duplication for this catalogue profile.
+- Recognizes both major numeric sections (`1`, `3`, `4`) and printed decimal
+  subsections (`3.30`, `6.40`) while preserving trailing zeroes.
+- Uses the structural Item/Photo and Order-No. columns to distinguish hierarchy
+  headings from ordinary positions, instead of accepting model names such as
+  `SQM10` or `ASZ12` as sub-machinery codes.
+- Removes merged child descriptions and ordering notes from sub-machinery names;
+  for example, `BURNER MOTOR` and `BLOWER` remain clean headings.
+- Preserves the first spare row when OCR merges it into the same table row as a
+  section heading.
+- Orders sub-machineries by their printed numeric hierarchy when several begin on
+  the same page, rather than alphabetically by name.
+- Adds an enabled-by-default adaptive document-analysis pass using
+  `mistral-large-2512` and the existing `MISTRAL_API_KEY`.
+- Samples at most 24 evenly distributed OCR pages, then records the document's
+  languages, English-selection rule, part/item column meanings, hierarchy patterns,
+  continuation behavior, exclusions, uncertainties, and profile confidence.
+- Saves the resulting profile with each document and supplies it to every
+  small-model extraction batch as evidence-based guidance.
+- Uses Large 3 only for language terms that remain uncertain after deterministic
+  English selection; routine row extraction remains on `mistral-small-latest`.
+- Displays the saved profile in the Processing step and falls back to the previous
+  extraction path if Large 3 is unavailable, without losing vessel or machinery data.
 
-Validation performed
-====================
-- Python syntax compilation passed for app.py and tools.py.
-- Module import test passed.
-- Synthetic English normalization tests passed for:
-  * KURBELGEHÄUSE CRANK CASE CARTER -> CRANK CASE
-  * multilingual GLEITLAGER / SLIDE BEARING / PALIER -> SLIDE BEARING
-  * one canonical English title propagated to all rows with the same section code
-  * already confirmed printed English not being unnecessarily replaced
-- Synthetic section regression test passed for a stale previous AI section code being overruled by a new printed page-header code.
+## Suggested acceptance check
 
-Deployment note
-===============
-Replace both app.py and tools.py together. Restart/redeploy Streamlit and rerun OCR/structuring for the affected PDF. Existing review tables and Excel exports were created with the previous language-normalization logic and will not update automatically.
+1. Upload a small PDF and complete the Machinery step.
+2. Confirm the Continue button activates and opens Processing.
+3. Run OCR and confirm the stepper shows completion/issue states.
+4. Edit one sub-machinery cell, leave the cell, and confirm the autosave message.
+5. Edit and manually verify a spare row, then change pages and return; confirm the
+   edit remains.
+6. Confirm Export remains blocked while included rows need correction and becomes
+   available when all included rows are ready.
+7. Confirm document removal and OCR reset require their confirmation checkbox.
+8. For the GSL Tegea catalogue, confirm item `3.82` creates three rows with codes
+   `151 518 1508/2`, `151 707 1503/2`, and `151 907 1505/2`, all under sub-machinery
+   `SERVO DRIVE FOR OIL BURNERS (3)`.
+9. Confirm the catalogue includes `BURNER CASING AND INDIVIDUAL PARTS (1)`,
+   `SERVO-DRIVE FOR GAS AND DUAL FUEL BURNERS (3.30)`, and
+   `MAGNET COUPLING (6.40)`; confirm sections 4 and 5 are named only
+   `BURNER MOTOR` and `BLOWER`.
+10. In Processing settings, confirm adaptive document analysis is On and the model
+    is `mistral-large-2512`. Run OCR, then open **Adaptive document analysis** and
+    verify the displayed languages, column roles, hierarchy examples, and confidence.
+11. Temporarily enter an unavailable analysis model and confirm OCR continues through
+    the safe fallback path with an informational recovery message.
+
+Syntax compilation, isolated autosave callback tests, multilingual Order-No.
+catalogue parser/section tests, bounded profile-sampling tests, profile normalization,
+and extraction-prompt integration tests passed in the Codex runtime. A live Mistral
+API call was not performed because no API credential was available in this workspace.
