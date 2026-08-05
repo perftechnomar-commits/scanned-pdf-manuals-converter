@@ -58,7 +58,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.8.0"
+APP_VERSION = "4.8.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1353,6 +1353,16 @@ with st.sidebar:
 ### Automatic sub-machinery detection
 
 The app uses the drawing/table code printed in each PDF page header as the internal key and assigns every spare by that exact key. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
+
+For older German/English/French catalogues, the app also recognizes simple numbered
+section headings printed inside the table (for example **3. Servo drive for oil
+burners**) and carries that section through consecutive continuation pages. If two
+numbered sections begin on the same PDF page, rows are assigned at table-row level.
+
+When the headings include **Bestell-Nr. / Order-No. / No de commande**, the app
+automatically uses Order-No. for both PART NO and CODE, uses Bild/Pict./Photo for
+ITEM NO, selects only the English Designation column, and ignores the kg weight
+column as a quantity.
 
 - The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
 - A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
