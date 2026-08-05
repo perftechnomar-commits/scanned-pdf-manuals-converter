@@ -2375,7 +2375,7 @@ if active_workflow_step == "3. Sub-machineries":
                 ),
             )
 
-            quick_actions = st.columns([1.15, 1.45, 1.1])
+            quick_actions = st.columns([1.15, 1.45, 1.3, 1.1])
             with quick_actions[0]:
                 if st.button("Add manual row", use_container_width=True):
                     st.session_state.submachinery_review = add_manual_submachinery_candidate(
@@ -2402,6 +2402,28 @@ if active_workflow_step == "3. Sub-machineries":
                     save_loaded_job_state()
                     st.rerun()
             with quick_actions[2]:
+                if st.button(
+                    "Verify all sub-machineries",
+                    use_container_width=True,
+                    disabled=st.session_state.submachinery_review.empty,
+                    help="Accept every detected proposal, include it, and refresh its linked spare-part assignments.",
+                ):
+                    previous = st.session_state.submachinery_review.copy()
+                    verified_submachineries = previous.copy()
+                    verified_submachineries["INCLUDE"] = True
+                    verified_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
+                    st.session_state.submachinery_review = verified_submachineries
+                    changed, reset = _apply_submachinery_changes_to_spares(
+                        previous, verified_submachineries
+                    )
+                    st.session_state.submachinery_editor_version += 1
+                    save_loaded_job_state()
+                    st.session_state.submachinery_flash = (
+                        f"Verified all {len(verified_submachineries)} sub-machinery proposal(s). "
+                        f"{changed} linked spare-part row(s) were assigned; {reset} row(s) were reset before rematching."
+                    )
+                    st.rerun()
+            with quick_actions[3]:
                 with st.popover("More actions", use_container_width=True):
                     st.caption(
                         "Use these actions only when needed. Saving the table already applies assignments automatically."
@@ -3205,6 +3227,39 @@ if active_workflow_step == "4. Review spare parts":
             metric_cols[4].metric("Awaiting verification", int((low_confidence_mask & ~verified_mask).sum()))
             metric_cols[5].metric("Low confidence", counts["Low confidence"])
 
+            verification_actions = st.columns([1.35, 3.65])
+            with verification_actions[0]:
+                if st.button(
+                    "Verify all included rows",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not bool(included_mask.any()),
+                    help="Mark every included spare-part row as manually verified. This clears low-confidence verification blocks across the whole document.",
+                ):
+                    verified = _verified_ids(st.session_state.verified_review_rows)
+                    verified.update(
+                        _review_row_id(row)
+                        for _, row in full_status.loc[included_mask].iterrows()
+                    )
+                    st.session_state.verified_review_rows = sorted(verified)
+                    st.session_state.spare_review = recalculate_review_with_verification(
+                        full_status,
+                        valid_machinery_names=valid_machinery_names,
+                        verified_rows=st.session_state.verified_review_rows,
+                        confidence_threshold=threshold,
+                    )
+                    st.session_state.editor_version += 1
+                    save_loaded_job_state()
+                    st.session_state.review_flash = (
+                        f"Verified all {int(included_mask.sum())} included spare-part row(s)."
+                    )
+                    st.rerun()
+            with verification_actions[1]:
+                st.caption(
+                    "This applies to every included row in this document, including rows outside the current page or filter. "
+                    "Use it only after you have reviewed the extraction result."
+                )
+
             toolbar = st.columns([1.45, 1.35, 1.0, 0.9, 0.9])
             with toolbar[0]:
                 review_filter = st.selectbox(
@@ -3326,12 +3381,10 @@ if active_workflow_step == "4. Review spare parts":
                         st.session_state.editor_version += 1
                         st.rerun()
                 with page_controls[2]:
-                    requested_page = st.number_input(
+                    requested_page = st.selectbox(
                         "Page",
-                        min_value=1,
-                        max_value=total_pages,
-                        value=current_page,
-                        step=1,
+                        options=list(range(1, total_pages + 1)),
+                        index=current_page - 1,
                         key=f"review_page_picker_{review_filter}_{review_sort}_{total_pages}",
                     )
                     if int(requested_page) != current_page:
