@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.7"
+TOOLS_VERSION = "4.8.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -694,6 +694,82 @@ def classify_ocr_pages(
 # ---------------------------------------------------------------------------
 
 
+MULTILINGUAL_ORDER_CATALOG_PROFILE = "multilingual_order_catalog"
+
+
+def _is_multilingual_order_catalog(markdown: Any) -> bool:
+    """Recognize older multilingual catalogues whose real identifier is Order-No.
+
+    These catalogues commonly place a drawing position at the far left, followed
+    by burner/equipment applicability, size, Order-No., weight, and three parallel
+    German/English/French designation columns.  The layout is materially different
+    from the Ident-No. tables used by newer manuals, so it needs its own mapping.
+    """
+    text = clean_text(markdown).lower()
+    order_signal = any(
+        token in text
+        for token in (
+            "order-no",
+            "order no",
+            "orderno",
+            "bestell-nr",
+            "bestell nr",
+            "no de commande",
+        )
+    )
+    multilingual_signal = (
+        "designation" in text
+        and any(token in text for token in ("bezeichnung", "benennung"))
+    )
+    layout_signal = any(
+        token in text
+        for token in (
+            "burner serie",
+            "burner series",
+            "brenner-typenreihe",
+            "type bruleur",
+            "type brûleur",
+            "pict.",
+            "photo",
+            "appr. kg",
+        )
+    )
+    return bool(order_signal and multilingual_signal and layout_signal)
+
+
+def _document_extraction_profile(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> str:
+    sample = "\n".join(str(markdown or "") for _, markdown in extracted_pages[:12])
+    if _is_multilingual_order_catalog(sample):
+        return MULTILINGUAL_ORDER_CATALOG_PROFILE
+    return ""
+
+
+def _profile_prompt(profile: str) -> str:
+    if profile != MULTILINGUAL_ORDER_CATALOG_PROFILE:
+        return ""
+    return """
+AUTOMATIC LAYOUT PROFILE - MULTILINGUAL ORDER-NO. CATALOGUE:
+- The column headed Bestell-Nr. / Order-No. / No de commande is the genuine
+  spare-part identifier. Copy it to ident_no. It will populate both PART NO and CODE.
+- Bild / Pict. / Photo is the drawing position and must populate item_no. It is
+  never the spare-part code.
+- Use only the middle English Designation column. Ignore the German Bezeichnung
+  and the final French Designation column.
+- Burner serie / Type bruleur and Size/Grandeur describe applicability. They are
+  not part numbers, quantities, or sub-machinery codes.
+- ca. kg / appr. kg / env. kg is WEIGHT. Never map it to quantity. Return quantity=null.
+- A single printed item position can contain several burner-series/size variants
+  and several Order-No. values. Return one row for EVERY Order-No.; repeat the same
+  item_no and English description on each variant row.
+- Section headings are simple numbered English headings such as "3. Servo drive
+  for oil burners". Use the integer as section_code and the exact English heading
+  as section_name_english. Carry it through consecutive continuation pages until
+  the next numbered section heading.
+""".strip()
+
+
 EXTRACTION_SYSTEM_PROMPT = """
 You are a precise technical-document extraction engine for marine and industrial
 spare-parts manuals. Convert OCR markdown into structured rows for the Benefit
@@ -742,6 +818,9 @@ Benefit mapping rules:
 6. ident_no is the identifier under headers such as Ident-Nr., Ident-No., Code,
    Material Code, Spare Part Code, or equivalent. This value will populate BOTH
    Benefit CODE and Benefit PART NO.
+6a. Under a multilingual Bestell-Nr. / Order-No. / No de commande header,
+    Order-No. is ident_no. Never confuse it with the Bild/Pict./Photo position,
+    burner-series applicability, size, unit marker, or weight.
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
@@ -771,6 +850,8 @@ Benefit mapping rules:
     page numbers, headers, or prose into spare-part rows.
 14. confidence is 0 to 1 and reflects OCR quality, row alignment, English-language
     selection, and section matching.
+15. A weight column headed ca. kg, appr. kg, env. kg, weight, or equivalent is not
+    quantity. Return quantity=null when the source has no genuine quantity column.
 
 Critical example:
 Source columns:
@@ -915,6 +996,7 @@ def _build_extraction_prompt(
     batch: Sequence[tuple[int, str]],
     additional_instructions: str,
     catalog_hint: str = "",
+    profile_hint: str = "",
 ) -> str:
     page_text = "\n\n".join(
         f"===== PAGE {page_number} =====\n{markdown}"
@@ -925,6 +1007,8 @@ def _build_extraction_prompt(
         "Return only the required JSON object. If the pages contain no spare-parts "
         "rows, return {\"spare_parts\": []}.\n\n"
     )
+    if profile_hint:
+        prompt += profile_hint + "\n\n"
     if catalog_hint:
         prompt += (
             "Authoritative section catalogue detected from this same PDF. Use these "
@@ -1068,9 +1152,17 @@ def extract_spare_parts_with_ai(
     )
     rows: list[dict[str, Any]] = []
     messages: list[str] = []
+    extraction_profile = _document_extraction_profile(extracted_pages)
+    profile_hint = _profile_prompt(extraction_profile)
     catalog_hint = _catalog_prompt_hint(
         build_section_catalog(extracted_pages).get("sections", [])
     )
+    if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE:
+        messages.append(
+            "Automatically detected a multilingual Order-No. catalogue. "
+            "Order-No. is being mapped to PART NO/CODE, Pict./Photo to ITEM NO, "
+            "and weight is being excluded from QNT."
+        )
 
     def process_batch(
         batch: list[tuple[int, str]],
@@ -1085,14 +1177,84 @@ def extract_spare_parts_with_ai(
                     {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
                     {
                         "role": "user",
-                        "content": _build_extraction_prompt(batch, additional_instructions, catalog_hint),
+                        "content": _build_extraction_prompt(
+                            batch,
+                            additional_instructions,
+                            catalog_hint,
+                            profile_hint,
+                        ),
                     },
                 ],
             )
             batch_rows = result.get("spare_parts", [])
             if not isinstance(batch_rows, list):
                 raise ValueError("JSON did not contain a spare_parts list")
-            rows.extend(_normalize_batch_source_pages(batch_rows, batch))
+            normalized_batch_rows = _normalize_batch_source_pages(batch_rows, batch)
+
+            # Some models return a valid but empty JSON object for dense historical
+            # catalogues.  That is not an API failure, so the old recovery path never
+            # ran. Retry once with an explicit coverage instruction before allowing
+            # the deterministic Markdown parser to supplement the page later.
+            expected_direct_rows = (
+                _direct_table_rows(batch)
+                if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
+                else []
+            )
+            catalog_table_present = bool(
+                extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
+                and any(
+                    _is_multilingual_order_catalog(markdown)
+                    for _, markdown in batch
+                )
+            )
+            if catalog_table_present and not normalized_batch_rows:
+                expected_wording = (
+                    f"approximately {len(expected_direct_rows)}"
+                    if expected_direct_rows
+                    else "multiple"
+                )
+                recovery_instructions = "\n\n".join(
+                    value
+                    for value in (
+                        clean_text(additional_instructions),
+                        (
+                            "COVERAGE RECOVERY: The prior pass returned no rows even "
+                            f"though the table contains {expected_wording} "
+                            "Order-No. records. Read every table row and every Order-No. "
+                            "variant. Do not summarize the page."
+                        ),
+                    )
+                    if value
+                )
+                retry = _mistral_json_request(
+                    api_key=api_key,
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                        {
+                            "role": "user",
+                            "content": _build_extraction_prompt(
+                                batch,
+                                recovery_instructions,
+                                catalog_hint,
+                                profile_hint,
+                            ),
+                        },
+                    ],
+                )
+                retry_rows = retry.get("spare_parts", [])
+                if isinstance(retry_rows, list):
+                    normalized_batch_rows = _normalize_batch_source_pages(
+                        retry_rows, batch
+                    )
+                if normalized_batch_rows:
+                    messages.append(
+                        f"Recovered {len(normalized_batch_rows)} row(s) from "
+                        f"catalogue page(s) {batch[0][0]}-{batch[-1][0]} after "
+                        "automatic empty-page retry."
+                    )
+
+            rows.extend(normalized_batch_rows)
             return
         except Exception as exc:
             if len(batch) > 1:
@@ -1467,6 +1629,11 @@ def _canonical_source_header(header: str) -> str | None:
     key = re.sub(r"[^a-z0-9]+", "", clean_text(header).lower())
     if not key:
         return None
+    if any(
+        token in key
+        for token in ("orderno", "orderingno", "bestellnr", "nodecommande")
+    ):
+        return "ident_no"
     if "ident" in key or key in {"code", "partcode", "sparepartcode", "materialcode", "articlecode"}:
         return "ident_no"
     if any(token in key for token in ("description", "designation", "benennung", "partname", "denomination")):
@@ -1474,6 +1641,8 @@ def _canonical_source_header(header: str) -> str | None:
     if any(token in key for token in ("quantity", "qty", "qnt", "menge", "numberoff", "nooff")):
         return "quantity"
     if any(token in key for token in ("itemno", "itemnumber", "positionno", "position", "posno", "refno", "referenceno", "indexno")):
+        return "item_no"
+    if any(token in key for token in ("bildpictphoto", "pictphoto", "picturephoto")):
         return "item_no"
     if any(token in key for token in ("partno", "partnumber", "teilnr", "catalogno", "orderingno", "stockno", "pno")):
         return "source_part_no"
@@ -1486,7 +1655,14 @@ def _find_data_header_index(rows: Sequence[Sequence[str]]) -> int | None:
     for row_index, row in enumerate(rows[:5]):
         joined = " ".join(clean_text(value).lower() for value in row)
         has_description = any(token in joined for token in ("description", "designation", "benennung", "part name"))
-        has_identifier = any(token in joined for token in ("ident", "code", "part-no", "part no", "item", "position"))
+        has_identifier = any(
+            token in joined
+            for token in (
+                "ident", "code", "part-no", "part no", "item", "position",
+                "order-no", "order no", "bestell-nr", "bestell nr",
+                "no de commande", "pict.", "photo",
+            )
+        )
         if has_description and has_identifier:
             return row_index
     return None
@@ -1562,6 +1738,10 @@ def _looks_likely_non_english(value: Any) -> bool:
         "flèche", "fleche", "rondelle", "clavette", "manchon", "vilebrequin",
         "étanch", "etanch", "graisseur", "ressort", "tôle", "tole",
         "désignation", "designation française", "quantité", "quantite",
+        "brûleur", "bruleur", "moteur", " pour ", "réglage", "reglage",
+        "brenner", "gebläse", "geblase", "stellantrieb", "luftregelung",
+        "pumpen", "druckwächter", "druckwachter", "flammkopf", "düsen",
+        "dusen", "zündtrafo", "zundtrafo", "ölvorwärmer", "olvorwarmer",
     )
     return any(marker in text for marker in markers)
 
@@ -1586,6 +1766,9 @@ def _looks_likely_english(value: Any) -> bool:
         "plug", "stud", "panel", "rubber", "metal", "foot", "inside",
         "outside", "adjustable", "protecting", "line", "air", "compressed",
         "elbow", "reduction", "reducing", "threaded", "filter", "cartridge",
+        "burner", "casing", "individual", "regulation", "servo", "drive",
+        "blower", "pump", "combustion", "ignition", "transformer", "preheater",
+        "monitor", "terminal", "electrical", "equipment", "train",
     )
     padded = f" {text} "
     return any(marker in padded for marker in markers)
@@ -1617,6 +1800,107 @@ def _english_variant(value: Any) -> str:
         if _looks_likely_non_english(first) and _looks_likely_english(second):
             return clean_text(second).upper()
     return clean_text(segments[0]).upper()
+
+
+_SIMPLE_SECTION_HEADING_RE = re.compile(
+    r"^\s*(\d{1,2})\.\s+(.+?[A-Za-zÀ-ÿ].*)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _classic_catalog_section_from_row(row: Sequence[Any]) -> dict[str, str]:
+    """Extract one simple numbered German/English/French section-heading row."""
+    code = ""
+    raw_candidates: list[str] = []
+    for cell in row:
+        segments = _language_segments(cell)
+        for segment in segments:
+            match = _SIMPLE_SECTION_HEADING_RE.match(segment)
+            if match:
+                code = match.group(1)
+                title = clean_text(match.group(2))
+                if title:
+                    raw_candidates.append(title)
+            elif re.fullmatch(r"\s*\d{1,2}\.\s*", segment):
+                code = re.sub(r"\D", "", segment)
+            elif code and re.search(r"[A-Za-zÀ-ÿ]", segment):
+                raw_candidates.append(clean_text(segment))
+
+    if not code:
+        joined = " ".join(clean_text(cell) for cell in row if clean_text(cell))
+        match = _SIMPLE_SECTION_HEADING_RE.match(joined)
+        if match:
+            code = match.group(1)
+            raw_candidates.append(clean_text(match.group(2)))
+
+    candidates: list[str] = []
+    for value in raw_candidates:
+        cleaned = clean_text(value).strip(" -:;|")
+        lowered = cleaned.lower()
+        if not cleaned or any(
+            token in lowered
+            for token in (
+                "order-no", "bestell", "no de commande", "designation",
+                "bezeichnung", "burner serie", "type bruleur", "type brûleur",
+                "appr. kg", "env. kg",
+            )
+        ):
+            continue
+        if cleaned not in candidates:
+            candidates.append(cleaned)
+
+    if not code or not candidates:
+        return {}
+
+    english_candidates = [
+        value
+        for value in candidates
+        if _looks_likely_english(value) and not _looks_likely_non_english(value)
+    ]
+    if english_candidates:
+        english = max(english_candidates, key=len)
+    elif len(candidates) >= 3:
+        # This catalogue family prints German, English, French in that order.
+        english = candidates[1]
+    else:
+        english = _english_variant("\n".join(candidates)) or candidates[0]
+    return {
+        "section_code": code,
+        "section_name_raw": "\n".join(candidates),
+        "section_name_english": clean_text(english).upper(),
+    }
+
+
+def _classic_catalog_sections(markdown: str) -> list[dict[str, str]]:
+    """Return every numbered section heading, including two sections on one page."""
+    if not _is_multilingual_order_catalog(markdown):
+        return []
+    candidate_rows: list[list[str]] = []
+    for block in _markdown_table_blocks(markdown):
+        header_index = _find_data_header_index(block)
+        start = (header_index + 1) if header_index is not None else 0
+        candidate_rows.extend(block[start:])
+    if not candidate_rows:
+        candidate_rows = [
+            [_clean_markdown_cell(line.lstrip("# "))]
+            for line in str(markdown or "").splitlines()[:100]
+        ]
+
+    result: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for row in candidate_rows:
+        section = _classic_catalog_section_from_row(row)
+        code = section.get("section_code", "")
+        if code and code not in seen:
+            seen.add(code)
+            result.append(section)
+    return result
+
+
+def _classic_catalog_section_metadata(markdown: str) -> dict[str, str]:
+    """Return the first numbered section heading for page-level continuation."""
+    sections = _classic_catalog_sections(markdown)
+    return sections[0] if sections else {}
 
 
 def _best_effort_english_description(value: Any) -> tuple[str, bool]:
@@ -1701,7 +1985,13 @@ def _page_header_text(markdown: str, max_lines: int = 28) -> str:
             lowered = clean_text(cleaned).lower()
             if (
                 any(token in lowered for token in ("description", "designation", "benennung"))
-                and any(token in lowered for token in ("ident", "part-no", "part no", "item"))
+                and any(
+                    token in lowered
+                    for token in (
+                        "ident", "part-no", "part no", "item", "order-no",
+                        "order no", "bestell", "no de commande", "pict", "photo",
+                    )
+                )
             ):
                 break
             candidates.append(cleaned)
@@ -1721,6 +2011,7 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
         "header_text": "",
         "section_code_source": "",
     }
+    classic_catalog = _is_multilingual_order_catalog(markdown)
     blocks = _markdown_table_blocks(markdown)
     for block in blocks:
         header_index = _find_data_header_index(block)
@@ -1771,7 +2062,7 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
 
     header_text = _page_header_text(markdown)
     metadata["header_text"] = header_text
-    if not metadata["section_code"]:
+    if not metadata["section_code"] and not classic_catalog:
         # Never search the spare-parts table body for a section code. Identifiers and
         # cross-references in the body caused the previous section to remain active.
         tokens = _section_code_tokens(header_text, permissive=True)
@@ -1811,6 +2102,22 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
             metadata["section_name_raw"] = title_lines[0]
 
     metadata["section_name_english"] = _english_variant(metadata["section_name_raw"])
+    if classic_catalog:
+        classic_section = _classic_catalog_section_metadata(markdown)
+        # In this layout, only a simple numbered heading is authoritative. Clear
+        # false codes such as PG11/ASZ12 or an Order-No. read from the table body.
+        metadata["section_code"] = classic_section.get("section_code", "")
+        metadata["section_code_source"] = (
+            "numbered catalogue section heading" if classic_section else ""
+        )
+        if classic_section:
+            metadata["section_name_raw"] = classic_section["section_name_raw"]
+            metadata["section_name_english"] = classic_section[
+                "section_name_english"
+            ]
+        else:
+            metadata["section_name_raw"] = ""
+            metadata["section_name_english"] = ""
     if not metadata["model"]:
         model_match = re.search(
             r"\b(?:COMPRESSOR|KOMPRESSOR|ENGINE|GENERATOR|PUMP)\s+([A-Z0-9][A-Z0-9 ._/-]{1,30})",
@@ -1821,9 +2128,55 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
             metadata["model"] = clean_text(model_match.group(1)).upper()
     return metadata
 
+def _catalog_cell_lines(value: Any) -> list[str]:
+    raw = _clean_markdown_cell(value)
+    return [clean_text(line) for line in raw.splitlines() if clean_text(line)]
+
+
+def _catalog_order_number_lines(value: Any) -> list[str]:
+    """Return individual Order-No. values from a vertically merged catalogue cell."""
+    result: list[str] = []
+    for line in _catalog_cell_lines(value):
+        candidate = re.sub(r"\s+[A-Z]$", "", line.strip(), flags=re.IGNORECASE)
+        candidate = re.sub(r"\s+", " ", candidate).strip(" ;,|")
+        digit_count = len(re.findall(r"\d", candidate))
+        if digit_count < 5:
+            continue
+        # Reject weights and simple sizes while accepting values such as
+        # 499 089, 151 327 1512/2, and 110 500 0009/2.
+        if re.fullmatch(r"\d+[,.]\d+", candidate):
+            continue
+        if not (re.search(r"\s", candidate) or "/" in candidate or "-" in candidate):
+            continue
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def _classic_english_description_index(
+    headers: Sequence[str], mappings: Sequence[str | None]
+) -> int | None:
+    description_indexes = [
+        index for index, canonical in enumerate(mappings) if canonical == "description_raw"
+    ]
+    if not description_indexes:
+        return None
+    # German / English / French are printed from left to right. Bezeichnung is
+    # normally the first description column and the English Designation is second.
+    if len(description_indexes) >= 3:
+        return description_indexes[1]
+    if len(description_indexes) == 2:
+        # The German Bezeichnung often shares the applicability column and is
+        # therefore not classified as a description column. The two remaining
+        # Designation columns are English first, French second.
+        return description_indexes[0]
+    return description_indexes[0]
+
+
 def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for page_number, markdown in extracted_pages:
+        classic_catalog = _is_multilingual_order_catalog(markdown)
         metadata = _page_metadata(int(page_number), markdown)
         for block in _markdown_table_blocks(markdown):
             header_index = _find_data_header_index(block)
@@ -1831,19 +2184,35 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                 continue
             headers = block[header_index]
             mappings = [_canonical_source_header(header) for header in headers]
+            if classic_catalog:
+                english_index = _classic_english_description_index(headers, mappings)
+                mappings = [
+                    (
+                        canonical
+                        if canonical != "description_raw" or index == english_index
+                        else None
+                    )
+                    for index, canonical in enumerate(mappings)
+                ]
             # When Ident-No. exists, a separate Part-No. column containing drawing
             # callouts is ITEM NO by the user's Benefit mapping rule.
             if "ident_no" in mappings and "item_no" not in mappings and "source_part_no" in mappings:
                 mappings[mappings.index("source_part_no")] = "item_no"
+            active_metadata = dict(metadata)
             for values in block[header_index + 1 :]:
+                if classic_catalog:
+                    row_section = _classic_catalog_section_from_row(values)
+                    if row_section:
+                        active_metadata.update(row_section)
+                        continue
                 padded = list(values) + [""] * max(0, len(headers) - len(values))
                 record: dict[str, Any] = {
                     "source_page": int(page_number),
-                    "section_code": metadata.get("section_code", ""),
-                    "section_name_english": metadata.get("section_name_english", ""),
-                    "section_maker": metadata.get("maker", ""),
-                    "section_model": metadata.get("model", ""),
-                    "table_title": metadata.get("section_name_raw", ""),
+                    "section_code": active_metadata.get("section_code", ""),
+                    "section_name_english": active_metadata.get("section_name_english", ""),
+                    "section_maker": active_metadata.get("maker", ""),
+                    "section_model": active_metadata.get("model", ""),
+                    "table_title": active_metadata.get("section_name_raw", ""),
                     "confidence": 0.88,
                 }
                 for column_index, canonical in enumerate(mappings):
@@ -1851,9 +2220,29 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                         value = padded[column_index]
                         record[canonical] = (
                             _clean_markdown_cell(value)
-                            if canonical == "description_raw"
+                            if canonical in {"description_raw", "ident_no"}
                             else clean_text(value)
                         )
+
+                if classic_catalog:
+                    description_raw = _clean_markdown_cell(
+                        record.get("description_raw", "")
+                    )
+                    item_no = clean_text(record.get("item_no", ""))
+                    identifiers = _catalog_order_number_lines(
+                        record.get("ident_no", "")
+                    )
+                    if not description_raw or not identifiers:
+                        continue
+                    for identifier in identifiers:
+                        variant = dict(record)
+                        variant["ident_no"] = identifier
+                        variant["item_no"] = item_no
+                        variant["quantity"] = None
+                        variant["confidence"] = 0.92
+                        rows.append(variant)
+                    continue
+
                 description_raw = clean_text(record.get("description_raw", ""))
                 ident_no = clean_text(record.get("ident_no", ""))
                 item_no = clean_text(record.get("item_no", ""))
@@ -1914,9 +2303,20 @@ def _global_manual_maker_model(extracted_pages: Sequence[tuple[int, str]]) -> tu
 def _looks_like_spare_table_page(markdown: str) -> bool:
     text = clean_text(markdown).lower()
     has_description = any(token in text for token in ("description", "designation", "benennung", "part name"))
-    has_identifier = any(token in text for token in ("ident-nr", "ident-no", "ident no", "item no", "position", "part no", "part-no", "code"))
+    has_identifier = any(
+        token in text
+        for token in (
+            "ident-nr", "ident-no", "ident no", "item no", "position",
+            "part no", "part-no", "code", "order-no", "order no",
+            "bestell-nr", "bestell nr", "no de commande", "pict.",
+        )
+    )
     has_quantity = any(token in text for token in ("qty", "quantity", "menge", "qnt"))
-    return has_description and has_identifier and (has_quantity or "|" in str(markdown or ""))
+    return has_description and has_identifier and (
+        has_quantity
+        or "|" in str(markdown or "")
+        or _is_multilingual_order_catalog(markdown)
+    )
 
 
 def select_spare_table_pages(
@@ -1946,11 +2346,23 @@ def build_section_catalog(
     codes. Body identifiers and cross-references previously produced multiple matches,
     leaving the previous ``active`` section stuck while the spare rows moved on.
     """
+    extraction_profile = _document_extraction_profile(extracted_pages)
+    allow_simple_section_codes = (
+        extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
+    )
     index_sections, index_pages = _index_sections(extracted_pages)
     global_maker, global_model = _global_manual_maker_model(extracted_pages)
     main_row = main_row or {}
     sections: list[dict[str, Any]] = []
     by_alias: dict[str, dict[str, Any]] = {}
+
+    def catalog_code_tokens(value: Any) -> list[str]:
+        tokens = _section_code_tokens(value, permissive=True)
+        text = clean_text(value).upper().strip().rstrip(".")
+        if allow_simple_section_codes and re.fullmatch(r"\d{1,2}", text):
+            if text not in tokens:
+                tokens.append(text)
+        return tokens
 
     def register(section: dict[str, Any], priority: int = 50) -> dict[str, Any]:
         aliases = [
@@ -1960,7 +2372,7 @@ def build_section_catalog(
         ]
         code = clean_text(section.get("code", "")).upper() or _join_section_codes(aliases)
         if not aliases and code:
-            aliases = _section_code_tokens(code, permissive=True) or [code]
+            aliases = catalog_code_tokens(code) or [code]
         aliases = list(dict.fromkeys(aliases))
         name = clean_text(section.get("name", "")).upper()
         existing = next(
@@ -2012,13 +2424,33 @@ def build_section_catalog(
         register(section, priority=80)
 
     page_metadata: dict[int, dict[str, Any]] = {}
+    page_heading_sections: dict[int, list[dict[str, Any]]] = {}
     for page_number, markdown in extracted_pages:
         page = int(page_number)
         metadata = _page_metadata(page, markdown)
         page_metadata[page] = metadata
         if page in index_pages:
             continue
-        code_tokens = _section_code_tokens(metadata.get("section_code", ""), permissive=True)
+        if allow_simple_section_codes:
+            registered_headings: list[dict[str, Any]] = []
+            for heading in _classic_catalog_sections(markdown):
+                registered_headings.append(
+                    register(
+                        {
+                            "code": heading.get("section_code", ""),
+                            "aliases": [heading.get("section_code", "")],
+                            "name": heading.get("section_name_english", ""),
+                            "maker": metadata.get("maker", ""),
+                            "model": metadata.get("model", ""),
+                            "pages": {page},
+                        },
+                        priority=110,
+                    )
+                )
+            if registered_headings:
+                page_heading_sections[page] = registered_headings
+                continue
+        code_tokens = catalog_code_tokens(metadata.get("section_code", ""))
         if code_tokens:
             registered = register(
                 {
@@ -2036,7 +2468,7 @@ def build_section_catalog(
     # AI catalogue values can fill gaps but must never overwrite an exact printed
     # header title such as RESILIENT MOUNTING with a paraphrase such as ELASTIC MOUNTING.
     for row in extracted_rows or []:
-        code_tokens = _section_code_tokens(row.get("section_code", ""), permissive=True)
+        code_tokens = catalog_code_tokens(row.get("section_code", ""))
         if not code_tokens:
             continue
         source_page = quantity_to_number(row.get("source_page"))
@@ -2069,7 +2501,7 @@ def build_section_catalog(
         return unique_sections(
             [
                 by_alias.get(normalize_key(token))
-                for token in _section_code_tokens(value, permissive=True)
+                for token in catalog_code_tokens(value)
             ]
         )
 
@@ -2105,7 +2537,12 @@ def build_section_catalog(
         if page in index_pages:
             continue
         metadata = page_metadata[page]
-        explicit_matches = sections_for_codes(metadata.get("section_code", ""))
+        explicit_matches = page_heading_sections.get(page) or sections_for_codes(
+            metadata.get("section_code", "")
+        )
+        multiple_numbered_headings = bool(
+            allow_simple_section_codes and len(explicit_matches) > 1
+        )
         resolved: dict[str, Any] | None = None
         resolved_source = ""
 
@@ -2113,11 +2550,16 @@ def build_section_catalog(
             resolved = explicit_matches[0]
             resolved_source = "exact page-header code"
         elif len(explicit_matches) > 1:
-            # Multiple aliases are fine when they resolve to one section; reaching
-            # this branch means genuinely conflicting sections on the same header.
+            # Historical catalogues can legitimately start two numbered sections
+            # on the same PDF page. Row-level parsing assigns that page's records;
+            # retain the last heading only as context for the following page.
             ambiguous_pages.add(page)
-            active = None
-            active_anchor_page = None
+            if allow_simple_section_codes:
+                active = explicit_matches[-1]
+                active_anchor_page = page
+            else:
+                active = None
+                active_anchor_page = None
         else:
             header_text = metadata.get("header_text", "")
             header_matches = unique_sections(
@@ -2181,7 +2623,7 @@ def build_section_catalog(
             resolved_source = "confirmed consecutive continuation"
             active_anchor_page = page
             resolved["pages"].add(page)
-        elif page in parts_pages:
+        elif page in parts_pages and not multiple_numbered_headings:
             unmapped_parts_pages.add(page)
             active = None
             active_anchor_page = None
@@ -2239,8 +2681,12 @@ def _catalog_prompt_hint(sections: Sequence[dict[str, Any]]) -> str:
         name = clean_text(section.get("name", ""))
         maker = clean_text(section.get("maker", ""))
         model = clean_text(section.get("model", ""))
+        pages = ",".join(str(page) for page in section.get("pages", []) if page)
         if code or name:
-            lines.append(f"- CODE={code}; NAME={name}; MAKER={maker}; MODEL={model}")
+            lines.append(
+                f"- CODE={code}; NAME={name}; PAGES={pages}; "
+                f"MAKER={maker}; MODEL={model}"
+            )
     return "\n".join(lines)
 
 
@@ -2343,6 +2789,10 @@ def prepare_benefit_rows(
     parts_pages = catalog["parts_pages"]
     ambiguous_pages = catalog.get("ambiguous_pages", set())
     unmapped_parts_pages = catalog.get("unmapped_parts_pages", set())
+    allow_simple_section_codes = (
+        _document_extraction_profile(section_context_pages)
+        == MULTILINGUAL_ORDER_CATALOG_PROFILE
+    )
 
     by_alias: dict[str, dict[str, Any]] = {}
     for section in sections:
@@ -2350,10 +2800,18 @@ def prepare_benefit_rows(
             if normalize_key(alias):
                 by_alias[normalize_key(alias)] = section
 
+    def benefit_code_tokens(value: Any) -> list[str]:
+        tokens = _section_code_tokens(value, permissive=True)
+        text = clean_text(value).upper().strip().rstrip(".")
+        if allow_simple_section_codes and re.fullmatch(r"\d{1,2}", text):
+            if text not in tokens:
+                tokens.append(text)
+        return tokens
+
     def exact_sections_for_code(value: Any) -> list[dict[str, Any]]:
         matches: list[dict[str, Any]] = []
         seen_ids: set[int] = set()
-        for token in _section_code_tokens(value, permissive=True):
+        for token in benefit_code_tokens(value):
             section = by_alias.get(normalize_key(token))
             if section is not None and id(section) not in seen_ids:
                 matches.append(section)
@@ -2678,11 +3136,17 @@ def prepare_benefit_rows(
     deduplicated: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for row in output:
-        key = (
-            str(row.get("source_page", "")),
-            normalize_key(row.get("item_no", "")),
-            normalize_key(row.get("ident_no", row.get("code", ""))),
-        )
+        identifier_key = normalize_key(row.get("ident_no", row.get("code", "")))
+        if allow_simple_section_codes and identifier_key:
+            # Order-No. is the unique catalogue identifier. If the same code is
+            # printed again for another applicability line, keep one import row.
+            key = ("ORDERNO", "", identifier_key)
+        else:
+            key = (
+                str(row.get("source_page", "")),
+                normalize_key(row.get("item_no", "")),
+                identifier_key,
+            )
         if key in seen:
             continue
         seen.add(key)
