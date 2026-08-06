@@ -57,10 +57,28 @@ from tools import (
     validate_machinery_dataframe,
 )
 
+try:
+    from tools import verify_document_profile_with_openai
+except ImportError:
+    # Deployment-safe compatibility: if Streamlit refreshes app.py before the
+    # matching tools.py, the primary Mistral workflow must still start.
+    def verify_document_profile_with_openai(
+        api_key: str,
+        model: str,
+        extracted_pages: object,
+        existing_profile: dict | None = None,
+        additional_instructions: str = "",
+    ) -> tuple[dict, list[str]]:
+        profile = dict(existing_profile) if isinstance(existing_profile, dict) else {}
+        return profile, [
+            "Optional OpenAI verification helper is not present in the deployed "
+            "tools.py, so it was bypassed and Mistral processing continued normally."
+        ]
+
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.9.3"
+APP_VERSION = "4.10.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -203,6 +221,8 @@ PROCESSING_PRESETS = {
         "extraction_model": "mistral-small-latest",
         "adaptive_analysis": True,
         "analysis_model": "mistral-large-2512",
+        "openai_verification": True,
+        "openai_model": "gpt-5.6-terra",
         "ocr_pages_per_request": 25,
         "extraction_pages_per_batch": 3,
         "extraction_max_chars": 12000,
@@ -218,6 +238,8 @@ PROCESSING_PRESETS = {
         "extraction_model": "mistral-small-latest",
         "adaptive_analysis": True,
         "analysis_model": "mistral-large-2512",
+        "openai_verification": True,
+        "openai_model": "gpt-5.6-terra",
         "ocr_pages_per_request": 35,
         "extraction_pages_per_batch": 4,
         "extraction_max_chars": 16000,
@@ -233,6 +255,8 @@ PROCESSING_PRESETS = {
         "extraction_model": "mistral-small-latest",
         "adaptive_analysis": True,
         "analysis_model": "mistral-large-2512",
+        "openai_verification": True,
+        "openai_model": "gpt-5.6-terra",
         "ocr_pages_per_request": 12,
         "extraction_pages_per_batch": 1,
         "extraction_max_chars": 8000,
@@ -639,6 +663,8 @@ def initialize_state() -> None:
         "setting_extraction_model": PROCESSING_PRESETS["Balanced"]["extraction_model"],
         "setting_adaptive_analysis": PROCESSING_PRESETS["Balanced"]["adaptive_analysis"],
         "setting_analysis_model": PROCESSING_PRESETS["Balanced"]["analysis_model"],
+        "setting_openai_verification": PROCESSING_PRESETS["Balanced"]["openai_verification"],
+        "setting_openai_model": PROCESSING_PRESETS["Balanced"]["openai_model"],
         "setting_ocr_pages_per_request": PROCESSING_PRESETS["Balanced"]["ocr_pages_per_request"],
         "setting_extraction_pages_per_batch": PROCESSING_PRESETS["Balanced"]["extraction_pages_per_batch"],
         "setting_extraction_max_chars": PROCESSING_PRESETS["Balanced"]["extraction_max_chars"],
@@ -911,6 +937,8 @@ def apply_processing_preset() -> None:
     st.session_state.setting_extraction_model = preset["extraction_model"]
     st.session_state.setting_adaptive_analysis = preset["adaptive_analysis"]
     st.session_state.setting_analysis_model = preset["analysis_model"]
+    st.session_state.setting_openai_verification = preset["openai_verification"]
+    st.session_state.setting_openai_model = preset["openai_model"]
     st.session_state.setting_ocr_pages_per_request = preset["ocr_pages_per_request"]
     st.session_state.setting_extraction_pages_per_batch = preset["extraction_pages_per_batch"]
     st.session_state.setting_extraction_max_chars = preset["extraction_max_chars"]
@@ -943,6 +971,8 @@ PERSISTENT_INPUT_KEYS = [
     "setting_extraction_model",
     "setting_adaptive_analysis",
     "setting_analysis_model",
+    "setting_openai_verification",
+    "setting_openai_model",
     "setting_ocr_pages_per_request",
     "setting_extraction_pages_per_batch",
     "setting_extraction_max_chars",
@@ -1012,7 +1042,7 @@ def render_processing_mode_controls() -> None:
     st.caption(f"**Active mode:** {st.session_state.processing_preset}")
     st.caption(active_preset["description"])
 
-    with st.expander("Advanced Mistral settings", expanded=False):
+    with st.expander("Advanced AI settings", expanded=False):
         st.caption(
             "These are the active settings for the current run. Re-selecting a mode "
             "restores that mode's defaults."
@@ -1064,6 +1094,33 @@ def render_processing_mode_controls() -> None:
                 "also handles only the language terms that remain uncertain."
             ),
         )
+        openai_key_available = bool(get_secret("OPENAI_API_KEY"))
+        openai_verification = st.checkbox(
+            "Use OpenAI as an optional document-pattern verifier",
+            key="setting_openai_verification",
+            disabled=structure_mode != "AI JSON extraction (recommended)",
+            help=(
+                "Makes one independent document-level check after Mistral OCR. "
+                "If the key, model, quota, network, or response is unavailable, "
+                "the app bypasses this step and continues with Mistral normally."
+            ),
+        )
+        openai_model = st.text_input(
+            "OpenAI verification model",
+            key="setting_openai_model",
+            disabled=(
+                structure_mode != "AI JSON extraction (recommended)"
+                or not openai_verification
+            ),
+            help="Default: gpt-5.6-terra. The model must be available to the OpenAI project.",
+        )
+        if openai_key_available:
+            st.caption("OpenAI verification key detected in Streamlit Secrets.")
+        else:
+            st.caption(
+                "OPENAI_API_KEY is not configured. OpenAI verification will be "
+                "skipped automatically; Mistral remains fully operational."
+            )
         ocr_pages_per_request = st.number_input(
             "PDF pages per OCR request",
             min_value=1,
@@ -1121,6 +1178,8 @@ def render_processing_mode_controls() -> None:
 - Row-extraction model: `{extraction_model}`
 - Adaptive document analysis: `{'On' if adaptive_analysis else 'Off'}`
 - Document-analysis model: `{analysis_model if adaptive_analysis else 'Not used'}`
+- Optional OpenAI verification: `{'On' if openai_verification else 'Off'}`
+- OpenAI verification model: `{openai_model if openai_verification else 'Not used'}`
 - OCR pages/request: `{int(ocr_pages_per_request)}`
 - Structuring pages/batch: `{int(extraction_pages_per_batch)}`
 - Maximum characters/batch: `{int(extraction_max_chars)}`
@@ -1680,11 +1739,14 @@ with st.expander("⚙️ Processing & export settings", expanded=False):
 api_key = get_secret("MISTRAL_API_KEY") or str(
     st.session_state.get("manual_mistral_api_key", "")
 ).strip()
+openai_api_key = get_secret("OPENAI_API_KEY")
 structure_mode = str(st.session_state.setting_structure_mode)
 page_filter_mode = str(st.session_state.setting_page_filter_mode)
 extraction_model = str(st.session_state.setting_extraction_model)
 adaptive_analysis = bool(st.session_state.setting_adaptive_analysis)
 analysis_model = str(st.session_state.setting_analysis_model)
+openai_verification = bool(st.session_state.setting_openai_verification)
+openai_model = str(st.session_state.setting_openai_model)
 ocr_pages_per_request = int(st.session_state.setting_ocr_pages_per_request)
 extraction_pages_per_batch = int(st.session_state.setting_extraction_pages_per_batch)
 extraction_max_chars = int(st.session_state.setting_extraction_max_chars)
@@ -2822,6 +2884,28 @@ if active_workflow_step == "2. OCR":
                                 "continued with the existing extraction and deterministic "
                                 f"validation path. Details: {profile_error}"
                             )
+                    if (
+                        openai_verification
+                        and structure_mode == "AI JSON extraction (recommended)"
+                    ):
+                        progress_bar.progress(
+                            0.05,
+                            text="Optionally cross-checking the document pattern with OpenAI...",
+                        )
+                        # The helper is intentionally fail-open. Missing/restricted
+                        # credentials, exhausted quota, timeouts, unsupported models,
+                        # and malformed replies all return the existing Mistral
+                        # profile and a log message instead of stopping this run.
+                        document_profile, openai_messages = (
+                            verify_document_profile_with_openai(
+                                api_key=openai_api_key,
+                                model=openai_model.strip() or "gpt-5.6-terra",
+                                extracted_pages=extracted_pages,
+                                existing_profile=document_profile,
+                                additional_instructions=extra_prompt,
+                            )
+                        )
+                        extraction_messages.extend(openai_messages)
                     if structure_mode == "AI JSON extraction (recommended)":
                         extraction_kwargs = {
                             "api_key": api_key,
