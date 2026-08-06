@@ -1,4 +1,4 @@
-#Spare Parts OCR Import Builder — catalogue hierarchy update 4.9.1
+# Spare Parts OCR Import Builder — catalogue hierarchy update 4.9.1
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
