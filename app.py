@@ -60,7 +60,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.9.2"
+APP_VERSION = "4.9.3"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2480,7 +2480,9 @@ if active_workflow_step == "3. Sub-machineries":
             # vertical-scroll trap that could prevent the browser page from reaching
             # the save button and the lower controls.
             total_submachineries = len(candidate_frame)
-            page_size_options = [5, 10, 15]
+            # Keep this aligned with the spare-parts review so users have the
+            # same predictable paging choices throughout the workflow.
+            page_size_options = [10, 25, 50]
             if int(st.session_state.get("submachinery_page_size", 10)) not in page_size_options:
                 st.session_state.submachinery_page_size = 10
 
