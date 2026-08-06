@@ -78,7 +78,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.10.0"
+APP_VERSION = "4.11.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1208,6 +1208,24 @@ def _review_row_id(row: pd.Series | dict) -> str:
 
 def _normalise_source_code(value: object) -> str:
     return re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+
+def _natural_code_sort_series(series: pd.Series) -> pd.Series:
+    """Return a display-safe natural sort key without changing stored codes.
+
+    Codes remain text because leading zeroes, slashes and manufacturer formats
+    are meaningful.  Numeric runs are padded only in this temporary sort key,
+    so values such as 1, 2, 10 and 3.30 appear in the expected order.
+    """
+    def key(value: object) -> str:
+        text = str(value or "").strip().upper()
+        return re.sub(
+            r"\d+",
+            lambda match: f"{int(match.group(0)):012d}",
+            text,
+        )
+
+    return series.map(key)
 
 
 def _extract_printed_english_from_pdf(pdf_bytes: bytes) -> tuple[dict[str, dict[str, object]], dict[str, str]]:
@@ -3388,6 +3406,7 @@ if active_workflow_step == "4. Review spare parts":
                         "Source page",
                         "Section start page",
                         "Sub-machinery",
+                        "Section code",
                         "Part number",
                         "Description",
                     ],
@@ -3452,9 +3471,15 @@ if active_workflow_step == "4. Review spare parts":
                     ["MACHINERY", "SOURCE PAGE"],
                     key=lambda series: series.astype(str).str.upper(),
                 )
+            elif review_sort == "Section code":
+                visible = visible.sort_values(
+                    ["SECTION CODE", "ITEM NO", "SOURCE PAGE"],
+                    key=_natural_code_sort_series,
+                    na_position="last",
+                )
             elif review_sort == "Part number":
                 visible = visible.sort_values(
-                    "PART NO", key=lambda series: series.astype(str).str.upper()
+                    "PART NO", key=_natural_code_sort_series, na_position="last"
                 )
             elif review_sort == "Description":
                 visible = visible.sort_values(
