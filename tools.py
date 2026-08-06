@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.9.3"
+TOOLS_VERSION = "4.10.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -1048,6 +1048,166 @@ Rules:
 """.strip()
 
 
+DOCUMENT_PROFILE_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "document_family": {"type": "string"},
+        "languages": {"type": "array", "items": {"type": "string"}},
+        "english_selection_rule": {"type": "string"},
+        "part_identifier_header": {"type": "string"},
+        "part_identifier_rule": {"type": "string"},
+        "item_number_header": {"type": "string"},
+        "item_number_rule": {"type": "string"},
+        "quantity_header": {"type": "string"},
+        "quantity_rule": {"type": "string"},
+        "hierarchy": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "major_code_pattern": {"type": "string"},
+                "subsection_code_pattern": {"type": "string"},
+                "heading_detection_rule": {"type": "string"},
+                "continuation_rule": {"type": "string"},
+                "examples": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "code": {"type": "string"},
+                            "name_english": {"type": "string"},
+                            "page": {"type": "integer"},
+                        },
+                        "required": ["code", "name_english", "page"],
+                    },
+                },
+            },
+            "required": [
+                "major_code_pattern", "subsection_code_pattern",
+                "heading_detection_rule", "continuation_rule", "examples",
+            ],
+        },
+        "table_rules": {"type": "array", "items": {"type": "string"}},
+        "exclude_as_codes": {"type": "array", "items": {"type": "string"}},
+        "uncertainties": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": [
+        "document_family", "languages", "english_selection_rule",
+        "part_identifier_header", "part_identifier_rule", "item_number_header",
+        "item_number_rule", "quantity_header", "quantity_rule", "hierarchy",
+        "table_rules", "exclude_as_codes", "uncertainties", "confidence",
+    ],
+}
+
+
+def _openai_response_text(body: Any) -> str:
+    """Return the assistant text from a raw Responses API result."""
+    if not isinstance(body, dict):
+        return ""
+    direct = body.get("output_text")
+    if isinstance(direct, str) and direct.strip():
+        return direct
+    fragments: list[str] = []
+    for item in body.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "output_text" and content.get("text"):
+                fragments.append(str(content["text"]))
+    return "".join(fragments)
+
+
+def _openai_json_request(
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout_seconds: int = 180,
+) -> dict[str, Any]:
+    """Make one bounded OpenAI Responses API call with strict JSON output.
+
+    This function deliberately performs no automatic retry. An optional verifier
+    must not consume a restricted key repeatedly or delay the primary Mistral path.
+    """
+    key = str(api_key or "").strip().strip('"').strip("'")
+    if not key:
+        raise RuntimeError("OpenAI verification key is not configured.")
+    endpoint = os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses")
+    payload = {
+        "model": clean_text(model) or "gpt-5.6-terra",
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_prompt}],
+            },
+        ],
+        "text": {
+            "verbosity": "low",
+            "format": {
+                "type": "json_schema",
+                "name": "document_profile",
+                "description": "Evidence-based spare-parts manual layout profile.",
+                "strict": True,
+                "schema": DOCUMENT_PROFILE_JSON_SCHEMA,
+            },
+        },
+        "max_output_tokens": 6000,
+    }
+    try:
+        response = requests.post(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            json=payload,
+            timeout=max(30, int(timeout_seconds)),
+        )
+    except (requests.Timeout, requests.RequestException, OSError) as exc:
+        raise RuntimeError(
+            "OpenAI verification could not be reached: "
+            + _safe_api_error_text(exc, key)
+        ) from exc
+
+    if not 200 <= int(response.status_code) < 300:
+        try:
+            error_value: Any = response.json()
+        except (ValueError, TypeError):
+            error_value = getattr(response, "text", "")
+        detail = _safe_api_error_text(error_value, key)
+        status = int(response.status_code)
+        reason = {
+            401: "authentication was rejected",
+            403: "the project or key lacks permission for this model",
+            404: "the configured model or endpoint is unavailable",
+            429: "the project quota or rate limit was reached",
+        }.get(status, "the optional service returned an error")
+        raise RuntimeError(
+            f"OpenAI verification skipped because {reason} (HTTP {status}). "
+            f"{detail}".strip()
+        )
+
+    try:
+        body = response.json()
+        content = _openai_response_text(body)
+        if not content:
+            raise ValueError("The response contained no output text.")
+        return _parse_json_object(content)
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "OpenAI verification returned an unusable structured response."
+        ) from exc
+
+
 def _representative_profile_pages(
     extracted_pages: Sequence[tuple[int, str]],
     max_pages: int = 24,
@@ -1190,6 +1350,165 @@ def analyze_document_profile_with_ai(
         f"{profile['analysis_model']} across {len(sample)} representative page(s) "
         f"(profile confidence {confidence:.0%})."
     ]
+
+
+def _merge_document_profiles(
+    primary: dict[str, Any] | None,
+    verifier: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Combine Mistral's profile with an optional independent verifier."""
+    base = dict(primary) if isinstance(primary, dict) else {}
+    check = dict(verifier) if isinstance(verifier, dict) else {}
+    if not check:
+        return base
+    if not base:
+        return check
+
+    base_confidence = clamp_confidence(base.get("confidence"), fallback=0.0)
+    check_confidence = clamp_confidence(check.get("confidence"), fallback=0.0)
+    verifier_is_strong = check_confidence >= max(0.60, base_confidence - 0.05)
+
+    scalar_fields = (
+        "document_family", "english_selection_rule", "part_identifier_header",
+        "part_identifier_rule", "item_number_header", "item_number_rule",
+        "quantity_header", "quantity_rule",
+    )
+    for field in scalar_fields:
+        if clean_text(check.get(field, "")) and (
+            verifier_is_strong or not clean_text(base.get(field, ""))
+        ):
+            base[field] = check[field]
+
+    for field in ("languages", "table_rules", "exclude_as_codes", "uncertainties"):
+        combined: list[Any] = []
+        seen: set[str] = set()
+        for item in list(base.get(field, []) or []) + list(check.get(field, []) or []):
+            key = normalize_key(item)
+            if key and key not in seen:
+                combined.append(item)
+                seen.add(key)
+        base[field] = combined
+
+    base_hierarchy = dict(base.get("hierarchy", {}) or {})
+    check_hierarchy = dict(check.get("hierarchy", {}) or {})
+    for field in (
+        "major_code_pattern", "subsection_code_pattern",
+        "heading_detection_rule", "continuation_rule",
+    ):
+        if clean_text(check_hierarchy.get(field, "")) and (
+            verifier_is_strong or not clean_text(base_hierarchy.get(field, ""))
+        ):
+            base_hierarchy[field] = check_hierarchy[field]
+
+    examples: list[dict[str, Any]] = []
+    seen_examples: set[tuple[str, int | None]] = set()
+    for example in list(base_hierarchy.get("examples", []) or []) + list(
+        check_hierarchy.get("examples", []) or []
+    ):
+        if not isinstance(example, dict):
+            continue
+        page_value = quantity_to_number(example.get("page"))
+        key = (
+            normalize_key(example.get("code", "")),
+            int(page_value) if page_value is not None else None,
+        )
+        if key[0] and key not in seen_examples:
+            examples.append(example)
+            seen_examples.add(key)
+    base_hierarchy["examples"] = examples[:60]
+    base["hierarchy"] = base_hierarchy
+    base["confidence"] = max(base_confidence, check_confidence)
+    base["analysis_model"] = " + ".join(
+        dict.fromkeys(
+            clean_text(value)
+            for value in (base.get("analysis_model", ""), check.get("analysis_model", ""))
+            if clean_text(value)
+        )
+    )
+    base["analyzed_pages"] = sorted(
+        {
+            int(quantity_to_number(page))
+            for page in list(base.get("analyzed_pages", []) or [])
+            + list(check.get("analyzed_pages", []) or [])
+            if quantity_to_number(page) is not None
+        }
+    )
+    base["openai_verified"] = True
+    return base
+
+
+def verify_document_profile_with_openai(
+    api_key: str,
+    model: str,
+    extracted_pages: Sequence[tuple[int, str]],
+    existing_profile: dict[str, Any] | None = None,
+    additional_instructions: str = "",
+) -> tuple[dict[str, Any], list[str]]:
+    """Optionally cross-check a document profile without ever blocking Mistral.
+
+    Missing credentials, restricted models, exhausted quota, timeouts, malformed
+    responses, and every other OpenAI-side failure return the original profile.
+    """
+    original = dict(existing_profile) if isinstance(existing_profile, dict) else {}
+    if not str(api_key or "").strip():
+        return original, [
+            "Optional OpenAI verification was skipped because OPENAI_API_KEY is not configured."
+        ]
+    selected_model = clean_text(model) or "gpt-5.6-terra"
+    try:
+        sample = _representative_profile_pages(
+            extracted_pages,
+            max_pages=60,
+            max_chars_per_page=5500,
+        )
+        if not sample:
+            return original, [
+                "Optional OpenAI verification was skipped because no OCR text was available."
+            ]
+        page_text = "\n\n".join(
+            f"===== PDF PAGE {page} =====\n{markdown}"
+            for page, markdown in sample
+        )
+        instruction_text = clean_text(additional_instructions)
+        user_prompt = (
+            "Independently verify the document layout and hierarchy in these OCR pages. "
+            "A numeric value is a sub-machinery code only when the page visibly presents "
+            "it as a section heading; ordinary item positions must not become sections. "
+            "Return only the required JSON.\n\n"
+        )
+        if instruction_text:
+            user_prompt += (
+                "User notes (verify them against the OCR rather than assuming they are true):\n"
+                f"{instruction_text}\n\n"
+            )
+        user_prompt += page_text
+        result = _openai_json_request(
+            api_key=api_key,
+            model=selected_model,
+            system_prompt=DOCUMENT_PROFILE_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+        )
+        verified = _normalize_document_profile(
+            result,
+            selected_model,
+            [page for page, _ in sample],
+        )
+        if not verified:
+            raise ValueError("OpenAI returned an empty document profile.")
+        merged = _merge_document_profiles(original, verified)
+        confidence = float(verified.get("confidence", 0.0))
+        return merged, [
+            f"Optional OpenAI verification completed with {selected_model} across "
+            f"{len(sample)} OCR page(s) (verification confidence {confidence:.0%})."
+        ]
+    except Exception as exc:
+        # This is intentionally fail-open. Mistral OCR/extraction and the local
+        # deterministic parser remain fully usable when OpenAI is unavailable.
+        return original, [
+            "Optional OpenAI verification was unavailable and was bypassed; "
+            "Mistral processing continued normally. Details: "
+            + _safe_api_error_text(exc, str(api_key or ""))
+        ]
 
 
 def _adaptive_profile_prompt(profile: dict[str, Any] | None) -> str:
