@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.9.2"
+TOOLS_VERSION = "4.9.3"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -3034,10 +3034,26 @@ def build_section_catalog(
 
     # AI catalogue values can fill gaps but must never overwrite an exact printed
     # header title such as RESILIENT MOUNTING with a paraphrase such as ELASTIC MOUNTING.
+    #
+    # In a multilingual Order-No. catalogue, an item's drawing position (for
+    # example 7.15 or 15.3) looks exactly like a legitimate hierarchy code.  The
+    # AI therefore must not be allowed to create a section from an unconfirmed
+    # numeric value: that turns spare parts into false sub-machineries.  It may
+    # enrich only a section that the source itself has already confirmed.
     for row in extracted_rows or []:
         code_tokens = catalog_code_tokens(row.get("section_code", ""))
         if not code_tokens:
             continue
+        if allow_simple_section_codes:
+            confirmed: list[dict[str, Any]] = []
+            for token in code_tokens:
+                section = by_alias.get(normalize_key(token))
+                if section is not None and all(
+                    id(section) != id(existing) for existing in confirmed
+                ):
+                    confirmed.append(section)
+            if len(confirmed) != 1:
+                continue
         source_page = quantity_to_number(row.get("source_page"))
         register(
             {
