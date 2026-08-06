@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.10.0"
+TOOLS_VERSION = "4.11.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -2446,6 +2446,21 @@ _SIMPLE_SECTION_HEADING_RE = re.compile(
 )
 
 
+def _catalog_section_code(value: Any) -> str:
+    """Keep a printed catalogue heading code as text, including trailing zeroes.
+
+    In this particular multilingual catalogue layout, subsection *headings* use
+    decade values (``3.30``, ``6.40`` and ``18.50``). OCR occasionally drops the
+    final zero and returns ``3.3``.  This helper is used only after a value has
+    already passed the heading test; spare item positions are never reformatted.
+    """
+    code = clean_text(value).strip().rstrip(".")
+    match = re.fullmatch(r"(\d{1,2})\.(\d)", code)
+    if match:
+        return f"{match.group(1)}.{match.group(2)}0"
+    return code
+
+
 def _catalog_heading_title(value: Any) -> str:
     """Return only the leading heading from a vertically merged title cell.
 
@@ -2572,24 +2587,32 @@ def _catalog_heading_code(value: Any) -> tuple[str, bool]:
     # hierarchy. Decimal subsection headings in this catalogue use decade
     # boundaries (3.30, 6.40, 18.50) followed by distinct child positions.
     major_heading = bool(re.fullmatch(r"\s*\d{1,2}\.\s*", lines[0]))
-    first_parts = codes[0].split(".")
+    raw_code = codes[0]
+    first_parts = raw_code.split(".")
     distinct_codes = list(dict.fromkeys(codes))
     decimal_heading = False
     if len(first_parts) == 2 and first_parts[1].isdigit():
         major, position = int(first_parts[0]), int(first_parts[1])
+        # OCR can read a section heading such as 6.40 as 6.4. Treat the
+        # one-digit form as its decade heading only when subsequent printed
+        # drawing positions prove that it starts a subsection.
+        heading_position = position * 10 if len(first_parts[1]) == 1 else position
         decimal_heading = bool(
-            position >= 10
-            and position % 10 == 0
+            heading_position >= 10
+            and heading_position % 10 == 0
             and any(
                 len(parts := candidate.split(".")) == 2
                 and parts[0].isdigit()
                 and parts[1].isdigit()
                 and int(parts[0]) == major
-                and int(parts[1]) > position
+                and int(parts[1]) > heading_position
                 for candidate in distinct_codes[1:]
             )
         )
-    return codes[0], bool(major_heading or decimal_heading)
+    return (
+        _catalog_section_code(raw_code) if decimal_heading else raw_code,
+        bool(major_heading or decimal_heading),
+    )
 
 
 def _classic_catalog_section_from_row(
@@ -2628,6 +2651,11 @@ def _classic_catalog_section_from_row(
         # proves that a heading precedes one or more child positions.
         if not code or (has_order_number_text and not strong_heading):
             return {}
+        if strong_heading or (
+            not has_order_number_text
+            and re.fullmatch(r"\d{1,2}\.\d", clean_text(code).rstrip("."))
+        ):
+            code = _catalog_section_code(code)
 
         english_index = _classic_english_description_index(values, mappings)
         if english_index is not None and english_index < len(values):
@@ -3731,6 +3759,45 @@ def prepare_benefit_rows(
                 seen_ids.add(id(section))
         return matches
 
+    def section_for_item_position(value: Any) -> dict[str, Any] | None:
+        """Resolve a catalogue spare row to its printed hierarchy heading.
+
+        A page can contain more than one section.  Page-level carry-forward is
+        therefore insufficient: position 7.15 belongs to heading 7, while 3.31
+        belongs to heading 3.30.  Use only a unique, source-confirmed match and
+        leave every unfamiliar code pattern to the existing page logic.
+        """
+        if not allow_simple_section_codes:
+            return None
+        item = clean_text(value).strip().rstrip(".")
+        match = re.fullmatch(r"(\d{1,2})(?:\.(\d{1,3}))?", item)
+        if not match:
+            return None
+        major = int(match.group(1))
+        item_minor = int(match.group(2)) if match.group(2) else None
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        for section in sections:
+            code = _catalog_section_code(section.get("code", ""))
+            code_match = re.fullmatch(r"(\d{1,2})(?:\.(\d{1,2}))?", code)
+            if not code_match or int(code_match.group(1)) != major:
+                continue
+            section_minor = (
+                int(code_match.group(2)) if code_match.group(2) is not None else None
+            )
+            if section_minor is None:
+                candidates.append((0, section))
+                continue
+            if item_minor is None:
+                continue
+            # A decimal heading is a decade anchor: 6.40 owns 6.41–6.49.
+            if section_minor % 10 == 0 and item_minor // 10 == section_minor // 10:
+                candidates.append((1, section))
+        if not candidates:
+            return None
+        highest_specificity = max(rank for rank, _ in candidates)
+        winners = [section for rank, section in candidates if rank == highest_specificity]
+        return winners[0] if len(winners) == 1 else None
+
     def fuzzy_section_for_name(value: Any) -> dict[str, Any] | None:
         name_key = normalize_key(value)
         if not name_key:
@@ -3764,10 +3831,21 @@ def prepare_benefit_rows(
         """Resolve a section with printed page context ahead of AI context."""
         direct_row = direct_row or {}
         ai_row = ai_row or {}
+        item_section = section_for_item_position(direct_row.get("item_no", ""))
         direct_matches = exact_sections_for_code(direct_row.get("section_code", ""))
         page_section = page_map.get(page) if page is not None else None
         ai_matches = exact_sections_for_code(ai_row.get("section_code", ""))
         conflict = False
+
+        # For the known numbered catalogue profile, a uniquely resolved drawing
+        # position is stronger than a stale page-level section label. This keeps
+        # different sections on one page from borrowing one another's parts.
+        if item_section is not None:
+            if len(direct_matches) == 1 and id(direct_matches[0]) != id(item_section):
+                conflict = True
+            if page_section is not None and id(page_section) != id(item_section):
+                conflict = True
+            return item_section, "printed drawing-position hierarchy", conflict
 
         if len(direct_matches) == 1:
             chosen = direct_matches[0]
