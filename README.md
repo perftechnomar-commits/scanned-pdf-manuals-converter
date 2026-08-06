@@ -1,10 +1,54 @@
-# Spare Parts OCR Import Builder — catalogue hierarchy update 4.9.1
+# Spare Parts OCR Import Builder — hierarchy and natural sorting 4.11.0
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.11.0 source hierarchy and code-aware sorting
+
+- Assigns numbered-catalogue spare rows from their printed drawing-position
+  hierarchy when a page contains multiple sections: for example, `7.15` belongs
+  to heading `7`, while `3.31` belongs to heading `3.30`.
+- Retains a recovered final zero in confirmed decimal heading codes such as
+  `6.40`, rather than exporting it as `6.4`. Stored codes remain text because
+  their exact formatting is business data.
+- Adds **Section code** to the Review sort menu and uses natural code sorting for
+  both it and **Part number**. Thus `1, 2, 10, 11` appears in that order without
+  coercing codes into Excel numbers.
+
+### 4.10.0 optional OpenAI cross-check
+
+- Adds one optional OpenAI Responses API document-pattern verification pass after
+  Mistral OCR, using `OPENAI_API_KEY` from Streamlit Secrets and
+  `gpt-5.6-terra` as the configurable default model.
+- Merges evidence-based OpenAI hierarchy/language guidance into the existing
+  Mistral profile while keeping Mistral OCR, extraction, and local parsing as the
+  primary workflow.
+- Fails open for missing or expired keys, restricted models, exhausted quota,
+  rate limits, network errors, timeouts, and malformed replies. The app logs the
+  bypass and continues normally with Mistral.
+- Performs one bounded OpenAI request with no automatic retry, reducing accidental
+  usage on limited projects.
+- Redacts the OpenAI key from error messages and never offers a browser/UI key field;
+  the key must remain server-side in Streamlit Secrets.
+- Keeps deployment compatible if `app.py` is refreshed before `tools.py`: the
+  optional verifier is bypassed instead of causing an import failure.
+- Aligns Sub-machineries rows/page choices with Review: 10, 25, and 50.
+
+### 4.9.3 hierarchy gate
+
+- Prevents AI item positions such as `7.15` and `15.3` from creating false
+  sub-machineries unless the source PDF has independently confirmed the code as a
+  printed hierarchy heading.
+
+### 4.9.2 deployment compatibility
+
+- Adds a compatibility check before passing the sparse-page recovery option to the
+  extraction helper. This prevents processing from failing if a deployment briefly
+  contains a newer `app.py` with an older `tools.py`; the normal extraction path
+  continues and the app reports that the optional high-accuracy fallback was skipped.
 
 ### 4.9.1 catalogue extraction corrections
 
