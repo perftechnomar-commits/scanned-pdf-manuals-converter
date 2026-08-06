@@ -4,6 +4,7 @@ import copy
 import hashlib
 import hmac
 import io
+import inspect
 import re
 import secrets
 import smtplib
@@ -59,7 +60,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.9.1"
+APP_VERSION = "4.9.2"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2820,20 +2821,32 @@ if active_workflow_step == "2. OCR":
                                 f"validation path. Details: {profile_error}"
                             )
                     if structure_mode == "AI JSON extraction (recommended)":
-                        ai_rows, row_extraction_messages = extract_spare_parts_with_ai(
-                            api_key=api_key,
-                            model=extraction_model.strip() or "mistral-small-latest",
-                            extracted_pages=structure_pages,
-                            pages_per_batch=int(extraction_pages_per_batch),
-                            max_chars_per_batch=int(extraction_max_chars),
-                            additional_instructions=extra_prompt,
-                            document_profile=document_profile,
-                            coverage_model=(
+                        extraction_kwargs = {
+                            "api_key": api_key,
+                            "model": extraction_model.strip()
+                            or "mistral-small-latest",
+                            "extracted_pages": structure_pages,
+                            "pages_per_batch": int(extraction_pages_per_batch),
+                            "max_chars_per_batch": int(extraction_max_chars),
+                            "additional_instructions": extra_prompt,
+                            "document_profile": document_profile,
+                            "progress": show_progress,
+                        }
+                        if "coverage_model" in inspect.signature(
+                            extract_spare_parts_with_ai
+                        ).parameters:
+                            extraction_kwargs["coverage_model"] = (
                                 analysis_model.strip()
                                 if adaptive_analysis and analysis_model.strip()
                                 else ""
-                            ),
-                            progress=show_progress,
+                            )
+                        else:
+                            extraction_messages.append(
+                                "The deployed extraction helper is an earlier version, so "
+                                "high-accuracy sparse-page recovery was skipped for this run."
+                            )
+                        ai_rows, row_extraction_messages = extract_spare_parts_with_ai(
+                            **extraction_kwargs,
                         )
                         extraction_messages.extend(row_extraction_messages)
                         extraction_messages = list(dict.fromkeys(extraction_messages))
