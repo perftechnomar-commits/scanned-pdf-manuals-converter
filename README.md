@@ -1,10 +1,32 @@
-# Spare Parts OCR Import Builder — adaptive analysis update 4.9.0
+Spare Parts OCR Import Builder — catalogue hierarchy update 4.9.1
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.9.1 catalogue extraction corrections
+
+- Detects standalone major headings such as `1. BURNER CASTING AND INDIVIDUAL
+  PARTS` and `3. SERVO DRIVE FOR OIL BURNERS`, even when OCR places the heading
+  above rather than inside the Markdown table.
+- Stops promoting repeated item positions, Order-No. values, or spare descriptions
+  to sub-machineries. Decimal sub-machinery codes must now satisfy stronger
+  hierarchy evidence.
+- Treats German assembly headings such as `Brennermotor`, `Luftregelung`, and
+  `Stellantrieb` as title text, never as the maker. The main-machinery maker is used
+  when the source does not print a section-specific manufacturer.
+- Keeps sub-machinery names clean: no appended `(code)`, ordering note, repeated
+  title, or first-spare description.
+- Splits flattened Order-No. cells into one unique spare-part row per printed code.
+- Measures multilingual catalogue coverage against deterministic table evidence.
+  Suspiciously sparse pages are retried once and, when adaptive analysis is enabled,
+  selectively escalated to the configured high-accuracy model. A failed recovery
+  never discards rows already extracted by the normal model.
+- Adds regression coverage for all of the above GSL Tegea failure modes.
+
+### Earlier 4.9.0 workflow and adaptive-analysis improvements
 
 - Removed the fixed-height workflow scroll surface. Each step now uses the normal
   browser page scroll.
@@ -74,10 +96,10 @@ same locations.
 7. Confirm document removal and OCR reset require their confirmation checkbox.
 8. For the GSL Tegea catalogue, confirm item `3.82` creates three rows with codes
    `151 518 1508/2`, `151 707 1503/2`, and `151 907 1505/2`, all under sub-machinery
-   `SERVO DRIVE FOR OIL BURNERS (3)`.
-9. Confirm the catalogue includes `BURNER CASING AND INDIVIDUAL PARTS (1)`,
-   `SERVO-DRIVE FOR GAS AND DUAL FUEL BURNERS (3.30)`, and
-   `MAGNET COUPLING (6.40)`; confirm sections 4 and 5 are named only
+   `SERVO DRIVE FOR OIL BURNERS` with CODE `3` stored in its separate column.
+9. Confirm the catalogue includes `BURNER CASING AND INDIVIDUAL PARTS`,
+   `SERVO-DRIVE FOR GAS AND DUAL FUEL BURNERS`, and `MAGNET COUPLING`, with
+   codes `1`, `3.30`, and `6.40` stored only in CODE; confirm sections 4 and 5 are named only
    `BURNER MOTOR` and `BLOWER`.
 10. In Processing settings, confirm adaptive document analysis is On and the model
     is `mistral-large-2512`. Run OCR, then open **Adaptive document analysis** and
