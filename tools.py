@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.9.0"
+TOOLS_VERSION = "4.9.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -763,10 +763,15 @@ AUTOMATIC LAYOUT PROFILE - MULTILINGUAL ORDER-NO. CATALOGUE:
 - A single printed item position can contain several burner-series/size variants
   and several Order-No. values. Return one row for EVERY Order-No.; repeat the same
   item_no and English description on each variant row.
+- German assembly words such as Brennermotor, Luftregelung, Stellantrieb, and
+  Brennergehause are hierarchy/title text, not a manufacturer. Leave section_maker
+  empty unless the page explicitly labels a maker/manufacturer or shows a clear brand.
 - Section headings are simple numbered English headings such as "3. Servo drive
   for oil burners". Use the integer as section_code and the exact English heading
-  as section_name_english. Carry it through consecutive continuation pages until
-  the next numbered section heading.
+  as section_name_english, without appending the code in parentheses. Carry it
+  through consecutive continuation pages until the next numbered section heading.
+- A repeated item position, Order-No., or individual spare description is never a
+  hierarchy heading. Do not promote table-body rows to sub-machineries.
 """.strip()
 
 
@@ -807,7 +812,9 @@ Benefit mapping rules:
    wording. Translate only when no English wording is printed.
 4. section_maker and section_model come from the relevant PDF page/section. A
    section-specific maker/model overrides the manual-level maker/model. Do not
-   invent either value.
+   invent either value. Only use an explicit maker/manufacturer label or a clear
+   brand/logo. German assembly/title words such as Brennermotor, Luftregelung,
+   Stellantrieb, Brennergehause, and Geblase are not makers.
 5. The first table column is often a drawing position even when its multilingual
    header contains "Part-No.". When it contains sequential callouts such as 1,
    2, 3, 1-12, P101, etc., return it as item_no.
@@ -821,6 +828,8 @@ Benefit mapping rules:
 6a. Under a multilingual Bestell-Nr. / Order-No. / No de commande header,
     Order-No. is ident_no. Never confuse it with the Bild/Pict./Photo position,
     burner-series applicability, size, unit marker, or weight.
+6b. OCR may flatten several Order-No. values into one cell. Return one distinct
+    spare_parts record for every printed Order-No.; never combine them into one code.
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
@@ -846,6 +855,9 @@ Benefit mapping rules:
     section_maker, section_model, and section_start_page only when the current page
     has no new drawing/table code in its own header. A code printed in a spare-part
     row, description, cross-reference, or table body is never a section_code.
+12a. section_name_english contains only the clean English assembly title. Do not
+     append section_code in parentheses and do not append ordering notes or the
+     description of the first spare part below the heading.
 13. Do not convert contents/index entries, drawing callouts without a parts table,
     page numbers, headers, or prose into spare-part rows.
 14. confidence is 0 to 1 and reflects OCR quality, row alignment, English-language
@@ -1349,6 +1361,7 @@ def extract_spare_parts_with_ai(
     max_chars_per_batch: int = 12000,
     additional_instructions: str = "",
     document_profile: dict[str, Any] | None = None,
+    coverage_model: str = "",
     progress: ProgressCallback | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """
@@ -1422,9 +1435,20 @@ def extract_spare_parts_with_ai(
                     for _, markdown in batch
                 )
             )
-            if catalog_table_present and not normalized_batch_rows:
+            expected_count = len(expected_direct_rows)
+            coverage_is_sparse = bool(
+                catalog_table_present
+                and (
+                    len(normalized_batch_rows) < 2
+                    or (
+                        expected_count >= 3
+                        and len(normalized_batch_rows) < max(2, int(expected_count * 0.85))
+                    )
+                )
+            )
+            if coverage_is_sparse:
                 expected_wording = (
-                    f"approximately {len(expected_direct_rows)}"
+                    f"approximately {expected_count}"
                     if expected_direct_rows
                     else "multiple"
                 )
@@ -1441,33 +1465,108 @@ def extract_spare_parts_with_ai(
                     )
                     if value
                 )
-                retry = _mistral_json_request(
-                    api_key=api_key,
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": _build_extraction_prompt(
-                                batch,
-                                recovery_instructions,
-                                catalog_hint,
-                                profile_hint,
-                                adaptive_profile_hint,
-                            ),
-                        },
-                    ],
-                )
-                retry_rows = retry.get("spare_parts", [])
-                if isinstance(retry_rows, list):
-                    normalized_batch_rows = _normalize_batch_source_pages(
-                        retry_rows, batch
+                try:
+                    retry = _mistral_json_request(
+                        api_key=api_key,
+                        model=model,
+                        messages=[
+                            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": _build_extraction_prompt(
+                                    batch,
+                                    recovery_instructions,
+                                    catalog_hint,
+                                    profile_hint,
+                                    adaptive_profile_hint,
+                                ),
+                            },
+                        ],
                     )
-                if normalized_batch_rows:
+                    retry_rows = retry.get("spare_parts", [])
+                    if isinstance(retry_rows, list):
+                        normalized_retry_rows = _normalize_batch_source_pages(
+                            retry_rows, batch
+                        )
+                        if len(normalized_retry_rows) > len(normalized_batch_rows):
+                            normalized_batch_rows = normalized_retry_rows
+                            messages.append(
+                                f"Recovered {len(normalized_batch_rows)} row(s) from "
+                                f"catalogue page(s) {batch[0][0]}-{batch[-1][0]} after "
+                                "automatic coverage retry."
+                            )
+                except Exception as recovery_error:
                     messages.append(
-                        f"Recovered {len(normalized_batch_rows)} row(s) from "
-                        f"catalogue page(s) {batch[0][0]}-{batch[-1][0]} after "
-                        "automatic empty-page retry."
+                        f"Catalogue coverage retry was unavailable for page(s) "
+                        f"{batch[0][0]}-{batch[-1][0]}; existing extracted rows were "
+                        f"retained. Details: {recovery_error}"
+                    )
+
+            still_sparse = bool(
+                catalog_table_present
+                and (
+                    len(normalized_batch_rows) < 2
+                    or (
+                        expected_count >= 3
+                        and len(normalized_batch_rows) < max(2, int(expected_count * 0.85))
+                    )
+                )
+            )
+            recovery_model = clean_text(coverage_model)
+            if (
+                still_sparse
+                and recovery_model
+                and normalize_key(recovery_model) != normalize_key(model)
+            ):
+                large_recovery_instructions = "\n\n".join(
+                    value
+                    for value in (
+                        clean_text(additional_instructions),
+                        (
+                            "HIGH-ACCURACY COVERAGE RECOVERY: Earlier extraction passes "
+                            "missed records on this page. Reconstruct every visual table row, "
+                            "split every Order-No. into its own spare-part record, preserve the "
+                            "printed hierarchy heading, and do not promote a spare description "
+                            "to section_name_english."
+                        ),
+                    )
+                    if value
+                )
+                try:
+                    large_retry = _mistral_json_request(
+                        api_key=api_key,
+                        model=recovery_model,
+                        messages=[
+                            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+                            {
+                                "role": "user",
+                                "content": _build_extraction_prompt(
+                                    batch,
+                                    large_recovery_instructions,
+                                    catalog_hint,
+                                    profile_hint,
+                                    adaptive_profile_hint,
+                                ),
+                            },
+                        ],
+                    )
+                    large_rows = large_retry.get("spare_parts", [])
+                    if isinstance(large_rows, list):
+                        normalized_large_rows = _normalize_batch_source_pages(
+                            large_rows, batch
+                        )
+                        if len(normalized_large_rows) > len(normalized_batch_rows):
+                            normalized_batch_rows = normalized_large_rows
+                            messages.append(
+                                f"Recovered {len(normalized_large_rows)} row(s) from "
+                                f"catalogue page(s) {batch[0][0]}-{batch[-1][0]} with "
+                                f"the high-accuracy model {recovery_model}."
+                            )
+                except Exception as recovery_error:
+                    messages.append(
+                        f"High-accuracy coverage recovery was unavailable for page(s) "
+                        f"{batch[0][0]}-{batch[-1][0]}; existing extracted rows were "
+                        f"retained. Details: {recovery_error}"
                     )
 
             rows.extend(normalized_batch_rows)
@@ -2058,6 +2157,49 @@ def _catalog_heading_title(value: Any) -> str:
     return clean_text(" ".join(title_parts)).strip(" -:;|")
 
 
+def _clean_catalog_section_name(value: Any, section_code: Any = "") -> str:
+    """Remove OCR spillover and code labels from an assembly heading."""
+    text = clean_text(value).strip(" -:;|").upper()
+    code = clean_text(section_code).strip().rstrip(".")
+    if not text:
+        return ""
+    if code:
+        text = re.sub(
+            rf"\s*\(\s*{re.escape(code)}\s*\)\s*$", "", text, flags=re.I
+        ).strip()
+        text = re.sub(
+            rf"^\s*{re.escape(code)}\.?\s+", "", text, flags=re.I
+        ).strip()
+
+    # Ordering notes and the first child description are commonly flattened onto
+    # the heading. They are not part of the sub-machinery name.
+    text = re.split(r"\bWHEN\s+ORDERING\b", text, maxsplit=1, flags=re.I)[0].strip()
+    words = text.split()
+    for length in range(min(5, len(words) // 2), 0, -1):
+        if words[:length] == words[length : length * 2]:
+            text = " ".join(words[:length])
+            break
+    return clean_text(text).strip(" -:;|").upper()
+
+
+def _clean_catalog_maker(value: Any) -> str:
+    """Reject German assembly headings that OCR/AI can mislabel as makers."""
+    text = clean_text(value).upper()
+    compact = normalize_key(text)
+    false_makers = {
+        "BRENNERMOTOR",
+        "BRENNERGEHAUSE",
+        "BRENNERGEHAEUSE",
+        "LUFTREGELUNG",
+        "STELLANTRIEB",
+        "GEBLASE",
+        "GEBLAESE",
+    }
+    if compact in false_makers:
+        return ""
+    return text
+
+
 def _catalog_row_without_heading(
     row: Sequence[Any], mappings: Sequence[str | None], section: dict[str, str]
 ) -> list[Any]:
@@ -2106,10 +2248,29 @@ def _catalog_heading_code(value: Any) -> tuple[str, bool]:
             codes.append(match.group(1))
     if not codes:
         return "", False
-    # ``1.`` is an unambiguous major heading. A decimal such as ``3.30`` is a
-    # heading when its merged cell also contains child positions (3.31, 3.32...).
+    # ``1.`` is an unambiguous major heading. Repeated positions such as
+    # ``12.1 / 12.1 / 12.1`` are applicability variants of one spare, not a
+    # hierarchy. Decimal subsection headings in this catalogue use decade
+    # boundaries (3.30, 6.40, 18.50) followed by distinct child positions.
     major_heading = bool(re.fullmatch(r"\s*\d{1,2}\.\s*", lines[0]))
-    return codes[0], bool(major_heading or len(codes) > 1)
+    first_parts = codes[0].split(".")
+    distinct_codes = list(dict.fromkeys(codes))
+    decimal_heading = False
+    if len(first_parts) == 2 and first_parts[1].isdigit():
+        major, position = int(first_parts[0]), int(first_parts[1])
+        decimal_heading = bool(
+            position >= 10
+            and position % 10 == 0
+            and any(
+                len(parts := candidate.split(".")) == 2
+                and parts[0].isdigit()
+                and parts[1].isdigit()
+                and int(parts[0]) == major
+                and int(parts[1]) > position
+                for candidate in distinct_codes[1:]
+            )
+        )
+    return codes[0], bool(major_heading or decimal_heading)
 
 
 def _classic_catalog_section_from_row(
@@ -2210,7 +2371,7 @@ def _classic_catalog_section_from_row(
     return {
         "section_code": code,
         "section_name_raw": "\n".join(candidates) or english,
-        "section_name_english": clean_text(english).upper(),
+        "section_name_english": _clean_catalog_section_name(english, code),
     }
 
 
@@ -2220,6 +2381,22 @@ def _classic_catalog_sections(markdown: str) -> list[dict[str, str]]:
         return []
     result: list[dict[str, str]] = []
     seen: set[str] = set()
+
+    # OCR sometimes places the real section heading immediately above the
+    # Markdown table instead of inside its first row. Read those standalone
+    # headings even when the same page also contains another valid table heading.
+    for line in str(markdown or "").splitlines()[:100]:
+        if "|" in line or line.lstrip().startswith("!["):
+            continue
+        cleaned = _clean_markdown_cell(line.lstrip("# "))
+        if not cleaned:
+            continue
+        section = _classic_catalog_section_from_row([cleaned])
+        code = section.get("section_code", "")
+        if code and code not in seen:
+            seen.add(code)
+            result.append(section)
+
     for block in _markdown_table_blocks(markdown):
         header_index = _find_data_header_index(block)
         if header_index is None:
@@ -2232,19 +2409,6 @@ def _classic_catalog_sections(markdown: str) -> list[dict[str, str]]:
             if code and code not in seen:
                 seen.add(code)
                 result.append(section)
-    if result:
-        return result
-
-    candidate_rows = [
-            [_clean_markdown_cell(line.lstrip("# "))]
-            for line in str(markdown or "").splitlines()[:100]
-        ]
-    for row in candidate_rows:
-        section = _classic_catalog_section_from_row(row)
-        code = section.get("section_code", "")
-        if code and code not in seen:
-            seen.add(code)
-            result.append(section)
     return result
 
 
@@ -2469,7 +2633,12 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
         else:
             metadata["section_name_raw"] = ""
             metadata["section_name_english"] = ""
-    if not metadata["model"]:
+        # Words such as Brennermotor, Luftregelung and Stellantrieb are German
+        # assembly titles in this layout, not manufacturer/model metadata. The
+        # verified main-machinery maker/model are applied later as the fallback.
+        metadata["maker"] = ""
+        metadata["model"] = ""
+    if not metadata["model"] and not classic_catalog:
         model_match = re.search(
             r"\b(?:COMPRESSOR|KOMPRESSOR|ENGINE|GENERATOR|PUMP)\s+([A-Z0-9][A-Z0-9 ._/-]{1,30})",
             header_text or text,
@@ -2490,6 +2659,23 @@ def _catalog_order_number_lines(value: Any) -> list[str]:
     for line in _catalog_cell_lines(value):
         candidate = re.sub(r"\s+[A-Z]$", "", line.strip(), flags=re.IGNORECASE)
         candidate = re.sub(r"\s+", " ", candidate).strip(" ;,|")
+        # OCR can flatten several visual Order-No. lines into one text line. Split
+        # the known manufacturer formats before applying the generic fallback.
+        tokens = re.findall(
+            r"(?<![\d/])(?:"
+            r"\d{3,4}\s+\d{3}\s+\d{3,4}/\d{1,2}"
+            r"|\d{9,12}/\d{1,2}"
+            r"|\d{3,4}[ .]\d{3}"
+            r"|\d{6}"
+            r")(?![\d/])",
+            candidate,
+        )
+        if tokens:
+            for token in tokens:
+                cleaned_token = re.sub(r"\s+", " ", token).strip(" .;,|")
+                if cleaned_token and cleaned_token not in result:
+                    result.append(cleaned_token)
+            continue
         digit_count = len(re.findall(r"\d", candidate))
         if digit_count < 5:
             continue
@@ -2741,7 +2927,7 @@ def build_section_catalog(
         if not aliases and code:
             aliases = catalog_code_tokens(code) or [code]
         aliases = list(dict.fromkeys(aliases))
-        name = clean_text(section.get("name", "")).upper()
+        name = _clean_catalog_section_name(section.get("name", ""), code)
         existing = next(
             (
                 by_alias.get(normalize_key(alias))
@@ -2755,11 +2941,21 @@ def build_section_catalog(
                 "code": code,
                 "aliases": aliases or ([code] if code else []),
                 "name": name,
-                "maker": clean_text(section.get("maker", "")).upper(),
+                "maker": _clean_catalog_maker(section.get("maker", ""))
+                if allow_simple_section_codes
+                else clean_text(section.get("maker", "")).upper(),
                 "model": clean_text(section.get("model", "")).upper(),
                 "pages": set(section.get("pages", set())),
                 "_name_priority": int(priority if name else -1),
-                "_maker_priority": int(priority if clean_text(section.get("maker", "")) else -1),
+                "_maker_priority": int(
+                    priority
+                    if (
+                        _clean_catalog_maker(section.get("maker", ""))
+                        if allow_simple_section_codes
+                        else clean_text(section.get("maker", ""))
+                    )
+                    else -1
+                ),
                 "_model_priority": int(priority if clean_text(section.get("model", "")) else -1),
             }
             sections.append(existing)
@@ -2767,7 +2963,11 @@ def build_section_catalog(
             if name and int(priority) > int(existing.get("_name_priority", -1)):
                 existing["name"] = name
                 existing["_name_priority"] = int(priority)
-            maker = clean_text(section.get("maker", "")).upper()
+            maker = (
+                _clean_catalog_maker(section.get("maker", ""))
+                if allow_simple_section_codes
+                else clean_text(section.get("maker", "")).upper()
+            )
             if maker and int(priority) > int(existing.get("_maker_priority", -1)):
                 existing["maker"] = maker
                 existing["_maker_priority"] = int(priority)
@@ -3012,7 +3212,9 @@ def build_section_catalog(
             for page in section.get("pages", set())
             if int(page) not in index_pages
         )
-        section["name"] = clean_text(section.get("name", "")).upper()
+        section["name"] = _clean_catalog_section_name(
+            section.get("name", ""), section.get("code", "")
+        )
         section["maker"] = clean_text(section.get("maker", "")).upper() or fallback_maker
         section["model"] = clean_text(section.get("model", "")).upper() or fallback_model
         section["first_page"] = min(pages) if pages else None
@@ -3672,7 +3874,12 @@ def build_submachinery_candidates(
 
     observations: list[dict[str, Any]] = []
     for _, row in review_frame.iterrows():
-        name = _clean_machinery_name(row.get("DETECTED MACHINERY", row.get("TABLE TITLE", "")))
+        name = _clean_catalog_section_name(
+            _clean_machinery_name(
+                row.get("DETECTED MACHINERY", row.get("TABLE TITLE", ""))
+            ),
+            row.get("SECTION CODE", ""),
+        )
         code = clean_text(row.get("SECTION CODE", "")).upper()
         if _is_generic_machinery_name(name) and not code:
             continue
@@ -3729,13 +3936,7 @@ def build_submachinery_candidates(
 
     records: list[dict[str, Any]] = []
     for item in preliminary:
-        benefit_name = item["name"]
-        # Benefit links sheet 2 to sheet 1 through the exact machinery NAME. Keep
-        # the source code visibly embedded in every automated sub-machinery name,
-        # matching the proven reference-workbook convention (e.g. CYLINDER HEAD
-        # (P101)) and eliminating ambiguous same-name sections.
-        if benefit_name and item["code"] and f"({item['code']})" not in benefit_name:
-            benefit_name = f"{benefit_name} ({item['code']})"
+        benefit_name = _clean_catalog_section_name(item["name"], item["code"])
         records.append(
             {
                 "INCLUDE": True,
