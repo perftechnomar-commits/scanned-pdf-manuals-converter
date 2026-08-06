@@ -59,7 +59,7 @@ from tools import (
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.9.0"
+APP_VERSION = "4.9.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2828,6 +2828,11 @@ if active_workflow_step == "2. OCR":
                             max_chars_per_batch=int(extraction_max_chars),
                             additional_instructions=extra_prompt,
                             document_profile=document_profile,
+                            coverage_model=(
+                                analysis_model.strip()
+                                if adaptive_analysis and analysis_model.strip()
+                                else ""
+                            ),
                             progress=show_progress,
                         )
                         extraction_messages.extend(row_extraction_messages)
