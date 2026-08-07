@@ -78,7 +78,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.11.0"
+APP_VERSION = "4.12.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
