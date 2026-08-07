@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.11.0"
+TOOLS_VERSION = "4.12.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -1747,6 +1747,11 @@ def extract_spare_parts_with_ai(
                 if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
                 else []
             )
+            identifier_evidence_count = (
+                _catalog_order_number_evidence_count(batch)
+                if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
+                else 0
+            )
             catalog_table_present = bool(
                 extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
                 and any(
@@ -1754,7 +1759,10 @@ def extract_spare_parts_with_ai(
                     for _, markdown in batch
                 )
             )
-            expected_count = len(expected_direct_rows)
+            expected_count = max(
+                len(expected_direct_rows),
+                identifier_evidence_count,
+            )
             coverage_is_sparse = bool(
                 catalog_table_present
                 and (
@@ -3010,7 +3018,7 @@ def _catalog_order_number_lines(value: Any) -> list[str]:
         # the known manufacturer formats before applying the generic fallback.
         tokens = re.findall(
             r"(?<![\d/])(?:"
-            r"\d{3,4}\s+\d{3}\s+\d{3,4}/\d{1,2}"
+            r"\d{3,4}\s+\d{3}\s+\d{4}(?:/\d{1,2})?"
             r"|\d{9,12}/\d{1,2}"
             r"|\d{3,4}[ .]\d{3}"
             r"|\d{6}"
@@ -3023,18 +3031,44 @@ def _catalog_order_number_lines(value: Any) -> list[str]:
                 if cleaned_token and cleaned_token not in result:
                     result.append(cleaned_token)
             continue
-        digit_count = len(re.findall(r"\d", candidate))
-        if digit_count < 5:
-            continue
-        # Reject weights and simple sizes while accepting values such as
-        # 499 089, 151 327 1512/2, and 110 500 0009/2.
-        if re.fullmatch(r"\d+[,.]\d+", candidate):
-            continue
-        if not (re.search(r"\s", candidate) or "/" in candidate or "-" in candidate):
-            continue
-        if candidate not in result:
-            result.append(candidate)
+        # Do not use a loose numeric fallback for this catalogue family. Values
+        # such as ``5-8 9-11``, ``7 8/2`` and ``1102/7`` are applicability or
+        # damaged OCR fragments, not Order-No. identifiers. The explicit formats
+        # above cover the printed Weishaupt identifiers used by the source.
     return result
+
+
+def _catalog_order_number_evidence_count(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> int:
+    """Count source Order-No. evidence without requiring a complete parsed row.
+
+    A sparse AI response used to look acceptable when the deterministic parser
+    also missed the description or hierarchy on a difficult page. Counting the
+    identifier column independently gives recovery a source-backed coverage floor.
+    """
+    evidence: set[tuple[int, str]] = set()
+    for page_number, markdown in extracted_pages:
+        if not _is_multilingual_order_catalog(markdown):
+            continue
+        for block in _markdown_table_blocks(markdown):
+            header_index = _find_data_header_index(block)
+            if header_index is None:
+                continue
+            mappings = [
+                _canonical_source_header(header) for header in block[header_index]
+            ]
+            ident_indexes = [
+                index for index, canonical in enumerate(mappings)
+                if canonical == "ident_no"
+            ]
+            for row in block[header_index + 1 :]:
+                for index in ident_indexes:
+                    if index >= len(row):
+                        continue
+                    for identifier in _catalog_order_number_lines(row[index]):
+                        evidence.add((int(page_number), normalize_key(identifier)))
+    return len(evidence)
 
 
 def _classic_english_description_index(
@@ -3717,9 +3751,43 @@ def prepare_benefit_rows(
     catalog_pages: Sequence[tuple[int, str]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Repair and normalize extraction using exact PDF table structure and page headers."""
-    normalized_ai = [_normalized_ai_row(row) for row in ai_rows if isinstance(row, dict)]
     direct_rows = _direct_table_rows(extracted_pages)
     section_context_pages = list(catalog_pages) if catalog_pages is not None else list(extracted_pages)
+    allow_simple_section_codes = (
+        _document_extraction_profile(section_context_pages)
+        == MULTILINGUAL_ORDER_CATALOG_PROFILE
+    )
+    normalized_ai: list[dict[str, Any]] = []
+    rejected_ai_identifiers = 0
+    expanded_ai_identifiers = 0
+    for raw in ai_rows:
+        if not isinstance(raw, dict):
+            continue
+        normalized = _normalized_ai_row(raw)
+        if not allow_simple_section_codes:
+            normalized_ai.append(normalized)
+            continue
+        raw_identifier = clean_text(normalized.get("ident_no", ""))
+        identifiers = _catalog_order_number_lines(raw_identifier)
+        if not identifiers:
+            if raw_identifier:
+                rejected_ai_identifiers += 1
+            # Retain the row only as section/description context. It cannot become
+            # an included spare without a source-valid Order-No.
+            normalized["ident_no"] = ""
+            normalized["identifier_rejected"] = bool(raw_identifier)
+            normalized_ai.append(normalized)
+            continue
+        if len(identifiers) > 1:
+            expanded_ai_identifiers += len(identifiers) - 1
+        for identifier in identifiers:
+            variant = dict(normalized)
+            variant["ident_no"] = identifier
+            variant["code"] = identifier
+            variant["part_no"] = identifier
+            variant["identifier_rejected"] = False
+            normalized_ai.append(variant)
+
     catalog = build_section_catalog(section_context_pages, normalized_ai, main_row)
     sections = catalog["sections"]
     page_map = catalog["page_map"]
@@ -3728,10 +3796,6 @@ def prepare_benefit_rows(
     parts_pages = catalog["parts_pages"]
     ambiguous_pages = catalog.get("ambiguous_pages", set())
     unmapped_parts_pages = catalog.get("unmapped_parts_pages", set())
-    allow_simple_section_codes = (
-        _document_extraction_profile(section_context_pages)
-        == MULTILINGUAL_ORDER_CATALOG_PROFILE
-    )
 
     by_alias: dict[str, dict[str, Any]] = {}
     for section in sections:
@@ -3758,45 +3822,6 @@ def prepare_benefit_rows(
                 matches.append(section)
                 seen_ids.add(id(section))
         return matches
-
-    def section_for_item_position(value: Any) -> dict[str, Any] | None:
-        """Resolve a catalogue spare row to its printed hierarchy heading.
-
-        A page can contain more than one section.  Page-level carry-forward is
-        therefore insufficient: position 7.15 belongs to heading 7, while 3.31
-        belongs to heading 3.30.  Use only a unique, source-confirmed match and
-        leave every unfamiliar code pattern to the existing page logic.
-        """
-        if not allow_simple_section_codes:
-            return None
-        item = clean_text(value).strip().rstrip(".")
-        match = re.fullmatch(r"(\d{1,2})(?:\.(\d{1,3}))?", item)
-        if not match:
-            return None
-        major = int(match.group(1))
-        item_minor = int(match.group(2)) if match.group(2) else None
-        candidates: list[tuple[int, dict[str, Any]]] = []
-        for section in sections:
-            code = _catalog_section_code(section.get("code", ""))
-            code_match = re.fullmatch(r"(\d{1,2})(?:\.(\d{1,2}))?", code)
-            if not code_match or int(code_match.group(1)) != major:
-                continue
-            section_minor = (
-                int(code_match.group(2)) if code_match.group(2) is not None else None
-            )
-            if section_minor is None:
-                candidates.append((0, section))
-                continue
-            if item_minor is None:
-                continue
-            # A decimal heading is a decade anchor: 6.40 owns 6.41–6.49.
-            if section_minor % 10 == 0 and item_minor // 10 == section_minor // 10:
-                candidates.append((1, section))
-        if not candidates:
-            return None
-        highest_specificity = max(rank for rank, _ in candidates)
-        winners = [section for rank, section in candidates if rank == highest_specificity]
-        return winners[0] if len(winners) == 1 else None
 
     def fuzzy_section_for_name(value: Any) -> dict[str, Any] | None:
         name_key = normalize_key(value)
@@ -3831,21 +3856,10 @@ def prepare_benefit_rows(
         """Resolve a section with printed page context ahead of AI context."""
         direct_row = direct_row or {}
         ai_row = ai_row or {}
-        item_section = section_for_item_position(direct_row.get("item_no", ""))
         direct_matches = exact_sections_for_code(direct_row.get("section_code", ""))
         page_section = page_map.get(page) if page is not None else None
         ai_matches = exact_sections_for_code(ai_row.get("section_code", ""))
         conflict = False
-
-        # For the known numbered catalogue profile, a uniquely resolved drawing
-        # position is stronger than a stale page-level section label. This keeps
-        # different sections on one page from borrowing one another's parts.
-        if item_section is not None:
-            if len(direct_matches) == 1 and id(direct_matches[0]) != id(item_section):
-                conflict = True
-            if page_section is not None and id(page_section) != id(item_section):
-                conflict = True
-            return item_section, "printed drawing-position hierarchy", conflict
 
         if len(direct_matches) == 1:
             chosen = direct_matches[0]
@@ -4024,6 +4038,8 @@ def prepare_benefit_rows(
             )
             if not description or not (ident_no or clean_text(ai.get("item_no", ""))):
                 continue
+            if allow_simple_section_codes and not ident_no:
+                continue
             confidence = clamp_confidence(ai.get("confidence", 0.70))
             if language_review:
                 confidence = min(confidence, 0.60)
@@ -4081,7 +4097,13 @@ def prepare_benefit_rows(
             description, language_review = _best_effort_english_description(
                 ai.get("description_english", "")
             )
-            if description and (clean_text(ai.get("ident_no", "")) or clean_text(ai.get("item_no", ""))):
+            if description and (
+                clean_text(ai.get("ident_no", ""))
+                or (
+                    not allow_simple_section_codes
+                    and clean_text(ai.get("item_no", ""))
+                )
+            ):
                 section, section_source, section_conflict = section_for(
                     ai.get("source_page"), None, ai
                 )
@@ -4147,6 +4169,17 @@ def prepare_benefit_rows(
         f"Deterministic table verification found {len(direct_rows)} spare-part row(s).",
         f"Detected {len(sections)} source-coded sub-machinery section(s).",
     ]
+    if rejected_ai_identifiers:
+        messages.append(
+            f"Rejected {rejected_ai_identifiers} AI identifier value(s) that did not "
+            "match a source Order-No. format; applicability, size, and damaged OCR "
+            "fragments were not exported as spare-part codes."
+        )
+    if expanded_ai_identifiers:
+        messages.append(
+            f"Split {expanded_ai_identifiers} additional source Order-No. value(s) "
+            "from AI cells that contained multiple printed identifiers."
+        )
     if inherited_item_count:
         messages.append(
             f"Repeated {inherited_item_count} merged/continuation ITEM NO value(s) on linked spare-part rows."
