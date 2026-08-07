@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.12.0"
+TOOLS_VERSION = "4.13.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -3018,8 +3018,12 @@ def _catalog_order_number_lines(value: Any) -> list[str]:
         # the known manufacturer formats before applying the generic fallback.
         tokens = re.findall(
             r"(?<![\d/])(?:"
-            r"\d{3,4}\s+\d{3}\s+\d{4}(?:/\d{1,2})?"
-            r"|\d{9,12}/\d{1,2}"
+            # The third printed group is normally four digits, but this manual
+            # also contains a genuine 4-3-3/slash family such as
+            # ``0511 210 002/2``. Keep the slash mandatory for the three-digit
+            # third group so flattened short codes are not joined accidentally.
+            r"\d{3,4}\s+\d{3}\s+(?:\d{4}(?:/\d{1,2})?|\d{3}/\d{1,2})"
+            r"|\d{9,12}(?:/\d{1,2})?"
             r"|\d{3,4}[ .]\d{3}"
             r"|\d{6}"
             r")(?![\d/])",
@@ -3117,11 +3121,15 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
             if "ident_no" in mappings and "item_no" not in mappings and "source_part_no" in mappings:
                 mappings[mappings.index("source_part_no")] = "item_no"
             active_metadata = dict(metadata)
+            last_english_description = ""
+            last_description_item_no = ""
             for values in block[header_index + 1 :]:
                 if classic_catalog:
                     row_section = _classic_catalog_section_from_row(values, mappings)
                     if row_section:
                         active_metadata.update(row_section)
+                        last_english_description = ""
+                        last_description_item_no = ""
                         ident_indexes = [
                             index
                             for index, canonical in enumerate(mappings)
@@ -3162,8 +3170,29 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                     identifiers = _catalog_order_number_lines(
                         record.get("ident_no", "")
                     )
+                    # Visually merged catalogue rows may print the English
+                    # designation once beside several Order-No. lines. Carry it
+                    # only within the same table/section and the same (or merged)
+                    # drawing position; a new heading resets this state above.
+                    if (
+                        not description_raw
+                        and identifiers
+                        and last_english_description
+                        and (
+                            not item_no
+                            or not last_description_item_no
+                            or normalize_key(item_no)
+                            == normalize_key(last_description_item_no)
+                        )
+                    ):
+                        description_raw = last_english_description
+                        record["description_raw"] = description_raw
+                        record["description_inherited"] = True
                     if not description_raw or not identifiers:
                         continue
+                    last_english_description = description_raw
+                    if item_no:
+                        last_description_item_no = item_no
                     for identifier in identifiers:
                         variant = dict(record)
                         variant["ident_no"] = identifier
@@ -4015,7 +4044,10 @@ def prepare_benefit_rows(
                     "source_description_raw": _clean_markdown_cell(direct.get("description_raw", "")),
                     "source_section_name_raw": _clean_markdown_cell(direct.get("table_title", "")),
                     "unit": normalize_unit((ai or {}).get("unit", ""), default_unit),
-                    "quantity": quantity_to_number(direct.get("quantity")),
+                    # This catalogue prints approximate weight, not quantity.
+                    # QNT must therefore remain blank even if AI interpreted a
+                    # neighbouring numeric column as quantity.
+                    "quantity": None if allow_simple_section_codes else quantity_to_number(direct.get("quantity")),
                     "confidence": confidence,
                     "language_review": language_review,
                     "description_source": description_source,
@@ -4071,6 +4103,7 @@ def prepare_benefit_rows(
                     "description_source_mismatch": False,
                     "section_review": bool(section_conflict or section is None),
                     "section_assignment_source": section_source,
+                    "quantity": None if allow_simple_section_codes else quantity_to_number(ai.get("quantity")),
                 }
             )
 
@@ -4139,15 +4172,25 @@ def prepare_benefit_rows(
                         "description_source_mismatch": False,
                         "section_review": bool(section_conflict or section is None),
                         "section_assignment_source": section_source,
+                        "quantity": None if allow_simple_section_codes else quantity_to_number(ai.get("quantity")),
                     }
                 )
 
     output, inherited_item_count = _carry_forward_merged_item_numbers(output)
 
-    # Deterministic de-duplication by source page + item + identifier. PART NO alone
-    # is intentionally not treated as globally unique across a technical manual.
+    # Deterministic de-duplication by source page + item + identifier. In the
+    # multilingual Order-No. catalogue, the Order-No. is globally unique. When
+    # the same code is printed for several exact drawing positions/applicability
+    # rows, retain one import record and aggregate those positions instead of
+    # silently discarding every occurrence after the first.
     deduplicated: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
+    consolidated_catalog_rows = 0
+
+    def item_position_sort_key(value: str) -> tuple[Any, ...]:
+        parts = re.split(r"(\d+)", clean_text(value))
+        return tuple(int(part) if part.isdigit() else part.upper() for part in parts)
+
     for row in output:
         identifier_key = normalize_key(row.get("ident_no", row.get("code", "")))
         if allow_simple_section_codes and identifier_key:
@@ -4160,9 +4203,29 @@ def prepare_benefit_rows(
                 normalize_key(row.get("item_no", "")),
                 identifier_key,
             )
-        if key in seen:
+        existing = seen.get(key)
+        if existing is not None:
+            if allow_simple_section_codes:
+                positions = {
+                    clean_text(value)
+                    for source in (
+                        existing.get("item_no", ""),
+                        row.get("item_no", ""),
+                    )
+                    for value in re.split(r"\s*;\s*", clean_text(source))
+                    if clean_text(value)
+                }
+                existing["item_no"] = "; ".join(
+                    sorted(positions, key=item_position_sort_key)
+                )
+                existing["item_no_aggregated"] = len(positions) > 1
+                existing["source_page"] = min(
+                    int(existing.get("source_page") or 10**9),
+                    int(row.get("source_page") or 10**9),
+                )
+                consolidated_catalog_rows += 1
             continue
-        seen.add(key)
+        seen[key] = row
         deduplicated.append(row)
 
     messages = [
@@ -4183,6 +4246,11 @@ def prepare_benefit_rows(
     if inherited_item_count:
         messages.append(
             f"Repeated {inherited_item_count} merged/continuation ITEM NO value(s) on linked spare-part rows."
+        )
+    if consolidated_catalog_rows:
+        messages.append(
+            f"Consolidated {consolidated_catalog_rows} repeated Order-No. occurrence(s) "
+            "into unique spare-part codes while retaining every distinct ITEM NO."
         )
     if paraphrases_prevented:
         messages.append(
@@ -4211,6 +4279,26 @@ def prepare_benefit_rows(
     if unconfirmed_sections:
         messages.append(
             f"{unconfirmed_sections} row(s) remain without a fully confirmed source section."
+        )
+    represented_section_codes = {
+        normalize_key(row.get("section_code", ""))
+        for row in deduplicated
+        if normalize_key(row.get("section_code", ""))
+    }
+    empty_source_sections = [
+        section
+        for section in sections
+        if section.get("pages")
+        and normalize_key(section.get("code", "")) not in represented_section_codes
+    ]
+    if empty_source_sections:
+        labels = ", ".join(
+            f"{clean_text(section.get('code', ''))} {clean_text(section.get('name', ''))}".strip()
+            for section in empty_source_sections
+        )
+        messages.append(
+            "COMPLETENESS WARNING: source sub-machinery heading(s) were detected "
+            f"without any exported spare rows: {labels}. Review or reprocess their pages."
         )
     return deduplicated, messages
 
