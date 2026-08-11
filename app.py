@@ -1210,6 +1210,119 @@ def _normalise_source_code(value: object) -> str:
     return re.sub(r"\s+", "", str(value or "").strip()).upper()
 
 
+def _consolidate_duplicate_part_codes(review: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Keep one included row per CODE and retain duplicate source-page evidence.
+
+    The import has a strict unique-code rule. Repeated OCR occurrences therefore
+    cannot all remain included, even after manual confidence verification. Select
+    the most complete/highest-confidence occurrence (earliest page as the final
+    tie-breaker), retain it for export, and leave the other occurrences excluded
+    in the review/audit data instead of deleting their evidence.
+    """
+    if review.empty or not {"INCLUDE", "CODE"}.issubset(review.columns):
+        return review, 0
+
+    result = review.copy()
+    included = result["INCLUDE"].astype(bool)
+    normalised_codes = result["CODE"].fillna("").astype(str).map(
+        _normalise_source_code
+    )
+    candidate_indexes = list(result.index[included & normalised_codes.ne("")])
+    if not candidate_indexes:
+        return result, 0
+
+    order = {index: position for position, index in enumerate(result.index)}
+
+    def source_page_value(index: object) -> float:
+        value = pd.to_numeric(
+            pd.Series([result.at[index, "SOURCE PAGE"]]), errors="coerce"
+        ).iloc[0] if "SOURCE PAGE" in result.columns else float("nan")
+        return float(value) if pd.notna(value) else float("inf")
+
+    def source_page_label(index: object) -> str:
+        if "SOURCE PAGE" not in result.columns:
+            return "unknown"
+        raw_value = result.at[index, "SOURCE PAGE"]
+        numeric_value = pd.to_numeric(pd.Series([raw_value]), errors="coerce").iloc[0]
+        if pd.notna(numeric_value):
+            numeric_value = float(numeric_value)
+            return str(int(numeric_value)) if numeric_value.is_integer() else str(numeric_value)
+        text_value = str(raw_value or "").strip()
+        return text_value or "unknown"
+
+    def quality(index: object) -> tuple[int, float, float, int]:
+        completeness_columns = (
+            "MACHINERY", "PART NO", "DESCRIPTION", "CODE", "ITEM NO", "UNIT"
+        )
+        completeness = sum(
+            bool(str(result.at[index, column] or "").strip())
+            for column in completeness_columns
+            if column in result.columns
+        )
+        confidence = pd.to_numeric(
+            pd.Series([result.at[index, "CONFIDENCE"]]), errors="coerce"
+        ).fillna(0.0).iloc[0] if "CONFIDENCE" in result.columns else 0.0
+        # max() prefers complete/high-confidence records, then the earliest page
+        # and finally the original row order for deterministic results.
+        return (
+            completeness,
+            float(confidence),
+            -source_page_value(index),
+            -order[index],
+        )
+
+    def append_source_note(index: object, note: str) -> None:
+        existing = ""
+        if "WARNING" in result.columns and pd.notna(result.at[index, "WARNING"]):
+            existing = str(result.at[index, "WARNING"]).strip()
+        messages = [message.strip() for message in existing.split(";") if message.strip()]
+        if note not in messages:
+            messages.append(note)
+        if "WARNING" in result.columns:
+            result.at[index, "WARNING"] = "; ".join(messages)
+
+    excluded_count = 0
+    for code in normalised_codes.loc[candidate_indexes].drop_duplicates().tolist():
+        duplicate_indexes = [
+            index for index in candidate_indexes if normalised_codes.at[index] == code
+        ]
+        if len(duplicate_indexes) < 2:
+            continue
+
+        retained_index = max(duplicate_indexes, key=quality)
+        excluded_indexes = [
+            index for index in duplicate_indexes if index != retained_index
+        ]
+        page_labels = sorted(
+            {source_page_label(index) for index in duplicate_indexes},
+            key=lambda value: (
+                float(value) if re.fullmatch(r"\d+(?:\.\d+)?", value) else float("inf"),
+                value,
+            ),
+        )
+        retained_page = source_page_label(retained_index)
+        source_summary = ", ".join(page_labels)
+        displayed_code = str(result.at[retained_index, "CODE"] or "").strip()
+        append_source_note(
+            retained_index,
+            f"Source: duplicate CODE '{displayed_code}' consolidated from page(s) "
+            f"{source_summary}, retained page {retained_page}",
+        )
+
+        for index in excluded_indexes:
+            result.at[index, "INCLUDE"] = False
+            if "READY" in result.columns:
+                result.at[index, "READY"] = False
+            append_source_note(
+                index,
+                f"Source: duplicate CODE '{displayed_code}' automatically excluded, "
+                f"retained source page {retained_page}",
+            )
+            excluded_count += 1
+
+    return result, excluded_count
+
+
 def _natural_code_sort_series(series: pd.Series) -> pd.Series:
     """Return a display-safe natural sort key without changing stored codes.
 
@@ -1383,9 +1496,10 @@ def recalculate_review_with_verification(
     verified_rows,
     confidence_threshold: float = 0.75,
 ) -> pd.DataFrame:
-    """Validate rows, always reject duplicate codes, and enforce verification."""
+    """Consolidate duplicate codes, validate rows, and enforce verification."""
+    deduplicated, _ = _consolidate_duplicate_part_codes(frame)
     result = recalculate_review_status(
-        frame,
+        deduplicated,
         valid_machinery_names=valid_machinery_names,
         allow_duplicates=False,
     )
@@ -3324,6 +3438,7 @@ if active_workflow_step == "4. Review spare parts":
             row_ids = full_status.apply(_review_row_id, axis=1)
             verified_mask = row_ids.isin(verified_ids)
             low_confidence_mask = included_mask & (confidence_values < threshold)
+            pending_verification_mask = low_confidence_mask & ~verified_mask
             detected_mask = full_status["DETECTED MACHINERY"].astype(str).str.strip().ne("")
             assignment_values = full_status["ASSIGNMENT SOURCE"].astype(str)
             submachinery_review_mask = (
@@ -3352,16 +3467,19 @@ if active_workflow_step == "4. Review spare parts":
             verification_actions = st.columns([1.35, 3.65])
             with verification_actions[0]:
                 if st.button(
-                    "Verify all included rows",
+                    "Verify all low-confidence rows",
                     type="primary",
                     use_container_width=True,
-                    disabled=not bool(included_mask.any()),
-                    help="Mark every included spare-part row as manually verified. This clears low-confidence verification blocks across the whole document.",
+                    disabled=not bool(pending_verification_mask.any()),
+                    help=(
+                        "Mark every included low-confidence row as manually verified. "
+                        "Required-field, machinery-link and unique-code rules still apply."
+                    ),
                 ):
                     verified = _verified_ids(st.session_state.verified_review_rows)
                     verified.update(
                         _review_row_id(row)
-                        for _, row in full_status.loc[included_mask].iterrows()
+                        for _, row in full_status.loc[low_confidence_mask].iterrows()
                     )
                     st.session_state.verified_review_rows = sorted(verified)
                     st.session_state.spare_review = recalculate_review_with_verification(
@@ -3373,13 +3491,15 @@ if active_workflow_step == "4. Review spare parts":
                     st.session_state.editor_version += 1
                     save_loaded_job_state()
                     st.session_state.review_flash = (
-                        f"Verified all {int(included_mask.sum())} included spare-part row(s)."
+                        f"Verified all {int(pending_verification_mask.sum())} pending "
+                        "low-confidence spare-part row(s)."
                     )
                     st.rerun()
             with verification_actions[1]:
                 st.caption(
-                    "This applies to every included row in this document, including rows outside the current page or filter. "
-                    "Use it only after you have reviewed the extraction result."
+                    "This clears confidence-related verification blocks across the whole "
+                    "document. Mandatory data checks still apply. Repeated part codes are "
+                    "automatically excluded while their source-page evidence remains in the audit."
                 )
 
             toolbar = st.columns([1.45, 1.35, 1.0, 0.9, 0.9])
