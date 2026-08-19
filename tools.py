@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.14.0"
+TOOLS_VERSION = "4.14.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -1992,52 +1992,59 @@ def extract_spare_parts_with_ai(
             # catalogues.  That is not an API failure, so the old recovery path never
             # ran. Retry once with an explicit coverage instruction before allowing
             # the deterministic Markdown parser to supplement the page later.
-            expected_direct_rows = (
-                _direct_table_rows(batch)
-                if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
-                else []
-            )
-            identifier_evidence_count = (
-                _catalog_order_number_evidence_count(batch)
-                if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
-                else 0
-            )
-            catalog_table_present = bool(
-                extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
-                and any(
+            coverage_profile = ""
+            expected_direct_rows: list[dict[str, Any]] = []
+            identifier_evidence_count = 0
+            coverage_table_present = False
+            if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE:
+                coverage_profile = "Order-No. catalogue"
+                expected_direct_rows = _direct_table_rows(batch)
+                identifier_evidence_count = _catalog_order_number_evidence_count(batch)
+                coverage_table_present = any(
                     _is_multilingual_order_catalog(markdown)
                     for _, markdown in batch
                 )
-            )
-            expected_count = max(
-                len(expected_direct_rows),
-                identifier_evidence_count,
-            )
+            elif extraction_profile == ENGINEERING_ARTICLE_DRAWING_PROFILE:
+                coverage_profile = "Article-No. engineering table"
+                expected_direct_rows = _direct_table_rows(batch)
+                identifier_evidence_count = _engineering_article_identifier_evidence_count(batch)
+                coverage_table_present = any(
+                    _is_engineering_article_table(markdown)
+                    for _, markdown in batch
+                )
+
+            expected_count = max(len(expected_direct_rows), identifier_evidence_count)
             coverage_is_sparse = bool(
-                catalog_table_present
+                coverage_table_present
                 and (
-                    len(normalized_batch_rows) < 2
+                    len(normalized_batch_rows) < 1
                     or (
                         expected_count >= 3
-                        and len(normalized_batch_rows) < max(2, int(expected_count * 0.85))
+                        and len(normalized_batch_rows) < max(1, int(expected_count * 0.85))
                     )
                 )
             )
             if coverage_is_sparse:
-                expected_wording = (
-                    f"approximately {expected_count}"
-                    if expected_direct_rows
-                    else "multiple"
-                )
+                expected_wording = f"approximately {expected_count}" if expected_count else "multiple"
+                if extraction_profile == ENGINEERING_ARTICLE_DRAWING_PROFILE:
+                    recovery_detail = (
+                        "Article-No. records. Reconstruct the orderable table even when OCR "
+                        "has emitted it in column-major reading order. Article No. is the "
+                        "identifier; Name/Designation is the description; Art. Rev., "
+                        "Material/Blank and Note are metadata and must not become ITEM NO or QNT."
+                    )
+                else:
+                    recovery_detail = (
+                        "Order-No. records. Read every table row and every Order-No. variant. "
+                        "Do not summarize the page."
+                    )
                 recovery_instructions = "\n\n".join(
                     value
                     for value in (
                         clean_text(additional_instructions),
                         (
-                            "COVERAGE RECOVERY: The prior pass returned no rows even "
-                            f"though the table contains {expected_wording} "
-                            "Order-No. records. Read every table row and every Order-No. "
-                            "variant. Do not summarize the page."
+                            "COVERAGE RECOVERY: The prior pass returned too few rows even "
+                            f"though source evidence indicates {expected_wording} {recovery_detail}"
                         ),
                     )
                     if value
@@ -2074,18 +2081,18 @@ def extract_spare_parts_with_ai(
                             )
                 except Exception as recovery_error:
                     messages.append(
-                        f"Catalogue coverage retry was unavailable for page(s) "
+                        f"Coverage retry was unavailable for page(s) "
                         f"{batch[0][0]}-{batch[-1][0]}; existing extracted rows were "
                         f"retained. Details: {recovery_error}"
                     )
 
             still_sparse = bool(
-                catalog_table_present
+                coverage_table_present
                 and (
-                    len(normalized_batch_rows) < 2
+                    len(normalized_batch_rows) < 1
                     or (
                         expected_count >= 3
-                        and len(normalized_batch_rows) < max(2, int(expected_count * 0.85))
+                        and len(normalized_batch_rows) < max(1, int(expected_count * 0.85))
                     )
                 )
             )
@@ -2101,10 +2108,10 @@ def extract_spare_parts_with_ai(
                         clean_text(additional_instructions),
                         (
                             "HIGH-ACCURACY COVERAGE RECOVERY: Earlier extraction passes "
-                            "missed records on this page. Reconstruct every visual table row, "
-                            "split every Order-No. into its own spare-part record, preserve the "
-                            "printed hierarchy heading, and do not promote a spare description "
-                            "to section_name_english."
+                            "missed source-backed records on this page. Reconstruct every "
+                            "orderable table record from the visible semantic columns, preserve "
+                            "the printed hierarchy/title-block context, and never promote metadata "
+                            "or construction/composition entries into spare parts."
                         ),
                     )
                     if value
@@ -3626,6 +3633,163 @@ def _classic_english_description_index(
     return description_indexes[0]
 
 
+def _engineering_article_identifier_evidence(
+    markdown: Any,
+    section_code: Any = "",
+) -> list[str]:
+    """Return source-backed Article-No. candidates from an engineering table page.
+
+    This is deliberately layout-agnostic. OCR may emit rows horizontally, columns
+    vertically, or flatten the whole table. A genuine Article-No. table is already
+    required by the caller, so identifiers can be collected from the whole OCR text.
+    The title-block document number itself is excluded.
+    """
+    if not _is_engineering_article_table(markdown):
+        return []
+    raw = str(markdown or "")
+    section_key = normalize_key(section_code)
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    # Prefer compound article numbers such as ``9007280 06``. The whitespace is
+    # meaningful and prevents a standalone drawing/document number from being
+    # mistaken for a spare identifier.
+    patterns = (
+        r"(?<![A-Z0-9])([A-Z0-9][A-Z0-9._/-]{5,19}\s+[A-Z0-9._/-]{1,5})(?![A-Z0-9])",
+        r"(?<![A-Z0-9])([A-Z]{1,4}[-/]?\d{5,12}[A-Z0-9._/-]*)(?![A-Z0-9])",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, raw, flags=re.I):
+            value = re.sub(r"\s+", " ", clean_text(match.group(1))).strip(" .;,|:")
+            key = normalize_key(value)
+            if not key or key == section_key or key in seen or not re.search(r"\d", value):
+                continue
+            # Filter obvious header/title fragments that merely happen to contain digits.
+            upper = value.upper()
+            if any(token in upper for token in ("PAGE", "SHEET", "REV", "BOOK", "DATE")):
+                continue
+            seen.add(key)
+            candidates.append(value)
+    return candidates
+
+
+def _engineering_article_identifier_evidence_count(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> int:
+    evidence: set[tuple[int, str]] = set()
+    for page_number, markdown in extracted_pages:
+        if not _is_engineering_article_table(markdown):
+            continue
+        metadata = _engineering_title_block_metadata(markdown)
+        for identifier in _engineering_article_identifier_evidence(
+            markdown, metadata.get("section_code", "")
+        ):
+            evidence.add((int(page_number), normalize_key(identifier)))
+    return len(evidence)
+
+
+def _columnar_orderable_article_rows(
+    page_number: int,
+    markdown: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Recover an Article-No. table when OCR emits columns instead of rows.
+
+    Rotated engineering drawings are often OCR'd in column-major reading order:
+    all Article No. values first, then revisions, then Name/Designation values.
+    This routine reconstructs only when a semantic Article-No. table is present and
+    there is enough source evidence to align identifiers with descriptions safely.
+    It is manufacturer-neutral.
+    """
+    if not _is_engineering_article_table(markdown):
+        return []
+
+    section_code = clean_text(metadata.get("section_code", ""))
+    identifiers = _engineering_article_identifier_evidence(markdown, section_code)
+    if not identifiers:
+        return []
+
+    raw = str(markdown or "")
+    lines = [_clean_markdown_cell(line) for line in raw.splitlines()]
+    lines = [line for line in lines if line]
+
+    header_patterns = {
+        "article": re.compile(r"^\s*article\s*(?:no\.?|number|nr\.?)\s*$", re.I),
+        "revision": re.compile(r"^\s*art\.?\s*rev\.?\s*$", re.I),
+        "name": re.compile(r"^\s*name\s*/?\s*designation\s*$", re.I),
+        "material": re.compile(r"^\s*material\s*/?\s*blank\s*$", re.I),
+        "note": re.compile(r"^\s*note\s*$", re.I),
+    }
+
+    def header_kind(line: str) -> str:
+        cleaned = clean_text(line)
+        for kind, pattern in header_patterns.items():
+            if pattern.fullmatch(cleaned):
+                return kind
+        return ""
+
+    # Collect values that follow the Name/Designation header until the next known
+    # semantic header. This handles the common column-major OCR representation.
+    name_values: list[str] = []
+    in_name_column = False
+    for line in lines:
+        kind = header_kind(line)
+        if kind:
+            in_name_column = kind == "name"
+            continue
+        if not in_name_column:
+            continue
+        value = clean_text(line).strip(" |;:")
+        if not value or not re.search(r"[A-Za-zÀ-ÿ]", value):
+            continue
+        compact = normalize_key(value)
+        if compact in {
+            "PURCHASEDARTICLE", "BOUGHTOUTITEM", "STANDARDARTICLE",
+            "MATERIALBLANK", "NOTE", "ARTREV",
+        }:
+            continue
+        if re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{5,19}(?:\s+[A-Z0-9._/-]{1,5})?", value, re.I):
+            continue
+        name_values.append(value)
+
+    # If OCR kept repeated values, align them directly. If it collapsed repeated
+    # names to one value, repeat it only when the title block independently prints
+    # the same title. This remains source-backed and avoids inventing descriptions.
+    descriptions: list[str] = []
+    if len(name_values) >= len(identifiers):
+        descriptions = name_values[: len(identifiers)]
+    elif len(name_values) == 1:
+        title_name = clean_text(metadata.get("section_name_english", ""))
+        if title_name and normalize_key(title_name) == normalize_key(name_values[0]):
+            descriptions = [name_values[0]] * len(identifiers)
+
+    if len(descriptions) != len(identifiers):
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for identifier, description in zip(identifiers, descriptions):
+        rows.append(
+            {
+                "source_page": int(page_number),
+                "section_code": section_code,
+                "section_name_english": clean_text(metadata.get("section_name_english", "")).upper(),
+                "section_maker": clean_text(metadata.get("maker", "")).upper(),
+                "section_model": clean_text(metadata.get("model", "")).upper(),
+                "table_title": clean_text(metadata.get("section_name_raw", "")),
+                "section_start_page": int(page_number),
+                "ident_no": clean_text(identifier),
+                "source_part_no": "",
+                "item_no": "",
+                "description_raw": clean_text(description),
+                "quantity": None,
+                "unit": "",
+                "confidence": 0.86,
+                "source_layout": "column-major Article-No. table",
+            }
+        )
+    return rows
+
+
 def _plain_orderable_article_rows(
     page_number: int,
     markdown: str,
@@ -3867,6 +4031,8 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
         # Markdown/HTML table. Recover aligned Article-No. rows deterministically.
         if article_drawing and not any(int(row.get("source_page") or 0) == int(page_number) for row in rows):
             rows.extend(_plain_orderable_article_rows(int(page_number), markdown, metadata))
+        if article_drawing and not any(int(row.get("source_page") or 0) == int(page_number) for row in rows):
+            rows.extend(_columnar_orderable_article_rows(int(page_number), markdown, metadata))
     return rows
 
 def _index_sections(extracted_pages: Sequence[tuple[int, str]]) -> tuple[list[dict[str, Any]], set[int]]:
