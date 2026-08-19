@@ -539,6 +539,147 @@ def clean_markdown(value: Any) -> str:
     return text.replace("\x00", "").strip()
 
 
+def _rotated_alfa_laval_drawing_candidate(markdown: Any, source_text: Any = "") -> bool:
+    """Return True when an Alfa Laval drawing is likely rotated inside the PDF page.
+
+    A common PureBallast layout places the complete engineering drawing 90 degrees
+    clockwise inside a portrait manual page. The normal OCR pass can then read the
+    small Pos./Designation/Composition table while missing the orderable Article No.
+    table and title block. Only pages with strong drawing evidence are retried.
+    """
+    combined = clean_text(f"{markdown}\n{source_text}").lower()
+    compact = re.sub(r"[^a-z0-9]+", "", combined)
+    if not combined:
+        return False
+    if "articleno" in compact and "namedesignation" in compact:
+        return False
+    drawing_context = (
+        "dimension drawings including technical data" in combined
+        or ("drawings" in combined and bool(re.search(r"\b\d+\.\d+\.\d+\b", combined)))
+    )
+    construction_table = (
+        "composition" in combined
+        and "designation" in combined
+        and bool(re.search(r"\bpos\.?\b", combined))
+    )
+    title_block_hint = any(
+        token in compact
+        for token in ("documentno", "responsibledepartment", "noofsheets", "revisionno")
+    )
+    document_number = bool(re.search(r"(?<!\d)\d{7,9}(?!\d)", combined))
+    return bool(document_number and drawing_context and (construction_table or title_block_hint))
+
+
+def recover_rotated_alfa_laval_drawing_pages(
+    api_key: str,
+    pdf_bytes: bytes,
+    extracted_pages: Sequence[tuple[int, str]],
+    candidate_page_numbers: Sequence[int] | None = None,
+    progress: ProgressCallback | None = None,
+    max_pages: int = 12,
+) -> tuple[list[tuple[int, str]], list[str], list[int]]:
+    """Retry likely rotated Alfa Laval drawings after rotating the PDF page 90°.
+
+    The returned OCR markdown keeps the original page number and combines the normal
+    OCR with the rotated rescue text. A rescue is accepted only when it reveals the
+    genuine Article No. / Name/Designation drawing-table pattern, preventing generic
+    engineering drawings from being promoted to spare-parts pages.
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    original_lookup = {int(page): clean_markdown(markdown) for page, markdown in extracted_pages}
+    allowed = (
+        {int(page) for page in candidate_page_numbers}
+        if candidate_page_numbers is not None
+        else set(original_lookup)
+    )
+    candidates: list[int] = []
+    for page_number in sorted(allowed):
+        if page_number not in original_lookup or not 1 <= page_number <= len(reader.pages):
+            continue
+        source_text = ""
+        try:
+            source_text = reader.pages[page_number - 1].extract_text() or ""
+        except Exception:
+            source_text = ""
+        if _rotated_alfa_laval_drawing_candidate(
+            original_lookup[page_number], source_text
+        ):
+            candidates.append(page_number)
+        if len(candidates) >= max(1, int(max_pages)):
+            break
+
+    if not candidates:
+        return list(extracted_pages), [], []
+
+    messages: list[str] = []
+    rescued_pages: list[int] = []
+    updated = dict(original_lookup)
+    total = len(candidates)
+
+    for index, page_number in enumerate(candidates, start=1):
+        if progress:
+            progress(
+                index - 1,
+                total,
+                f"Rotated drawing OCR rescue {index}/{total} (PDF page {page_number})",
+            )
+        try:
+            # Use a fresh reader so page.rotate() cannot affect subsequent candidates.
+            page_reader = PdfReader(io.BytesIO(pdf_bytes))
+            page = page_reader.pages[page_number - 1]
+            page.rotate(90)  # clockwise: makes the embedded Alfa Laval A3 drawing upright
+            writer = PdfWriter()
+            writer.add_page(page)
+            buffer = io.BytesIO()
+            writer.write(buffer)
+            response = _mistral_ocr_request(
+                api_key=api_key,
+                document={
+                    "type": "document_url",
+                    "document_url": _pdf_data_url(buffer.getvalue()),
+                },
+            )
+            response_pages = _response_pages(response)
+            rescue_markdown = (
+                clean_markdown(response_pages[0].get("markdown", ""))
+                if response_pages
+                else ""
+            )
+            if rescue_markdown and _is_alfa_laval_article_drawing(rescue_markdown):
+                updated[page_number] = (
+                    original_lookup[page_number]
+                    + "\n\n===== ROTATED DRAWING OCR RESCUE =====\n"
+                    + rescue_markdown
+                ).strip()
+                rescued_pages.append(page_number)
+                messages.append(
+                    f"PDF page {page_number}: rotated drawing OCR recovered the "
+                    "Article No. spare-parts table and Alfa Laval title block."
+                )
+            else:
+                messages.append(
+                    f"PDF page {page_number}: rotated drawing OCR was attempted but "
+                    "did not expose a genuine Article No. table, so the original OCR was kept."
+                )
+        except Exception as exc:
+            messages.append(
+                f"PDF page {page_number}: rotated drawing OCR rescue was unavailable; "
+                f"the original OCR was kept. Details: {_safe_api_error_text(exc, api_key)}"
+            )
+        if progress:
+            progress(
+                index,
+                total,
+                f"Rotated drawing OCR rescue {index}/{total} complete",
+            )
+
+    rebuilt = [
+        (int(page), updated.get(int(page), clean_markdown(markdown)))
+        for page, markdown in extracted_pages
+    ]
+    return rebuilt, messages, rescued_pages
+
+
 # ---------------------------------------------------------------------------
 # Local page classification / pre-filtering
 # ---------------------------------------------------------------------------
