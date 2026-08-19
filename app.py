@@ -79,7 +79,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.13.1"
+APP_VERSION = "4.13.2"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -643,6 +643,7 @@ def initialize_state() -> None:
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
         "document_profile": {},
+        "model_run_status": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "selected_vessels": [],
@@ -707,6 +708,7 @@ JOB_STATE_FIELDS = [
     "page_classification",
     "extraction_log",
     "document_profile",
+    "model_run_status",
     "spare_review",
     "submachinery_review",
     "selected_vessels",
@@ -759,6 +761,7 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
         "document_profile": {},
+        "model_run_status": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "selected_vessels": [],
@@ -1853,6 +1856,7 @@ with st.expander("⚙️ Processing & export settings", expanded=False):
             st.session_state.page_classification = pd.DataFrame()
             st.session_state.extraction_log = []
             st.session_state.document_profile = {}
+            st.session_state.model_run_status = {}
             st.session_state.spare_review = empty_review_dataframe()
             st.session_state.submachinery_review = empty_submachinery_review_dataframe()
             st.session_state.output = None
@@ -2982,6 +2986,11 @@ if active_workflow_step == "2. OCR":
                     extraction_messages: list[str] = []
                     profile_messages: list[str] = []
                     document_profile: dict = {}
+                    st.session_state.model_run_status = {
+                        "Row extraction": {"provider": "Mistral", "model": extraction_model.strip() or "mistral-small-latest", "status": "Pending" if structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
+                        "Document analysis": {"provider": "Mistral", "model": analysis_model.strip() or "mistral-large-2512", "status": "Pending" if adaptive_analysis and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
+                        "Independent verification": {"provider": "OpenAI", "model": openai_model.strip() or "gpt-5.6-terra", "status": "Pending" if openai_verification and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
+                    }
                     if (
                         adaptive_analysis
                         and structure_mode == "AI JSON extraction (recommended)"
@@ -3000,6 +3009,8 @@ if active_workflow_step == "2. OCR":
                                 )
                             )
                             extraction_messages.extend(profile_messages)
+                            st.session_state.model_run_status["Document analysis"]["status"] = "Completed"
+                            st.session_state.model_run_status["Document analysis"]["detail"] = f"Profile confidence {float(document_profile.get('confidence', 0.0)):.0%}"
                             if float(document_profile.get("confidence", 0.0)) < 0.60:
                                 extraction_messages.append(
                                     "Adaptive document analysis reported low confidence. "
@@ -3007,6 +3018,8 @@ if active_workflow_step == "2. OCR":
                                     "validation/review controls remain active."
                                 )
                         except Exception as profile_error:
+                            st.session_state.model_run_status["Document analysis"]["status"] = "Unavailable - bypassed"
+                            st.session_state.model_run_status["Document analysis"]["detail"] = str(profile_error)[:240]
                             previous_profile = st.session_state.get(
                                 "document_profile", {}
                             )
@@ -3039,6 +3052,12 @@ if active_workflow_step == "2. OCR":
                             )
                         )
                         extraction_messages.extend(openai_messages)
+                        if bool(document_profile.get("openai_verified")):
+                            st.session_state.model_run_status["Independent verification"]["status"] = "Completed"
+                            st.session_state.model_run_status["Independent verification"]["detail"] = "Structured document-profile verification returned successfully."
+                        else:
+                            st.session_state.model_run_status["Independent verification"]["status"] = "Skipped / unavailable"
+                            st.session_state.model_run_status["Independent verification"]["detail"] = openai_messages[-1][:240] if openai_messages else "No verification result returned."
                     if structure_mode == "AI JSON extraction (recommended)":
                         extraction_kwargs = {
                             "api_key": api_key,
@@ -3068,6 +3087,8 @@ if active_workflow_step == "2. OCR":
                             **extraction_kwargs,
                         )
                         extraction_messages.extend(row_extraction_messages)
+                        st.session_state.model_run_status["Row extraction"]["status"] = "Completed"
+                        st.session_state.model_run_status["Row extraction"]["detail"] = f"Returned {len(ai_rows)} AI row(s) before deterministic/source reconciliation."
                         extraction_messages = list(dict.fromkeys(extraction_messages))
                     else:
                         ai_rows = []
@@ -3327,6 +3348,18 @@ if active_workflow_step == "2. OCR":
                         )
                     with st.popover("View complete analysis profile"):
                         st.json(saved_profile)
+
+            run_status = st.session_state.get("model_run_status", {})
+            if isinstance(run_status, dict) and run_status:
+                with st.expander("AI model run status", expanded=False):
+                    status_rows = [
+                        {"ROLE": role, "PROVIDER": value.get("provider", ""), "MODEL": value.get("model", ""), "STATUS": value.get("status", ""), "DETAIL": value.get("detail", "")}
+                        for role, value in run_status.items() if isinstance(value, dict)
+                    ]
+                    if status_rows:
+                        status_frame = pd.DataFrame(status_rows)
+                        st.dataframe(status_frame, use_container_width=True, hide_index=True, column_config=_auto_dataframe_config(status_frame, maximums={"ROLE": 220, "PROVIDER": 120, "MODEL": 220, "STATUS": 190, "DETAIL": 520}))
+                        st.caption("Completed means that the model returned a usable response in this document run. Skipped/unavailable means the fail-open path continued without blocking Mistral OCR/extraction.")
 
             with st.expander("OCR details and raw output", expanded=False):
                 st.caption(
