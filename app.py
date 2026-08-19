@@ -79,7 +79,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.13.2"
+APP_VERSION = "4.13.3"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -823,10 +823,77 @@ def load_document_job(job_id: str) -> None:
     st.session_state.active_document_id = job_id
 
 
+STEP1_DRAFT_FIELDS = (
+    "selected_vessels",
+    "additional_vessels_text",
+    "main_code",
+    "main_name",
+    "main_maker",
+    "main_model",
+    "main_type",
+    "main_instruction_book",
+    "main_specifications",
+)
+
+
+def _capture_unattached_step1_draft() -> dict[str, object]:
+    """Capture Step 1 values entered before the first PDF is uploaded.
+
+    Streamlit reruns immediately when a file is uploaded. Previously, the newly
+    created document job started with blank machinery/vessel fields and then
+    replaced the user's already-entered Step 1 values. This draft is used only
+    when there are no existing PDF jobs and no loaded document, so adding a later
+    PDF cannot accidentally copy machinery data from the currently active job.
+    """
+    if st.session_state.get("document_jobs") or st.session_state.get("loaded_job_id"):
+        return {}
+
+    draft: dict[str, object] = {}
+    for field in STEP1_DRAFT_FIELDS:
+        if field in st.session_state:
+            draft[field] = _clone_state_value(st.session_state[field])
+    return draft
+
+
+def _seed_job_from_step1_draft(
+    job: dict,
+    draft: dict[str, object],
+    file_name: str,
+) -> dict:
+    """Apply a pre-upload Step 1 draft to the first newly created PDF job."""
+    if not draft:
+        return job
+
+    seeded = dict(job)
+    for field in STEP1_DRAFT_FIELDS:
+        if field not in draft:
+            continue
+        value = _clone_state_value(draft[field])
+        if field == "main_instruction_book":
+            # Keep the automatic PDF filename when the user had left INSTR.BOOK
+            # blank. If the user explicitly entered a value, preserve it exactly.
+            if str(value or "").strip():
+                seeded[field] = value
+                seeded["auto_instruction_book_source"] = ""
+            else:
+                seeded[field] = file_name
+                seeded["auto_instruction_book_source"] = file_name
+            continue
+        seeded[field] = value
+    return seeded
+
+
 def register_uploaded_pdfs(uploaded_files) -> None:
     if not uploaded_files:
         return
+
     jobs = st.session_state.get("document_jobs", {})
+    # Snapshot any vessel/machinery details entered in Step 1 before the very
+    # first PDF exists. Only the first newly created job inherits this draft.
+    # Additional PDFs remain independent and therefore start with clean fields.
+    preupload_draft = _capture_unattached_step1_draft() if not jobs else {}
+    draft_seeded = False
+
     for uploaded in uploaded_files:
         data = uploaded.getvalue()
         file_hash = hashlib.sha256(data).hexdigest()
@@ -836,12 +903,20 @@ def register_uploaded_pdfs(uploaded_files) -> None:
         if not pdf_path.exists():
             pdf_path.write_bytes(data)
         if job_id not in jobs:
-            jobs[job_id] = _empty_job_state(
+            new_job = _empty_job_state(
                 file_name=uploaded.name,
                 pdf_path=str(pdf_path),
                 file_hash=file_hash,
                 size_bytes=len(data),
             )
+            if preupload_draft and not draft_seeded:
+                new_job = _seed_job_from_step1_draft(
+                    new_job,
+                    preupload_draft,
+                    uploaded.name,
+                )
+                draft_seeded = True
+            jobs[job_id] = new_job
         else:
             jobs[job_id]["file_name"] = uploaded.name
             jobs[job_id]["pdf_path"] = str(pdf_path)
@@ -2406,6 +2481,12 @@ if active_workflow_step == "1. Machinery":
         active_job = active_document_job()
         if active_job:
             st.caption(f"Active document: **{active_job['file_name']}**")
+        elif input_type == "PDF":
+            st.info(
+                "You can complete Step 1 before uploading the PDF. When the first PDF "
+                "is uploaded, these vessel and machinery values are carried into that "
+                "document automatically, so you do not need to enter them again."
+            )
         st.subheader("Step 1 — Vessel assignment")
         st.multiselect(
             "Vessel(s) *",
