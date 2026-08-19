@@ -52,7 +52,7 @@ from tools import (
     pdf_page_count,
     prepare_benefit_rows,
     recalculate_review_status,
-    recover_rotated_alfa_laval_drawing_pages,
+    recover_rotated_engineering_drawing_pages,
     rows_to_review_dataframe,
     select_spare_table_pages,
     safe_filename,
@@ -80,7 +80,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.13.4"
+APP_VERSION = "4.14.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -3066,11 +3066,10 @@ if active_workflow_step == "2. OCR":
                     rotated_rescue_messages: list[str] = []
                     rotated_rescued_pages: list[int] = []
                     if input_type == "PDF" and source_file is not None:
-                        # First identify likely table pages from the normal OCR. Alfa Laval
-                        # A3 drawings are sometimes embedded 90 degrees inside portrait
-                        # manual pages, causing the first pass to see the construction table
-                        # but miss the Article No. ordering table. Retry only those strong
-                        # drawing candidates after rotating the source PDF page clockwise.
+                        # First identify likely table pages from the normal OCR. Engineering
+                        # drawings can be embedded sideways inside portrait manual pages,
+                        # causing the first pass to see only part of the drawing or the wrong
+                        # table. Retry only strong candidates at alternate orientations.
                         pre_candidate_pages, _ = classify_ocr_pages(
                             extracted_pages,
                             mode=page_filter_mode,
@@ -3080,7 +3079,7 @@ if active_workflow_step == "2. OCR":
                             fallback_pages=pre_candidate_pages,
                         )
                         extracted_pages, rotated_rescue_messages, rotated_rescued_pages = (
-                            recover_rotated_alfa_laval_drawing_pages(
+                            recover_rotated_engineering_drawing_pages(
                                 api_key=api_key,
                                 pdf_bytes=pdf_bytes,
                                 extracted_pages=extracted_pages,
@@ -3116,14 +3115,14 @@ if active_workflow_step == "2. OCR":
                     document_profile: dict = {}
                     st.session_state.model_run_status = {
                         "OCR": {"provider": "Mistral", "model": "mistral-ocr-latest", "status": "Completed", "detail": f"Processed {len(extracted_pages)} PDF/image page(s)."},
-                        "Rotated drawing OCR rescue": {
+                        "Drawing orientation OCR rescue": {
                             "provider": "Mistral",
                             "model": "mistral-ocr-latest",
                             "status": "Completed" if rotated_rescued_pages else ("Attempted - no Article table found" if rotated_rescue_messages else "Not needed"),
                             "detail": (
-                                f"Recovered Article No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}."
+                                f"Recovered orderable Article No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}."
                                 if rotated_rescued_pages
-                                else (rotated_rescue_messages[-1] if rotated_rescue_messages else "No strongly rotated Alfa Laval drawing candidate required a second OCR pass.")
+                                else (rotated_rescue_messages[-1] if rotated_rescue_messages else "No engineering drawing showed enough evidence to require an alternate-orientation OCR pass.")
                             ),
                         },
                         "Row extraction": {"provider": "Mistral", "model": extraction_model.strip() or "mistral-small-latest", "status": "Pending" if structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
@@ -3270,11 +3269,22 @@ if active_workflow_step == "2. OCR":
                     )
                     extraction_messages.extend(automation_messages)
 
+                    if rows and structure_mode == "AI JSON extraction (recommended)" and not ai_rows:
+                        st.session_state.model_run_status["Row extraction"]["status"] = "Completed + deterministic recovery"
+                        st.session_state.model_run_status["Row extraction"]["detail"] = (
+                            f"The AI pass returned 0 row(s), but source/table reconciliation recovered {len(rows)} row(s)."
+                        )
+
                     if not rows:
                         rows = extract_spare_parts_from_markdown_tables(structure_pages)
                         extraction_messages.append(
                             "The deterministic local parser was used because no structured rows were returned."
                         )
+                        if rows and structure_mode == "AI JSON extraction (recommended)":
+                            st.session_state.model_run_status["Row extraction"]["status"] = "Completed + local table recovery"
+                            st.session_state.model_run_status["Row extraction"]["detail"] = (
+                                f"The AI pass returned 0 row(s), but the local table parser recovered {len(rows)} row(s)."
+                            )
 
                     # Mandatory second pass: isolate the printed English phrase when OCR
                     # flattened German/English/French together; otherwise translate the
