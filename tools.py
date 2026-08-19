@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.13.2"
+TOOLS_VERSION = "4.14.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -539,38 +539,69 @@ def clean_markdown(value: Any) -> str:
     return text.replace("\x00", "").strip()
 
 
-def _rotated_alfa_laval_drawing_candidate(markdown: Any, source_text: Any = "") -> bool:
-    """Return True when an Alfa Laval drawing is likely rotated inside the PDF page.
+def _engineering_drawing_rotation_candidate(markdown: Any, source_text: Any = "") -> bool:
+    """Return True when OCR likely saw only part of a rotated engineering drawing.
 
-    A common PureBallast layout places the complete engineering drawing 90 degrees
-    clockwise inside a portrait manual page. The normal OCR pass can then read the
-    small Pos./Designation/Composition table while missing the orderable Article No.
-    table and title block. Only pages with strong drawing evidence are retried.
+    This is manufacturer-agnostic. It looks for evidence of an engineering title block,
+    drawing/section context, or a non-orderable construction table while a genuine
+    orderable-parts header is still absent. Only such pages are eligible for the
+    additional orientation OCR pass.
     """
     combined = clean_text(f"{markdown}\n{source_text}").lower()
     compact = re.sub(r"[^a-z0-9]+", "", combined)
     if not combined:
         return False
-    if "articleno" in compact and "namedesignation" in compact:
+    if _is_engineering_article_table(markdown):
         return False
-    drawing_context = (
-        "dimension drawings including technical data" in combined
-        or ("drawings" in combined and bool(re.search(r"\b\d+\.\d+\.\d+\b", combined)))
+
+    drawing_context = bool(
+        re.search(r"\b(?:drawing|drawings|dimension|technical data|assembly|sheet)\b", combined)
+        or re.search(r"\b\d+\.\d+(?:\.\d+)+\b", combined)
     )
-    construction_table = (
+    construction_table = bool(
         "composition" in combined
         and "designation" in combined
-        and bool(re.search(r"\bpos\.?\b", combined))
+        and re.search(r"\bpos\.?\b", combined)
     )
     title_block_hint = any(
         token in compact
-        for token in ("documentno", "responsibledepartment", "noofsheets", "revisionno")
+        for token in (
+            "documentno", "documentnumber", "drawingno", "drawingnumber",
+            "dwgno", "responsibledepartment", "noofsheets", "revisionno",
+            "sheetno", "creator", "approved", "title",
+        )
     )
-    document_number = bool(re.search(r"(?<!\d)\d{7,9}(?!\d)", combined))
-    return bool(document_number and drawing_context and (construction_table or title_block_hint))
+    document_number = bool(re.search(r"(?<!\d)\d{6,10}(?!\d)", combined))
+    return bool(document_number and (title_block_hint or drawing_context) and (construction_table or title_block_hint))
 
 
-def recover_rotated_alfa_laval_drawing_pages(
+def _orientation_table_evidence(markdown: Any) -> int:
+    """Score an OCR orientation by orderable-table and title-block evidence."""
+    text = clean_text(markdown).lower()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    score = 0
+    signals = {
+        "articleno": 8,
+        "articlenumber": 8,
+        "namedesignation": 7,
+        "partname": 6,
+        "materialblank": 3,
+        "documentno": 4,
+        "drawingno": 4,
+        "purchasedarticle": 4,
+        "quantity": 2,
+        "qty": 2,
+    }
+    for token, weight in signals.items():
+        if token in compact:
+            score += weight
+    score += min(12, len(re.findall(r"(?m)^\s*\d{6,10}(?:\s+[A-Z0-9]{1,4})?\b", str(markdown or ""))))
+    if _is_engineering_article_table(markdown):
+        score += 20
+    return score
+
+
+def recover_rotated_engineering_drawing_pages(
     api_key: str,
     pdf_bytes: bytes,
     extracted_pages: Sequence[tuple[int, str]],
@@ -578,12 +609,12 @@ def recover_rotated_alfa_laval_drawing_pages(
     progress: ProgressCallback | None = None,
     max_pages: int = 12,
 ) -> tuple[list[tuple[int, str]], list[str], list[int]]:
-    """Retry likely rotated Alfa Laval drawings after rotating the PDF page 90°.
+    """Retry likely rotated engineering drawings using alternate page orientations.
 
-    The returned OCR markdown keeps the original page number and combines the normal
-    OCR with the rotated rescue text. A rescue is accepted only when it reveals the
-    genuine Article No. / Name/Designation drawing-table pattern, preventing generic
-    engineering drawings from being promoted to spare-parts pages.
+    The recovery is generic: a candidate page is tried at 90, 270, then 180 degrees.
+    The best result is accepted only when it exposes a coherent orderable-parts table
+    with stronger structural evidence than the original OCR. Original page numbering
+    is retained and the rescue text is appended for downstream reconciliation.
     """
     reader = PdfReader(io.BytesIO(pdf_bytes))
     original_lookup = {int(page): clean_markdown(markdown) for page, markdown in extracted_pages}
@@ -601,9 +632,7 @@ def recover_rotated_alfa_laval_drawing_pages(
             source_text = reader.pages[page_number - 1].extract_text() or ""
         except Exception:
             source_text = ""
-        if _rotated_alfa_laval_drawing_candidate(
-            original_lookup[page_number], source_text
-        ):
+        if _engineering_drawing_rotation_candidate(original_lookup[page_number], source_text):
             candidates.append(page_number)
         if len(candidates) >= max(1, int(max_pages)):
             break
@@ -618,66 +647,60 @@ def recover_rotated_alfa_laval_drawing_pages(
 
     for index, page_number in enumerate(candidates, start=1):
         if progress:
-            progress(
-                index - 1,
-                total,
-                f"Rotated drawing OCR rescue {index}/{total} (PDF page {page_number})",
-            )
+            progress(index - 1, total, f"Drawing orientation OCR rescue {index}/{total} (PDF page {page_number})")
+        original_score = _orientation_table_evidence(original_lookup[page_number])
+        best_markdown = ""
+        best_rotation = 0
+        best_score = original_score
         try:
-            # Use a fresh reader so page.rotate() cannot affect subsequent candidates.
-            page_reader = PdfReader(io.BytesIO(pdf_bytes))
-            page = page_reader.pages[page_number - 1]
-            page.rotate(90)  # clockwise: makes the embedded Alfa Laval A3 drawing upright
-            writer = PdfWriter()
-            writer.add_page(page)
-            buffer = io.BytesIO()
-            writer.write(buffer)
-            response = _mistral_ocr_request(
-                api_key=api_key,
-                document={
-                    "type": "document_url",
-                    "document_url": _pdf_data_url(buffer.getvalue()),
-                },
-            )
-            response_pages = _response_pages(response)
-            rescue_markdown = (
-                clean_markdown(response_pages[0].get("markdown", ""))
-                if response_pages
-                else ""
-            )
-            if rescue_markdown and _is_alfa_laval_article_drawing(rescue_markdown):
+            for rotation in (90, 270, 180):
+                page_reader = PdfReader(io.BytesIO(pdf_bytes))
+                page = page_reader.pages[page_number - 1]
+                page.rotate(rotation)
+                writer = PdfWriter()
+                writer.add_page(page)
+                buffer = io.BytesIO()
+                writer.write(buffer)
+                response = _mistral_ocr_request(
+                    api_key=api_key,
+                    document={"type": "document_url", "document_url": _pdf_data_url(buffer.getvalue())},
+                )
+                response_pages = _response_pages(response)
+                rescue_markdown = clean_markdown(response_pages[0].get("markdown", "")) if response_pages else ""
+                score = _orientation_table_evidence(rescue_markdown)
+                if score > best_score:
+                    best_markdown, best_rotation, best_score = rescue_markdown, rotation, score
+                if rescue_markdown and _is_engineering_article_table(rescue_markdown):
+                    best_markdown, best_rotation, best_score = rescue_markdown, rotation, score
+                    break
+
+            if best_markdown and _is_engineering_article_table(best_markdown) and best_score > original_score:
                 updated[page_number] = (
                     original_lookup[page_number]
-                    + "\n\n===== ROTATED DRAWING OCR RESCUE =====\n"
-                    + rescue_markdown
+                    + f"\n\n===== ORIENTATION OCR RESCUE {best_rotation} DEG =====\n"
+                    + best_markdown
                 ).strip()
                 rescued_pages.append(page_number)
                 messages.append(
-                    f"PDF page {page_number}: rotated drawing OCR recovered the "
-                    "Article No. spare-parts table and Alfa Laval title block."
+                    f"PDF page {page_number}: orientation OCR recovered an orderable Article No./Name-Designation table at {best_rotation} degrees."
                 )
             else:
                 messages.append(
-                    f"PDF page {page_number}: rotated drawing OCR was attempted but "
-                    "did not expose a genuine Article No. table, so the original OCR was kept."
+                    f"PDF page {page_number}: alternate-orientation OCR was attempted but did not reveal a stronger orderable-parts table, so the original OCR was kept."
                 )
         except Exception as exc:
             messages.append(
-                f"PDF page {page_number}: rotated drawing OCR rescue was unavailable; "
-                f"the original OCR was kept. Details: {_safe_api_error_text(exc, api_key)}"
+                f"PDF page {page_number}: alternate-orientation OCR rescue was unavailable; the original OCR was kept. Details: {_safe_api_error_text(exc, api_key)}"
             )
         if progress:
-            progress(
-                index,
-                total,
-                f"Rotated drawing OCR rescue {index}/{total} complete",
-            )
+            progress(index, total, f"Drawing orientation OCR rescue {index}/{total} complete")
 
-    rebuilt = [
-        (int(page), updated.get(int(page), clean_markdown(markdown)))
-        for page, markdown in extracted_pages
-    ]
+    rebuilt = [(int(page), updated.get(int(page), clean_markdown(markdown))) for page, markdown in extracted_pages]
     return rebuilt, messages, rescued_pages
+
+
+# Backward-compatible alias for deployments that still import the older helper name.
+recover_rotated_alfa_laval_drawing_pages = recover_rotated_engineering_drawing_pages
 
 
 # ---------------------------------------------------------------------------
@@ -852,7 +875,8 @@ def classify_ocr_pages(
 
 
 MULTILINGUAL_ORDER_CATALOG_PROFILE = "multilingual_order_catalog"
-ALFA_LAVAL_ARTICLE_DRAWING_PROFILE = "alfa_laval_article_drawing"
+ENGINEERING_ARTICLE_DRAWING_PROFILE = "engineering_article_drawing"
+ALFA_LAVAL_ARTICLE_DRAWING_PROFILE = ENGINEERING_ARTICLE_DRAWING_PROFILE  # compatibility alias
 
 
 def _is_multilingual_order_catalog(markdown: Any) -> bool:
@@ -895,28 +919,42 @@ def _is_multilingual_order_catalog(markdown: Any) -> bool:
     return bool(order_signal and multilingual_signal and layout_signal)
 
 
-def _is_alfa_laval_article_drawing(markdown: Any) -> bool:
-    """Recognize Alfa Laval drawing sheets with an orderable Article No. table."""
+def _is_engineering_article_table(markdown: Any) -> bool:
+    """Recognize an orderable engineering-drawing table by semantic headers.
+
+    The detector is manufacturer-neutral. It requires an Article Number style
+    identifier plus a name/designation field and at least one additional drawing-
+    table/title-block signal so ordinary prose containing those words is ignored.
+    """
     text = clean_text(markdown).lower()
     compact = re.sub(r"[^a-z0-9]+", "", text)
-    article_signal = "articleno" in compact or "articlenumber" in compact
+    article_signal = any(token in compact for token in ("articleno", "articlenumber", "articlenr"))
     name_signal = "namedesignation" in compact or ("name" in text and "designation" in text)
     drawing_signal = any(
         token in compact
-        for token in ("materialblank", "artrev", "documentno", "purchasedarticle")
+        for token in (
+            "materialblank", "artrev", "documentno", "documentnumber",
+            "drawingno", "drawingnumber", "dwgno", "purchasedarticle",
+            "sheetno", "revisionno",
+        )
     )
     return bool(article_signal and name_signal and drawing_signal)
+
+
+# Backward-compatible internal alias. New logic is intentionally manufacturer-neutral.
+def _is_alfa_laval_article_drawing(markdown: Any) -> bool:
+    return _is_engineering_article_table(markdown)
 
 
 def _document_extraction_profile(
     extracted_pages: Sequence[tuple[int, str]],
 ) -> str:
-    # Alfa Laval orderable drawing sheets can appear hundreds of pages into a
+    # Orderable engineering-drawing tables can appear hundreds of pages into a
     # compiled system manual, so scan page-by-page instead of sampling only the
     # beginning of the document. This is local string inspection and adds no API cost.
     for _, markdown in extracted_pages:
-        if _is_alfa_laval_article_drawing(markdown):
-            return ALFA_LAVAL_ARTICLE_DRAWING_PROFILE
+        if _is_engineering_article_table(markdown):
+            return ENGINEERING_ARTICLE_DRAWING_PROFILE
     sample = "\n".join(str(markdown or "") for _, markdown in extracted_pages[:20])
     if _is_multilingual_order_catalog(sample):
         return MULTILINGUAL_ORDER_CATALOG_PROFILE
@@ -924,13 +962,13 @@ def _document_extraction_profile(
 
 
 def _profile_prompt(profile: str) -> str:
-    if profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE:
+    if profile == ENGINEERING_ARTICLE_DRAWING_PROFILE:
         return """
-AUTOMATIC LAYOUT PROFILE - ALFA LAVAL DRAWING TITLE BLOCK + ARTICLE TABLE:
+AUTOMATIC LAYOUT PROFILE - ENGINEERING DRAWING TITLE BLOCK + ARTICLE TABLE:
 - A page is a spare-parts source when it contains Article No. / Art. Rev. /
   Name/Designation / Material/Blank / Note.
-- The drawing title block is authoritative for the sub-machinery: Document No. is
-  section_code and Title is section_name_english. Example: Document No. 9007280
+- A drawing title block can be authoritative for the sub-machinery: Document No./Drawing No. is
+  section_code and Title/Assembly is section_name_english when both are clearly paired. Example: Document No. 9007280
   and Title Cable means section_code="9007280", section_name_english="CABLE".
 - Article No. is the genuine spare identifier and populates ident_no, therefore both
   PART NO and CODE. Preserve printed spaces and leading zeroes.
@@ -1910,9 +1948,9 @@ def extract_spare_parts_with_ai(
     catalog_hint = _catalog_prompt_hint(
         build_section_catalog(extracted_pages).get("sections", [])
     )
-    if extraction_profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE:
+    if extraction_profile == ENGINEERING_ARTICLE_DRAWING_PROFILE:
         messages.append(
-            "Automatically detected an Alfa Laval drawing title-block Article No. catalogue. "
+            "Automatically detected an engineering drawing title-block Article No. catalogue. "
             "Document No./Title define the sub-machinery and only Article No. rows are treated as spares."
         )
     if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE:
@@ -2462,21 +2500,108 @@ def _is_markdown_separator(line: str) -> bool:
     return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
 
 
+def _html_table_blocks(markdown: str) -> list[list[list[str]]]:
+    """Parse simple HTML tables sometimes emitted by OCR instead of Markdown."""
+    raw = str(markdown or "")
+    blocks: list[list[list[str]]] = []
+    for table_html in re.findall(r"<table\b[^>]*>(.*?)</table>", raw, flags=re.I | re.S):
+        rows: list[list[str]] = []
+        for row_html in re.findall(r"<tr\b[^>]*>(.*?)</tr>", table_html, flags=re.I | re.S):
+            cells = re.findall(r"<(?:th|td)\b[^>]*>(.*?)</(?:th|td)>", row_html, flags=re.I | re.S)
+            if cells:
+                cleaned = [
+                    _clean_markdown_cell(re.sub(r"<[^>]+>", " ", cell))
+                    for cell in cells
+                ]
+                if any(cleaned):
+                    rows.append(cleaned)
+        if len(rows) >= 2:
+            blocks.append(rows)
+    return blocks
+
+
 def _markdown_table_blocks(markdown: str) -> list[list[list[str]]]:
+    """Return tabular blocks from strict Markdown, loose pipe tables, or HTML.
+
+    OCR engines are inconsistent about emitting the Markdown separator row. The
+    parser therefore accepts a loose pipe table when the first row looks like a
+    semantic technical-table header and at least one following row has a similar
+    number of cells. This improves coverage without making any manufacturer-specific
+    assumptions.
+    """
     lines = str(markdown or "").splitlines()
     blocks: list[list[list[str]]] = []
+    consumed: set[int] = set()
     index = 0
     while index + 1 < len(lines):
         if "|" in lines[index] and _is_markdown_separator(lines[index + 1]):
             block = [_split_markdown_row(lines[index])]
+            consumed.update({index, index + 1})
             index += 2
             while index < len(lines) and "|" in lines[index]:
-                block.append(_split_markdown_row(lines[index]))
+                if not _is_markdown_separator(lines[index]):
+                    block.append(_split_markdown_row(lines[index]))
+                consumed.add(index)
                 index += 1
-            blocks.append(block)
+            if len(block) >= 2:
+                blocks.append(block)
         else:
             index += 1
+
+    # Loose pipe tables without the usual |---|---| separator.
+    index = 0
+    while index < len(lines):
+        if index in consumed or lines[index].count("|") < 2:
+            index += 1
+            continue
+        start = index
+        raw_rows: list[list[str]] = []
+        while index < len(lines) and lines[index].count("|") >= 2:
+            if index not in consumed and not _is_markdown_separator(lines[index]):
+                raw_rows.append(_split_markdown_row(lines[index]))
+            index += 1
+        if len(raw_rows) < 2:
+            continue
+        first_joined = " ".join(clean_text(value).lower() for value in raw_rows[0])
+        header_signal = any(
+            token in first_joined
+            for token in (
+                "article no", "article number", "ident", "order-no", "order no",
+                "part no", "part-no", "ref. no", "ref no", "item no", "position",
+                "description", "designation", "part name", "quantity", "qty",
+                "material/blank", "composition",
+            )
+        )
+        if header_signal:
+            blocks.append(raw_rows)
+            consumed.update(range(start, index))
+
+    blocks.extend(_html_table_blocks(markdown))
     return blocks
+
+
+def _semantic_table_role(headers: Sequence[str]) -> str:
+    """Classify a table before extracting rows from it."""
+    keys = [re.sub(r"[^a-z0-9]+", "", clean_text(value).lower()) for value in headers]
+    mapped = [_canonical_source_header(value) for value in headers]
+    has_identifier = "ident_no" in mapped or "source_part_no" in mapped
+    has_description = "description_raw" in mapped
+    has_quantity = "quantity" in mapped
+    composition = any("composition" in key for key in keys)
+    material_blank = any(key in {"materialblank", "material", "blank"} for key in keys)
+    revision = any(key in {"revision", "revisionno", "rev", "artrev"} for key in keys)
+
+    if composition and not has_identifier:
+        return "MATERIAL_COMPOSITION"
+    if has_identifier and has_description:
+        return "SPARE_PARTS"
+    if revision and not has_identifier:
+        return "REVISION"
+    if material_blank and not has_identifier:
+        return "TECHNICAL_DATA"
+    if has_quantity and has_description and not has_identifier:
+        return "SPECIFICATION"
+    return "UNKNOWN"
 
 
 def _canonical_source_header(header: str) -> str | None:
@@ -3178,9 +3303,15 @@ def _page_header_text(markdown: str, max_lines: int = 28) -> str:
     return "\n".join(dict.fromkeys(clean_text(value) for value in candidates if clean_text(value)))
 
 
-def _alfa_laval_title_block_metadata(markdown: str) -> dict[str, str]:
-    """Extract Title and Document No. from an Alfa Laval Article No. drawing page."""
-    if not _is_alfa_laval_article_drawing(markdown):
+def _engineering_title_block_metadata(markdown: str) -> dict[str, str]:
+    """Extract an assembly title and drawing/document number from a title block.
+
+    The detector is manufacturer-neutral and only activates on pages that also
+    contain a coherent orderable Article-No./Name-Designation table. This prevents
+    chapter numbers, revisions, dates, and ordinary drawing callouts from becoming
+    sub-machinery identifiers.
+    """
+    if not _is_engineering_article_table(markdown):
         return {}
     document_no = ""
     title = ""
@@ -3188,26 +3319,34 @@ def _alfa_laval_title_block_metadata(markdown: str) -> dict[str, str]:
     def _value(v: Any) -> str:
         return clean_text(v).strip(" :;|-")
 
+    code_labels = {
+        "documentno", "documentnumber", "docno",
+        "drawingno", "drawingnumber", "dwgno", "dwgnumber",
+    }
+    title_labels = {"title", "assembly", "equipment", "drawingtitle"}
+    excluded_titles = {
+        "TITLE", "ASSEMBLY", "EQUIPMENT", "DRAWINGTITLE",
+        "DOCUMENTNO", "DOCUMENTNUMBER", "DRAWINGNO", "DRAWINGNUMBER",
+        "SHEET", "SHEETNO", "NOOFSHEETS", "REVISION", "REVISIONNO",
+        "RESPONSIBLEDEPARTMENT", "CREATOR", "APPROVED", "PURCHASEDARTICLE",
+    }
+
     for block in _markdown_table_blocks(markdown):
         for row in block:
             cells = [_value(cell) for cell in row]
             for i, cell in enumerate(cells):
                 key = re.sub(r"[^a-z0-9]+", "", cell.lower())
-                if key in {"documentno", "documentnumber", "docno"}:
+                if key in code_labels:
                     for candidate in cells[i + 1:] + cells[:i]:
                         compact = re.sub(r"\s+", "", candidate)
-                        if re.fullmatch(r"\d{6,10}", compact):
-                            document_no = compact
+                        if re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{4,19}", compact, flags=re.I) and re.search(r"\d", compact):
+                            document_no = compact.upper()
                             break
-                elif key == "title":
+                elif key in title_labels:
                     for candidate in cells[i + 1:] + cells[:i]:
                         candidate = _value(candidate)
-                        if re.search(r"[A-Za-z]", candidate) and len(candidate) <= 100:
-                            if normalize_key(candidate) not in {
-                                "TITLE", "DOCUMENTNO", "SHEET", "NOOFSHEETS",
-                                "REVISIONNO", "RESPONSIBLEDEPARTMENT", "CREATOR",
-                                "APPROVED", "PURCHASEDARTICLE",
-                            }:
+                        if re.search(r"[A-Za-z]", candidate) and 1 < len(candidate) <= 120:
+                            if normalize_key(candidate) not in excluded_titles:
                                 title = candidate
                                 break
             if document_no and title:
@@ -3217,32 +3356,44 @@ def _alfa_laval_title_block_metadata(markdown: str) -> dict[str, str]:
 
     raw = str(markdown or "")
     if not document_no:
-        m = re.search(r"Document\s*No\.?\s*[:|\-]?\s*(\d{6,10})", raw, flags=re.I)
-        if m:
-            document_no = m.group(1)
+        for pattern in (
+            r"(?:Document|Drawing|DWG)\s*(?:No\.?|Number)\s*[:|\-]?\s*([A-Z0-9][A-Z0-9._/ -]{4,24})",
+        ):
+            match = re.search(pattern, raw, flags=re.I)
+            if match:
+                candidate = re.sub(r"\s+", "", _value(match.group(1))).upper()
+                if re.search(r"\d", candidate):
+                    document_no = candidate
+                    break
     if not title:
         for pattern in (
-            r"(?:^|\n)\s*Title\s*[:|\-]?\s*([^\n|]{2,100})",
-            r"\|\s*Title\s*\|\s*([^|]{2,100})\|",
+            r"(?:^|\n)\s*(?:Title|Assembly|Equipment)\s*[:|\-]?\s*([^\n|]{2,120})",
+            r"\|\s*(?:Title|Assembly|Equipment)\s*\|\s*([^|]{2,120})\|",
         ):
-            m = re.search(pattern, raw, flags=re.I)
-            if m:
-                candidate = _value(m.group(1))
-                if re.search(r"[A-Za-z]", candidate):
+            match = re.search(pattern, raw, flags=re.I)
+            if match:
+                candidate = _value(match.group(1))
+                if re.search(r"[A-Za-z]", candidate) and normalize_key(candidate) not in excluded_titles:
                     title = candidate
                     break
     if not document_no:
-        candidates = re.findall(r"(?m)^\s*(\d{6,10})\s*$", raw)
-        if candidates:
-            document_no = candidates[-1]
+        candidates = re.findall(r"(?m)^\s*([A-Z0-9][A-Z0-9._/-]{5,19})\s*$", raw, flags=re.I)
+        numeric_like = [candidate for candidate in candidates if re.search(r"\d", candidate)]
+        if numeric_like:
+            document_no = numeric_like[-1].upper()
     if not document_no or not title:
         return {}
     return {
         "section_code": document_no,
         "section_name_raw": title,
         "section_name_english": title.upper(),
-        "section_code_source": "Alfa Laval drawing title block Document No.",
+        "section_code_source": "engineering drawing title block",
     }
+
+
+# Compatibility alias retained for previous app imports/tests.
+def _alfa_laval_title_block_metadata(markdown: str) -> dict[str, str]:
+    return _engineering_title_block_metadata(markdown)
 
 
 def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
@@ -3368,11 +3519,9 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
         # verified main-machinery maker/model are applied later as the fallback.
         metadata["maker"] = ""
         metadata["model"] = ""
-    drawing_title_block = _alfa_laval_title_block_metadata(markdown)
+    drawing_title_block = _engineering_title_block_metadata(markdown)
     if drawing_title_block:
         metadata.update(drawing_title_block)
-        if "alfa laval" in clean_text(markdown).lower():
-            metadata["maker"] = "ALFA LAVAL"
 
     if not metadata["model"] and not classic_catalog:
         model_match = re.search(
@@ -3383,6 +3532,7 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
         if model_match:
             metadata["model"] = clean_text(model_match.group(1)).upper()
     return metadata
+
 
 def _catalog_cell_lines(value: Any) -> list[str]:
     raw = _clean_markdown_cell(value)
@@ -3476,17 +3626,95 @@ def _classic_english_description_index(
     return description_indexes[0]
 
 
+def _plain_orderable_article_rows(
+    page_number: int,
+    markdown: str,
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Recover Article-No. rows when OCR emits aligned text instead of a table.
+
+    This fallback is semantic rather than manufacturer-specific. It activates only
+    when the page contains the Article No. + Name/Designation drawing-table pattern.
+    It intentionally ignores revision, material/classification, note/length, and
+    composition rows as import fields.
+    """
+    if not _is_engineering_article_table(markdown):
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    raw_lines = [line.rstrip() for line in str(markdown or "").splitlines()]
+    article_re = re.compile(r"^\s*([A-Z0-9][A-Z0-9._/-]{5,19}(?:\s+[A-Z0-9._/-]{1,5})?)\s*$", re.I)
+
+    def add(article: str, description: str) -> None:
+        ident = clean_text(article)
+        desc = clean_text(description)
+        key = normalize_key(ident)
+        if not ident or not desc or key in seen or not re.search(r"[A-Za-z]", desc):
+            return
+        if not re.search(r"\d", ident):
+            return
+        seen.add(key)
+        rows.append({
+            "source_page": int(page_number),
+            "section_code": clean_text(metadata.get("section_code", "")),
+            "section_name_english": clean_text(metadata.get("section_name_english", "")).upper(),
+            "section_maker": clean_text(metadata.get("maker", "")).upper(),
+            "section_model": clean_text(metadata.get("model", "")).upper(),
+            "table_title": clean_text(metadata.get("section_name_raw", "")),
+            "section_start_page": int(page_number),
+            "ident_no": ident,
+            "source_part_no": "",
+            "item_no": "",
+            "description_raw": desc,
+            "quantity": None,
+            "unit": "",
+            "confidence": 0.88,
+            "source_layout": "aligned text Article-No. table",
+        })
+
+    # Prefer column spacing preserved by OCR.
+    for line in raw_lines:
+        compact = re.sub(r"[^a-z0-9]+", "", line.lower())
+        if any(token in compact for token in ("articleno", "namedesignation", "materialblank", "artrev")):
+            continue
+        cells = [clean_text(cell) for cell in re.split(r"\t+|\s{2,}", line.strip()) if clean_text(cell)]
+        if len(cells) >= 3 and article_re.fullmatch(cells[0]):
+            # The second cell is commonly Art. Rev.; the third is Name/Designation.
+            description_index = 2 if len(cells) >= 3 and re.fullmatch(r"\d{1,4}", cells[1]) else 1
+            if description_index < len(cells):
+                add(cells[0], cells[description_index])
+
+    # Fallback for OCR that collapses the row to single spaces but retains a clear
+    # uppercase material/classification marker such as PURCHASED ARTICLE.
+    if not rows:
+        collapsed_re = re.compile(
+            r"^\s*(?P<article>[A-Z0-9][A-Z0-9._/-]{5,19}(?:\s+[A-Z0-9._/-]{1,5})?)"
+            r"\s+(?P<rev>\d{1,4})\s+(?P<name>.+?)\s+"
+            r"(?P<class>PURCHASED\s+ARTICLE|BOUGHT[- ]OUT\s+ITEM|STANDARD\s+ARTICLE)"
+            r"(?:\s+(?P<note>.*))?$",
+            re.I,
+        )
+        for line in raw_lines:
+            match = collapsed_re.match(line)
+            if match:
+                add(match.group("article"), match.group("name"))
+    return rows
+
+
 def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for page_number, markdown in extracted_pages:
         classic_catalog = _is_multilingual_order_catalog(markdown)
-        article_drawing = _is_alfa_laval_article_drawing(markdown)
+        article_drawing = _is_engineering_article_table(markdown)
         metadata = _page_metadata(int(page_number), markdown)
         for block in _markdown_table_blocks(markdown):
             header_index = _find_data_header_index(block)
             if header_index is None:
                 continue
             headers = block[header_index]
+            table_role = _semantic_table_role(headers)
+            if table_role == "MATERIAL_COMPOSITION":
+                continue
             if article_drawing:
                 header_keys = {
                     re.sub(r"[^a-z0-9]+", "", clean_text(header).lower())
@@ -3634,6 +3862,11 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                     ):
                         record["quantity"] = quantity_to_number(record.get("quantity"))
                         rows.append(record)
+
+        # OCR sometimes exposes the correct semantic headers but not a formal
+        # Markdown/HTML table. Recover aligned Article-No. rows deterministically.
+        if article_drawing and not any(int(row.get("source_page") or 0) == int(page_number) for row in rows):
+            rows.extend(_plain_orderable_article_rows(int(page_number), markdown, metadata))
     return rows
 
 def _index_sections(extracted_pages: Sequence[tuple[int, str]]) -> tuple[list[dict[str, Any]], set[int]]:
@@ -3705,7 +3938,7 @@ def _looks_like_spare_table_page(markdown: str) -> bool:
     reference_parts_layout = has_reference_no and (
         "part name" in text or "partname" in compact_text
     )
-    article_parts_layout = _is_alfa_laval_article_drawing(markdown)
+    article_parts_layout = _is_engineering_article_table(markdown)
     has_identifier = has_standard_identifier or reference_parts_layout or article_parts_layout
     has_quantity = any(token in text for token in ("qty", "quantity", "menge", "qnt"))
     illustrated_ref_list = (
@@ -3766,7 +3999,7 @@ def _illustrated_parts_series_sections(
 ) -> list[dict[str, Any]]:
     """Detect one equipment catalogue split across successive illustrated sheets.
 
-    Manuals such as Woodward 03036 alternate a parts-list page with an exploded
+    Some illustrated-parts manuals alternate a parts-list page with an exploded
     drawing page: Figure 6-1, 6-2, 6-3, etc. Those list pages are continuations of
     the same equipment and must not become separate sub-machineries merely because
     an illustration page occurs between them.
@@ -3989,9 +4222,6 @@ def build_section_catalog(
     allow_simple_section_codes = (
         extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
     )
-    allow_title_block_document_codes = (
-        extraction_profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE
-    )
     index_sections, index_pages = _index_sections(extracted_pages)
     global_maker, global_model = _global_manual_maker_model(extracted_pages)
     main_row = main_row or {}
@@ -4008,10 +4238,6 @@ def build_section_catalog(
                 if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text)
                 else []
             )
-        if allow_title_block_document_codes:
-            compact = re.sub(r"\s+", "", text)
-            if re.fullmatch(r"\d{6,10}", compact):
-                return [compact]
         return _section_code_tokens(value, permissive=True)
 
     def register(section: dict[str, Any], priority: int = 50) -> dict[str, Any]:
@@ -4124,7 +4350,11 @@ def build_section_catalog(
             if registered_headings:
                 page_heading_sections[page] = registered_headings
                 continue
-        code_tokens = catalog_code_tokens(metadata.get("section_code", ""))
+        if clean_text(metadata.get("section_code_source", "")) == "engineering drawing title block":
+            printed_code = clean_text(metadata.get("section_code", "")).upper()
+            code_tokens = [printed_code] if printed_code else []
+        else:
+            code_tokens = catalog_code_tokens(metadata.get("section_code", ""))
         if code_tokens:
             registered = register(
                 {
@@ -4148,7 +4378,14 @@ def build_section_catalog(
     # numeric value: that turns spare parts into false sub-machineries.  It may
     # enrich only a section that the source itself has already confirmed.
     for row in extracted_rows or []:
-        code_tokens = catalog_code_tokens(row.get("section_code", ""))
+        source_page_value = quantity_to_number(row.get("source_page"))
+        source_page = int(source_page_value) if source_page_value is not None else None
+        source_metadata = page_metadata.get(source_page, {}) if source_page is not None else {}
+        if clean_text(source_metadata.get("section_code_source", "")) == "engineering drawing title block":
+            printed_code = clean_text(source_metadata.get("section_code", "")).upper()
+            code_tokens = [printed_code] if printed_code else []
+        else:
+            code_tokens = catalog_code_tokens(row.get("section_code", ""))
         if not code_tokens:
             continue
         if allow_simple_section_codes:
@@ -4188,6 +4425,9 @@ def build_section_catalog(
         return result
 
     def sections_for_codes(value: Any) -> list[dict[str, Any]]:
+        direct = by_alias.get(normalize_key(value))
+        if direct is not None:
+            return [direct]
         return unique_sections(
             [
                 by_alias.get(normalize_key(token))
@@ -4518,9 +4758,6 @@ def prepare_benefit_rows(
     allow_simple_section_codes = (
         extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
     )
-    allow_title_block_document_codes = (
-        extraction_profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE
-    )
     page_markdown_lookup = {int(page): markdown for page, markdown in extracted_pages}
     normalized_ai: list[dict[str, Any]] = []
     rejected_ai_identifiers = 0
@@ -4532,13 +4769,13 @@ def prepare_benefit_rows(
         normalized = _normalized_ai_row(raw)
         source_page = normalized.get("source_page")
         page_markdown = page_markdown_lookup.get(int(source_page)) if source_page is not None else ""
-        if allow_title_block_document_codes and page_markdown and _is_alfa_laval_article_drawing(page_markdown):
-            title_block = _alfa_laval_title_block_metadata(page_markdown)
+        if page_markdown and _is_engineering_article_table(page_markdown):
+            title_block = _engineering_title_block_metadata(page_markdown)
             if title_block:
                 normalized["section_code"] = title_block["section_code"]
                 normalized["section_name_english"] = title_block["section_name_english"]
                 normalized["detected_machinery"] = title_block["section_name_english"]
-            # This OEM family has no drawing-position or quantity field in the
+            # This page pattern has no drawing-position or quantity field in the
             # Article No. table. Art. Rev. and Note lengths must never leak into them.
             normalized["item_no"] = ""
             normalized["quantity"] = None
@@ -4586,16 +4823,14 @@ def prepare_benefit_rows(
 
     def benefit_code_tokens(value: Any) -> list[str]:
         text = clean_text(value).upper().strip().rstrip(".")
+        if normalize_key(text) in by_alias:
+            return [text]
         if allow_simple_section_codes:
             return (
                 [text]
                 if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text)
                 else []
             )
-        if allow_title_block_document_codes:
-            compact = re.sub(r"\s+", "", text)
-            if re.fullmatch(r"\d{6,10}", compact):
-                return [compact]
         return _section_code_tokens(value, permissive=True)
 
     def exact_sections_for_code(value: Any) -> list[dict[str, Any]]:
@@ -4990,7 +5225,7 @@ def prepare_benefit_rows(
     ]
     if rejected_non_article_ai_rows:
         messages.append(
-            f"Rejected {rejected_non_article_ai_rows} AI row(s) from Alfa Laval construction/composition tables because no genuine Article No. was present."
+            f"Rejected {rejected_non_article_ai_rows} AI row(s) from construction/composition tables because no genuine Article No. was present."
         )
     if rejected_ai_identifiers:
         messages.append(
