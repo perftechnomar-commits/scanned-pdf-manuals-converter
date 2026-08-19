@@ -80,7 +80,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.14.0"
+APP_VERSION = "4.14.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -3440,7 +3440,12 @@ if active_workflow_step == "2. OCR":
                             previous_step="1. Machinery",
                             next_step="3. Sub-machineries",
                             next_label="Review detected sub-machineries →",
-                            next_disabled=False,
+                            next_disabled=not bool(len(new_review)),
+                            next_help=(
+                                None
+                                if len(new_review)
+                                else "OCR completed, but no spare-part rows were recovered. Inspect the recovery/model details below before continuing."
+                            ),
                         )
                     for message in extraction_messages:
                         lowered_message = message.lower()
