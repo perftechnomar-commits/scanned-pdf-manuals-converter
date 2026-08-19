@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.13.1"
+TOOLS_VERSION = "4.13.2"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -550,6 +550,9 @@ _POSITIVE_PAGE_PHRASES: tuple[tuple[str, int], ...] = (
     ("parts list", 5),
     ("part no", 4),
     ("part number", 4),
+    ("article no", 5),
+    ("article number", 5),
+    ("name/designation", 4),
     ("part name", 3),
     ("ref. no", 3),
     ("ref no", 3),
@@ -600,6 +603,9 @@ def _markdown_table_signal(markdown: str) -> tuple[int, int]:
             for phrase in (
                 "part no",
                 "part number",
+                "article no",
+                "article number",
+                "name/designation",
                 "part name",
                 "ref. no",
                 "ref no",
@@ -705,6 +711,7 @@ def classify_ocr_pages(
 
 
 MULTILINGUAL_ORDER_CATALOG_PROFILE = "multilingual_order_catalog"
+ALFA_LAVAL_ARTICLE_DRAWING_PROFILE = "alfa_laval_article_drawing"
 
 
 def _is_multilingual_order_catalog(markdown: Any) -> bool:
@@ -747,16 +754,57 @@ def _is_multilingual_order_catalog(markdown: Any) -> bool:
     return bool(order_signal and multilingual_signal and layout_signal)
 
 
+def _is_alfa_laval_article_drawing(markdown: Any) -> bool:
+    """Recognize Alfa Laval drawing sheets with an orderable Article No. table."""
+    text = clean_text(markdown).lower()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    article_signal = "articleno" in compact or "articlenumber" in compact
+    name_signal = "namedesignation" in compact or ("name" in text and "designation" in text)
+    drawing_signal = any(
+        token in compact
+        for token in ("materialblank", "artrev", "documentno", "purchasedarticle")
+    )
+    return bool(article_signal and name_signal and drawing_signal)
+
+
 def _document_extraction_profile(
     extracted_pages: Sequence[tuple[int, str]],
 ) -> str:
-    sample = "\n".join(str(markdown or "") for _, markdown in extracted_pages[:12])
+    # Alfa Laval orderable drawing sheets can appear hundreds of pages into a
+    # compiled system manual, so scan page-by-page instead of sampling only the
+    # beginning of the document. This is local string inspection and adds no API cost.
+    for _, markdown in extracted_pages:
+        if _is_alfa_laval_article_drawing(markdown):
+            return ALFA_LAVAL_ARTICLE_DRAWING_PROFILE
+    sample = "\n".join(str(markdown or "") for _, markdown in extracted_pages[:20])
     if _is_multilingual_order_catalog(sample):
         return MULTILINGUAL_ORDER_CATALOG_PROFILE
     return ""
 
 
 def _profile_prompt(profile: str) -> str:
+    if profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE:
+        return """
+AUTOMATIC LAYOUT PROFILE - ALFA LAVAL DRAWING TITLE BLOCK + ARTICLE TABLE:
+- A page is a spare-parts source when it contains Article No. / Art. Rev. /
+  Name/Designation / Material/Blank / Note.
+- The drawing title block is authoritative for the sub-machinery: Document No. is
+  section_code and Title is section_name_english. Example: Document No. 9007280
+  and Title Cable means section_code="9007280", section_name_english="CABLE".
+- Article No. is the genuine spare identifier and populates ident_no, therefore both
+  PART NO and CODE. Preserve printed spaces and leading zeroes.
+- Name/Designation is the spare description. Art. Rev. is revision metadata, not
+  ITEM NO. Material/Blank (including PURCHASED ARTICLE) is classification, not the
+  spare description. Note is specification text, not quantity.
+- If there is no genuine drawing-position column, item_no must be blank. If there is
+  no genuine quantity column, quantity must be null. Note values such as 10 m, 25 m,
+  50 m, 75 m, 100 m, or Length acc. to order are not QNT.
+- Reject a separate Pos. / Designation / Composition construction table as a spare
+  table. CONDUCTOR, FILLER, WRAPPING, EMC SCREEN and SHEATH are not spare rows unless
+  that logical row also has a genuine Article No.
+- Never use chapter headings such as Dimension drawings including technical data,
+  dates, sheet numbers, or revision numbers as the sub-machinery code/name.
+""".strip()
     if profile != MULTILINGUAL_ORDER_CATALOG_PROFILE:
         return ""
     return """
@@ -1721,6 +1769,11 @@ def extract_spare_parts_with_ai(
     catalog_hint = _catalog_prompt_hint(
         build_section_catalog(extracted_pages).get("sections", [])
     )
+    if extraction_profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE:
+        messages.append(
+            "Automatically detected an Alfa Laval drawing title-block Article No. catalogue. "
+            "Document No./Title define the sub-machinery and only Article No. rows are treated as spares."
+        )
     if extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE:
         messages.append(
             "Automatically detected a multilingual Order-No. catalogue. "
@@ -2289,6 +2342,8 @@ def _canonical_source_header(header: str) -> str | None:
     key = re.sub(r"[^a-z0-9]+", "", clean_text(header).lower())
     if not key:
         return None
+    if key in {"articleno", "articlenumber", "articlenr"}:
+        return "ident_no"
     if any(
         token in key
         for token in ("orderno", "orderingno", "bestellnr", "nodecommande")
@@ -2300,7 +2355,11 @@ def _canonical_source_header(header: str) -> str | None:
         return "description_raw"
     if any(token in key for token in ("quantity", "qty", "qnt", "menge", "numberoff", "nooff")):
         return "quantity"
-    if any(token in key for token in ("itemno", "itemnumber", "positionno", "position", "posno", "refno", "referenceno", "indexno")):
+    if key in {
+        "itemno", "itemnumber", "itemnr",
+        "position", "positionno", "positionnumber", "posno", "posnr",
+        "refno", "referenceno", "referencenumber", "indexno", "indexnumber",
+    }:
         return "item_no"
     if any(token in key for token in ("bildpictphoto", "pictphoto", "picturephoto")):
         return "item_no"
@@ -2323,7 +2382,7 @@ def _find_data_header_index(rows: Sequence[Sequence[str]]) -> int | None:
             token in joined
             for token in (
                 "ident", "code", "part-no", "part no", "item", "position",
-                "order-no", "order no", "bestell-nr", "bestell nr",
+                "article no", "article-no", "article number", "order-no", "order no", "bestell-nr", "bestell nr",
                 "no de commande", "pict.", "photo",
             )
         )
@@ -2516,7 +2575,7 @@ def _looks_likely_english(value: Any) -> bool:
         "plug", "stud", "panel", "rubber", "metal", "foot", "inside",
         "outside", "adjustable", "protecting", "line", "air", "compressed",
         "elbow", "reduction", "reducing", "threaded", "filter", "cartridge",
-        "burner", "casing", "individual", "regulation", "servo", "drive",
+        "burner", "cable", "casing", "individual", "regulation", "servo", "drive",
         "blower", "pump", "combustion", "ignition", "transformer", "preheater",
         "monitor", "terminal", "electrical", "equipment", "train",
     )
@@ -2978,6 +3037,73 @@ def _page_header_text(markdown: str, max_lines: int = 28) -> str:
     return "\n".join(dict.fromkeys(clean_text(value) for value in candidates if clean_text(value)))
 
 
+def _alfa_laval_title_block_metadata(markdown: str) -> dict[str, str]:
+    """Extract Title and Document No. from an Alfa Laval Article No. drawing page."""
+    if not _is_alfa_laval_article_drawing(markdown):
+        return {}
+    document_no = ""
+    title = ""
+
+    def _value(v: Any) -> str:
+        return clean_text(v).strip(" :;|-")
+
+    for block in _markdown_table_blocks(markdown):
+        for row in block:
+            cells = [_value(cell) for cell in row]
+            for i, cell in enumerate(cells):
+                key = re.sub(r"[^a-z0-9]+", "", cell.lower())
+                if key in {"documentno", "documentnumber", "docno"}:
+                    for candidate in cells[i + 1:] + cells[:i]:
+                        compact = re.sub(r"\s+", "", candidate)
+                        if re.fullmatch(r"\d{6,10}", compact):
+                            document_no = compact
+                            break
+                elif key == "title":
+                    for candidate in cells[i + 1:] + cells[:i]:
+                        candidate = _value(candidate)
+                        if re.search(r"[A-Za-z]", candidate) and len(candidate) <= 100:
+                            if normalize_key(candidate) not in {
+                                "TITLE", "DOCUMENTNO", "SHEET", "NOOFSHEETS",
+                                "REVISIONNO", "RESPONSIBLEDEPARTMENT", "CREATOR",
+                                "APPROVED", "PURCHASEDARTICLE",
+                            }:
+                                title = candidate
+                                break
+            if document_no and title:
+                break
+        if document_no and title:
+            break
+
+    raw = str(markdown or "")
+    if not document_no:
+        m = re.search(r"Document\s*No\.?\s*[:|\-]?\s*(\d{6,10})", raw, flags=re.I)
+        if m:
+            document_no = m.group(1)
+    if not title:
+        for pattern in (
+            r"(?:^|\n)\s*Title\s*[:|\-]?\s*([^\n|]{2,100})",
+            r"\|\s*Title\s*\|\s*([^|]{2,100})\|",
+        ):
+            m = re.search(pattern, raw, flags=re.I)
+            if m:
+                candidate = _value(m.group(1))
+                if re.search(r"[A-Za-z]", candidate):
+                    title = candidate
+                    break
+    if not document_no:
+        candidates = re.findall(r"(?m)^\s*(\d{6,10})\s*$", raw)
+        if candidates:
+            document_no = candidates[-1]
+    if not document_no or not title:
+        return {}
+    return {
+        "section_code": document_no,
+        "section_name_raw": title,
+        "section_name_english": title.upper(),
+        "section_code_source": "Alfa Laval drawing title block Document No.",
+    }
+
+
 def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
     metadata: dict[str, Any] = {
         "page": int(page_number),
@@ -3101,6 +3227,12 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
         # verified main-machinery maker/model are applied later as the fallback.
         metadata["maker"] = ""
         metadata["model"] = ""
+    drawing_title_block = _alfa_laval_title_block_metadata(markdown)
+    if drawing_title_block:
+        metadata.update(drawing_title_block)
+        if "alfa laval" in clean_text(markdown).lower():
+            metadata["maker"] = "ALFA LAVAL"
+
     if not metadata["model"] and not classic_catalog:
         model_match = re.search(
             r"\b(?:COMPRESSOR|KOMPRESSOR|ENGINE|GENERATOR|PUMP)\s+([A-Z0-9][A-Z0-9 ._/-]{1,30})",
@@ -3207,12 +3339,22 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
     rows: list[dict[str, Any]] = []
     for page_number, markdown in extracted_pages:
         classic_catalog = _is_multilingual_order_catalog(markdown)
+        article_drawing = _is_alfa_laval_article_drawing(markdown)
         metadata = _page_metadata(int(page_number), markdown)
         for block in _markdown_table_blocks(markdown):
             header_index = _find_data_header_index(block)
             if header_index is None:
                 continue
             headers = block[header_index]
+            if article_drawing:
+                header_keys = {
+                    re.sub(r"[^a-z0-9]+", "", clean_text(header).lower())
+                    for header in headers
+                }
+                # On this drawing family only the Article No. table is orderable.
+                # Pos./Designation/Composition describes cable/material construction.
+                if not header_keys.intersection({"articleno", "articlenumber", "articlenr"}):
+                    continue
             mappings = [_canonical_source_header(header) for header in headers]
 
             # Some OEM parts lists expose only Ref. No. / Part Name / Quantity.
@@ -3410,7 +3552,8 @@ def _looks_like_spare_table_page(markdown: str) -> bool:
         token in text
         for token in (
             "ident-nr", "ident-no", "ident no", "item no", "position",
-            "part no", "part-no", "code", "order-no", "order no",
+            "part no", "part-no", "article no", "article-no", "article number",
+            "code", "order-no", "order no",
             "bestell-nr", "bestell nr", "no de commande", "pict.",
         )
     )
@@ -3421,7 +3564,8 @@ def _looks_like_spare_table_page(markdown: str) -> bool:
     reference_parts_layout = has_reference_no and (
         "part name" in text or "partname" in compact_text
     )
-    has_identifier = has_standard_identifier or reference_parts_layout
+    article_parts_layout = _is_alfa_laval_article_drawing(markdown)
+    has_identifier = has_standard_identifier or reference_parts_layout or article_parts_layout
     has_quantity = any(token in text for token in ("qty", "quantity", "menge", "qnt"))
     illustrated_ref_list = (
         "parts list for figure" in text and has_reference_no and has_quantity
@@ -3431,6 +3575,7 @@ def _looks_like_spare_table_page(markdown: str) -> bool:
     return has_description and has_identifier and (
         has_quantity
         or (reference_parts_layout and "parts list" in text)
+        or article_parts_layout
         or _is_multilingual_order_catalog(markdown)
         or (has_standard_identifier and "|" in str(markdown or ""))
     )
@@ -3703,6 +3848,9 @@ def build_section_catalog(
     allow_simple_section_codes = (
         extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
     )
+    allow_title_block_document_codes = (
+        extraction_profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE
+    )
     index_sections, index_pages = _index_sections(extracted_pages)
     global_maker, global_model = _global_manual_maker_model(extracted_pages)
     main_row = main_row or {}
@@ -3719,6 +3867,10 @@ def build_section_catalog(
                 if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text)
                 else []
             )
+        if allow_title_block_document_codes:
+            compact = re.sub(r"\s+", "", text)
+            if re.fullmatch(r"\d{6,10}", compact):
+                return [compact]
         return _section_code_tokens(value, permissive=True)
 
     def register(section: dict[str, Any], priority: int = 50) -> dict[str, Any]:
@@ -4221,17 +4373,37 @@ def prepare_benefit_rows(
     """Repair and normalize extraction using exact PDF table structure and page headers."""
     direct_rows = _direct_table_rows(extracted_pages)
     section_context_pages = list(catalog_pages) if catalog_pages is not None else list(extracted_pages)
+    extraction_profile = _document_extraction_profile(section_context_pages)
     allow_simple_section_codes = (
-        _document_extraction_profile(section_context_pages)
-        == MULTILINGUAL_ORDER_CATALOG_PROFILE
+        extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
     )
+    allow_title_block_document_codes = (
+        extraction_profile == ALFA_LAVAL_ARTICLE_DRAWING_PROFILE
+    )
+    page_markdown_lookup = {int(page): markdown for page, markdown in extracted_pages}
     normalized_ai: list[dict[str, Any]] = []
     rejected_ai_identifiers = 0
     expanded_ai_identifiers = 0
+    rejected_non_article_ai_rows = 0
     for raw in ai_rows:
         if not isinstance(raw, dict):
             continue
         normalized = _normalized_ai_row(raw)
+        source_page = normalized.get("source_page")
+        page_markdown = page_markdown_lookup.get(int(source_page)) if source_page is not None else ""
+        if allow_title_block_document_codes and page_markdown and _is_alfa_laval_article_drawing(page_markdown):
+            title_block = _alfa_laval_title_block_metadata(page_markdown)
+            if title_block:
+                normalized["section_code"] = title_block["section_code"]
+                normalized["section_name_english"] = title_block["section_name_english"]
+                normalized["detected_machinery"] = title_block["section_name_english"]
+            # This OEM family has no drawing-position or quantity field in the
+            # Article No. table. Art. Rev. and Note lengths must never leak into them.
+            normalized["item_no"] = ""
+            normalized["quantity"] = None
+            if not clean_text(normalized.get("ident_no", "")):
+                rejected_non_article_ai_rows += 1
+                continue
         if not allow_simple_section_codes:
             normalized_ai.append(normalized)
             continue
@@ -4279,6 +4451,10 @@ def prepare_benefit_rows(
                 if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text)
                 else []
             )
+        if allow_title_block_document_codes:
+            compact = re.sub(r"\s+", "", text)
+            if re.fullmatch(r"\d{6,10}", compact):
+                return [compact]
         return _section_code_tokens(value, permissive=True)
 
     def exact_sections_for_code(value: Any) -> list[dict[str, Any]]:
@@ -4671,6 +4847,10 @@ def prepare_benefit_rows(
         f"Deterministic table verification found {len(direct_rows)} spare-part row(s).",
         f"Detected {len(sections)} source-coded sub-machinery section(s).",
     ]
+    if rejected_non_article_ai_rows:
+        messages.append(
+            f"Rejected {rejected_non_article_ai_rows} AI row(s) from Alfa Laval construction/composition tables because no genuine Article No. was present."
+        )
     if rejected_ai_identifiers:
         messages.append(
             f"Rejected {rejected_ai_identifiers} AI identifier value(s) that did not "
@@ -4769,6 +4949,7 @@ _GENERIC_MACHINERY_NAMES = {
     "DESCRIPTION", "DESIGNATION", "ITEM NO", "ITEM NUMBER", "PART NO",
     "PART NUMBER", "QUANTITY", "DRAWING", "DRAWING NO", "TABLE",
     "CONTINUED", "LIST OF SPARE PARTS",
+    "DIMENSION DRAWINGS INCLUDING TECHNICAL DATA",
 }
 
 
