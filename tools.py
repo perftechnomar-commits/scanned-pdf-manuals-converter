@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
 
 
-TOOLS_VERSION = "4.13.0"
+TOOLS_VERSION = "4.13.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -550,6 +550,12 @@ _POSITIVE_PAGE_PHRASES: tuple[tuple[str, int], ...] = (
     ("parts list", 5),
     ("part no", 4),
     ("part number", 4),
+    ("part name", 3),
+    ("ref. no", 3),
+    ("ref no", 3),
+    ("reference no", 3),
+    ("replacement parts", 4),
+    ("illustrated parts", 4),
     ("item no", 3),
     ("item number", 3),
     ("position no", 3),
@@ -594,6 +600,10 @@ def _markdown_table_signal(markdown: str) -> tuple[int, int]:
             for phrase in (
                 "part no",
                 "part number",
+                "part name",
+                "ref. no",
+                "ref no",
+                "reference no",
                 "item no",
                 "item number",
                 "description",
@@ -830,6 +840,14 @@ Benefit mapping rules:
     burner-series applicability, size, unit marker, or weight.
 6b. OCR may flatten several Order-No. values into one cell. Return one distinct
     spare_parts record for every printed Order-No.; never combine them into one code.
+6c. When a parts list uses a single Ref. No. / Reference No. column with composite
+    values such as 03036-55 or 03036-58A, the FULL printed reference is ident_no
+    (therefore PART NO and CODE), while only its final callout suffix is item_no
+    (55 or 58A). Never copy the full composite Ref. No. into ITEM NO.
+6d. Successive pages titled Parts List for Figure X-1, X-2, X-3, etc. belong to
+    one equipment section when the manual/equipment heading is unchanged. Do not
+    create one sub-machinery per sheet. Keep the same section code/name across all
+    list sheets, even when illustrated drawing pages occur between them.
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
@@ -2296,8 +2314,12 @@ def _canonical_source_header(header: str) -> str | None:
 def _find_data_header_index(rows: Sequence[Sequence[str]]) -> int | None:
     for row_index, row in enumerate(rows[:5]):
         joined = " ".join(clean_text(value).lower() for value in row)
-        has_description = any(token in joined for token in ("description", "designation", "benennung", "part name"))
-        has_identifier = any(
+        joined_compact = re.sub(r"\s+", "", joined)
+        has_description = any(
+            token in joined
+            for token in ("description", "designation", "benennung", "part name")
+        ) or "partname" in joined_compact
+        has_standard_identifier = any(
             token in joined
             for token in (
                 "ident", "code", "part-no", "part no", "item", "position",
@@ -2305,9 +2327,95 @@ def _find_data_header_index(rows: Sequence[Sequence[str]]) -> int | None:
                 "no de commande", "pict.", "photo",
             )
         )
-        if has_description and has_identifier:
+        has_reference_no = bool(
+            re.search(r"\b(?:ref(?:erence)?\.?\s*no\.?)\b", joined, flags=re.I)
+        )
+        # A generic tool list may also have a Ref. No. column. Treat Ref. No. as
+        # a spare-parts identifier only when the same header explicitly says Part Name.
+        reference_parts_header = has_reference_no and (
+            "part name" in joined or "partname" in joined_compact
+        )
+        if has_description and (has_standard_identifier or reference_parts_header):
             return row_index
     return None
+
+
+_REFERENCE_IDENTIFIER_RE = re.compile(
+    r"^\s*(?P<prefix>[A-Z0-9][A-Z0-9._/]*?)\s*[-/]\s*(?P<item>\d+[A-Z]?)\s*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_reference_no_header(value: Any) -> bool:
+    key = re.sub(r"[^a-z0-9]+", "", clean_text(value).lower())
+    return key in {"refno", "referenceno", "referencenumber"}
+
+
+def _reference_identifier_parts(value: Any) -> tuple[str, str, str] | None:
+    """Split a composite Ref. No. into full identifier, stable prefix and item suffix."""
+    text = clean_text(value).upper()
+    match = _REFERENCE_IDENTIFIER_RE.fullmatch(text)
+    if not match:
+        return None
+    prefix = clean_text(match.group("prefix")).upper()
+    item = clean_text(match.group("item")).upper()
+    if len(normalize_key(prefix)) < 3 or not re.search(r"\d", prefix):
+        return None
+    return text, prefix, item
+
+
+def _reference_identifier_columns(
+    block: Sequence[Sequence[str]],
+    header_index: int,
+    headers: Sequence[str],
+) -> set[int]:
+    """Find Ref. No. columns that are clearly composite catalogue identifiers.
+
+    This is deliberately conservative: at least three printed values must share
+    one stable prefix (for example 03036-1, 03036-2, 03036-58A). A plain drawing
+    reference column containing 1, 2, 3 therefore remains an ITEM NO column.
+    """
+    result: set[int] = set()
+    for column_index, header in enumerate(headers):
+        if not _is_reference_no_header(header):
+            continue
+        parsed: list[tuple[str, str, str]] = []
+        for row in block[header_index + 1 : header_index + 24]:
+            if column_index >= len(row):
+                continue
+            item = _reference_identifier_parts(row[column_index])
+            if item is not None:
+                parsed.append(item)
+        if len(parsed) < 3:
+            continue
+        prefix_counts: dict[str, int] = {}
+        for _, prefix, _ in parsed:
+            key = normalize_key(prefix)
+            prefix_counts[key] = prefix_counts.get(key, 0) + 1
+        dominant = max(prefix_counts.values(), default=0)
+        if dominant >= 3 and dominant / len(parsed) >= 0.75:
+            result.add(column_index)
+    return result
+
+
+def _logical_table_column_groups(
+    mappings: Sequence[str | None],
+) -> list[tuple[int, int]]:
+    """Split side-by-side repeated parts lists into independent logical records."""
+    identifier_starts = [
+        index for index, canonical in enumerate(mappings) if canonical == "ident_no"
+    ]
+    if len(identifier_starts) < 2:
+        return [(0, len(mappings))]
+
+    groups: list[tuple[int, int]] = []
+    for position, start in enumerate(identifier_starts):
+        end = identifier_starts[position + 1] if position + 1 < len(identifier_starts) else len(mappings)
+        group = mappings[start:end]
+        if "description_raw" not in group:
+            return [(0, len(mappings))]
+        groups.append((start, end))
+    return groups
 
 
 _HYPHEN_SECTION_CODE_RE = re.compile(
@@ -3106,6 +3214,17 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                 continue
             headers = block[header_index]
             mappings = [_canonical_source_header(header) for header in headers]
+
+            # Some OEM parts lists expose only Ref. No. / Part Name / Quantity.
+            # When Ref. No. values share a stable composite prefix (03036-55,
+            # 03036-58A, ...), the full reference is the source identifier and the
+            # final suffix is the drawing ITEM NO.
+            reference_identifier_columns = _reference_identifier_columns(
+                block, header_index, headers
+            )
+            for column_index in reference_identifier_columns:
+                mappings[column_index] = "ident_no"
+
             if classic_catalog:
                 english_index = _classic_english_description_index(headers, mappings)
                 mappings = [
@@ -3117,12 +3236,19 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                     for index, canonical in enumerate(mappings)
                 ]
             # When Ident-No. exists, a separate Part-No. column containing drawing
-            # callouts is ITEM NO by the user's Benefit mapping rule.
+            # callouts is ITEM NO by the user's import mapping rule.
             if "ident_no" in mappings and "item_no" not in mappings and "source_part_no" in mappings:
                 mappings[mappings.index("source_part_no")] = "item_no"
+
+            column_groups = (
+                [(0, len(mappings))]
+                if classic_catalog
+                else _logical_table_column_groups(mappings)
+            )
             active_metadata = dict(metadata)
             last_english_description = ""
             last_description_item_no = ""
+
             for values in block[header_index + 1 :]:
                 if classic_catalog:
                     row_section = _classic_catalog_section_from_row(values, mappings)
@@ -3143,73 +3269,89 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                         values = _catalog_row_without_heading(
                             values, mappings, row_section
                         )
+
                 padded = list(values) + [""] * max(0, len(headers) - len(values))
-                record: dict[str, Any] = {
-                    "source_page": int(page_number),
-                    "section_code": active_metadata.get("section_code", ""),
-                    "section_name_english": active_metadata.get("section_name_english", ""),
-                    "section_maker": active_metadata.get("maker", ""),
-                    "section_model": active_metadata.get("model", ""),
-                    "table_title": active_metadata.get("section_name_raw", ""),
-                    "confidence": 0.88,
-                }
-                for column_index, canonical in enumerate(mappings):
-                    if canonical and column_index < len(padded):
+
+                for group_start, group_end in column_groups:
+                    record: dict[str, Any] = {
+                        "source_page": int(page_number),
+                        "section_code": active_metadata.get("section_code", ""),
+                        "section_name_english": active_metadata.get("section_name_english", ""),
+                        "section_maker": active_metadata.get("maker", ""),
+                        "section_model": active_metadata.get("model", ""),
+                        "table_title": active_metadata.get("section_name_raw", ""),
+                        "confidence": 0.88,
+                    }
+                    for column_index in range(group_start, group_end):
+                        canonical = mappings[column_index]
+                        if not canonical or column_index >= len(padded):
+                            continue
                         value = padded[column_index]
                         record[canonical] = (
                             _clean_markdown_cell(value)
                             if canonical in {"description_raw", "ident_no"}
                             else clean_text(value)
                         )
+                        if column_index in reference_identifier_columns:
+                            reference_parts = _reference_identifier_parts(value)
+                            if reference_parts is not None:
+                                full_identifier, _, item_suffix = reference_parts
+                                record["ident_no"] = full_identifier
+                                record["item_no"] = item_suffix
+                                record["item_no_from_reference"] = True
 
-                if classic_catalog:
-                    description_raw = _clean_markdown_cell(
-                        record.get("description_raw", "")
-                    )
-                    item_no = clean_text(record.get("item_no", ""))
-                    identifiers = _catalog_order_number_lines(
-                        record.get("ident_no", "")
-                    )
-                    # Visually merged catalogue rows may print the English
-                    # designation once beside several Order-No. lines. Carry it
-                    # only within the same table/section and the same (or merged)
-                    # drawing position; a new heading resets this state above.
-                    if (
-                        not description_raw
-                        and identifiers
-                        and last_english_description
-                        and (
-                            not item_no
-                            or not last_description_item_no
-                            or normalize_key(item_no)
-                            == normalize_key(last_description_item_no)
+                    if classic_catalog:
+                        description_raw = _clean_markdown_cell(
+                            record.get("description_raw", "")
                         )
-                    ):
-                        description_raw = last_english_description
-                        record["description_raw"] = description_raw
-                        record["description_inherited"] = True
-                    if not description_raw or not identifiers:
+                        item_no = clean_text(record.get("item_no", ""))
+                        identifiers = _catalog_order_number_lines(
+                            record.get("ident_no", "")
+                        )
+                        # Visually merged catalogue rows may print the English
+                        # designation once beside several Order-No. lines. Carry it
+                        # only within the same table/section and the same (or merged)
+                        # drawing position; a new heading resets this state above.
+                        if (
+                            not description_raw
+                            and identifiers
+                            and last_english_description
+                            and (
+                                not item_no
+                                or not last_description_item_no
+                                or normalize_key(item_no)
+                                == normalize_key(last_description_item_no)
+                            )
+                        ):
+                            description_raw = last_english_description
+                            record["description_raw"] = description_raw
+                            record["description_inherited"] = True
+                        if not description_raw or not identifiers:
+                            continue
+                        last_english_description = description_raw
+                        if item_no:
+                            last_description_item_no = item_no
+                        for identifier in identifiers:
+                            variant = dict(record)
+                            variant["ident_no"] = identifier
+                            variant["item_no"] = item_no
+                            variant["quantity"] = None
+                            variant["confidence"] = 0.92
+                            rows.append(variant)
                         continue
-                    last_english_description = description_raw
-                    if item_no:
-                        last_description_item_no = item_no
-                    for identifier in identifiers:
-                        variant = dict(record)
-                        variant["ident_no"] = identifier
-                        variant["item_no"] = item_no
-                        variant["quantity"] = None
-                        variant["confidence"] = 0.92
-                        rows.append(variant)
-                    continue
 
-                description_raw = clean_text(record.get("description_raw", ""))
-                ident_no = clean_text(record.get("ident_no", ""))
-                item_no = clean_text(record.get("item_no", ""))
-                if description_raw and (ident_no or item_no) and re.search(r"[A-Za-zÀ-ÿ]", description_raw):
-                    record["quantity"] = quantity_to_number(record.get("quantity"))
-                    rows.append(record)
+                    description_raw = clean_text(record.get("description_raw", ""))
+                    ident_no = clean_text(record.get("ident_no", ""))
+                    item_no = clean_text(record.get("item_no", ""))
+                    if (
+                        description_raw
+                        and description_raw.upper() not in {"NOT USED", "NOT USED."}
+                        and (ident_no or item_no)
+                        and re.search(r"[A-Za-zÀ-ÿ]", description_raw)
+                    ):
+                        record["quantity"] = quantity_to_number(record.get("quantity"))
+                        rows.append(record)
     return rows
-
 
 def _index_sections(extracted_pages: Sequence[tuple[int, str]]) -> tuple[list[dict[str, Any]], set[int]]:
     sections: list[dict[str, Any]] = []
@@ -3261,8 +3403,10 @@ def _global_manual_maker_model(extracted_pages: Sequence[tuple[int, str]]) -> tu
 
 def _looks_like_spare_table_page(markdown: str) -> bool:
     text = clean_text(markdown).lower()
-    has_description = any(token in text for token in ("description", "designation", "benennung", "part name"))
-    has_identifier = any(
+    has_description = any(
+        token in text for token in ("description", "designation", "benennung", "part name")
+    )
+    has_standard_identifier = any(
         token in text
         for token in (
             "ident-nr", "ident-no", "ident no", "item no", "position",
@@ -3270,11 +3414,25 @@ def _looks_like_spare_table_page(markdown: str) -> bool:
             "bestell-nr", "bestell nr", "no de commande", "pict.",
         )
     )
+    has_reference_no = bool(
+        re.search(r"\b(?:ref(?:erence)?\.?\s*no\.?)\b", text, flags=re.I)
+    )
+    compact_text = re.sub(r"\s+", "", text)
+    reference_parts_layout = has_reference_no and (
+        "part name" in text or "partname" in compact_text
+    )
+    has_identifier = has_standard_identifier or reference_parts_layout
     has_quantity = any(token in text for token in ("qty", "quantity", "menge", "qnt"))
+    illustrated_ref_list = (
+        "parts list for figure" in text and has_reference_no and has_quantity
+    )
+    if illustrated_ref_list:
+        return True
     return has_description and has_identifier and (
         has_quantity
-        or "|" in str(markdown or "")
+        or (reference_parts_layout and "parts list" in text)
         or _is_multilingual_order_catalog(markdown)
+        or (has_standard_identifier and "|" in str(markdown or ""))
     )
 
 
@@ -3293,6 +3451,242 @@ def select_spare_table_pages(
         return selected
     return list(fallback_pages if fallback_pages is not None else extracted_pages)
 
+
+
+_PARTS_LIST_FIGURE_RE = re.compile(
+    r"\bPARTS\s+LIST\s+FOR\s+FIGURE\s+([A-Z0-9]+(?:[.-][A-Z0-9]+)*)",
+    flags=re.IGNORECASE,
+)
+_ILLUSTRATED_PARTS_CAPTION_RE = re.compile(
+    r"\bFIGURE\s+([A-Z0-9]+(?:[.-][A-Z0-9]+)*)\.?\s+ILLUSTRATED\s+PARTS\s+FOR\s+(?:THE\s+)?(.+?)(?:\s*\(\s*SHEET\s*\d+\s*\))?(?:$|\n)",
+    flags=re.IGNORECASE,
+)
+_MANUAL_REFERENCE_RE = re.compile(
+    r"\bMANUAL\s+([A-Z0-9][A-Z0-9._/-]{2,})\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _figure_family_key(value: Any) -> str:
+    text = clean_text(value).upper().replace(".", "-")
+    parts = [part for part in text.split("-") if part]
+    if len(parts) >= 2 and parts[-1].isdigit():
+        return "-".join(parts[:-1])
+    return text
+
+
+def _illustrated_parts_series_sections(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> list[dict[str, Any]]:
+    """Detect one equipment catalogue split across successive illustrated sheets.
+
+    Manuals such as Woodward 03036 alternate a parts-list page with an exploded
+    drawing page: Figure 6-1, 6-2, 6-3, etc. Those list pages are continuations of
+    the same equipment and must not become separate sub-machineries merely because
+    an illustration page occurs between them.
+    """
+    page_texts = [(int(page), str(markdown or "")) for page, markdown in extracted_pages]
+    captions: dict[str, list[str]] = {}
+    for _, text in page_texts:
+        for figure, raw_name in _ILLUSTRATED_PARTS_CAPTION_RE.findall(text):
+            family = _figure_family_key(figure)
+            raw_name = re.sub(
+                r"\s*\(\s*SHEET\s*\d+\s*\)\s*$",
+                "",
+                clean_text(raw_name),
+                flags=re.IGNORECASE,
+            )
+            name = _clean_machinery_name(raw_name)
+            if family and name and not _is_generic_machinery_name(name):
+                captions.setdefault(family, []).append(name)
+
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for page, text in page_texts:
+        figure_match = _PARTS_LIST_FIGURE_RE.search(text)
+        if not figure_match:
+            continue
+        family = _figure_family_key(figure_match.group(1))
+        manual_match = _MANUAL_REFERENCE_RE.search(text)
+        manual_code = clean_text(manual_match.group(1)).upper() if manual_match else ""
+        if not family or not manual_code:
+            continue
+
+        name_candidates = captions.get(family, [])
+        name = ""
+        if name_candidates:
+            counts: dict[str, int] = {}
+            for candidate in name_candidates:
+                counts[candidate] = counts.get(candidate, 0) + 1
+            name = sorted(
+                counts,
+                key=lambda candidate: (-counts[candidate], len(candidate), candidate),
+            )[0]
+        if not name:
+            # Fallback to the repeated running header around "Manual <code>".
+            for line in text.splitlines()[:20]:
+                flat = clean_text(line)
+                if not flat or "manual" not in flat.lower():
+                    continue
+                cleaned = re.sub(
+                    rf"\bMANUAL\s+{re.escape(manual_code)}\b",
+                    "",
+                    flat,
+                    flags=re.IGNORECASE,
+                ).strip(" -:;|")
+                if re.search(r"[A-Za-z]", cleaned) and not _is_generic_machinery_name(cleaned):
+                    name = _clean_machinery_name(cleaned)
+                    break
+        if not name:
+            continue
+
+        key = (normalize_key(manual_code), family)
+        group = grouped.setdefault(
+            key,
+            {
+                "code": manual_code,
+                "aliases": [manual_code],
+                "name": name,
+                "maker": "",
+                "model": "",
+                "pages": set(),
+                "figure_family": family,
+            },
+        )
+        group["pages"].add(page)
+        if len(name) < len(clean_text(group.get("name", ""))) and not _is_generic_machinery_name(name):
+            group["name"] = name
+
+    # Require at least two parts-list sheets before applying cross-page series
+    # continuation. A single ordinary parts-list page keeps the normal logic.
+    return [group for group in grouped.values() if len(group.get("pages", set())) >= 2]
+
+
+
+def extract_reference_parts_from_pdf(pdf_bytes: bytes) -> tuple[list[dict[str, Any]], list[str]]:
+    """Supplement OCR with exact text-layer rows from Ref. No. parts lists.
+
+    This is a fail-safe for text-based manuals whose replacement-parts chapter is
+    laid out as ``Ref. No. / Part Name / Quantity``. It does nothing for scanned
+    PDFs without a text layer. The source PDF remains authoritative: full composite
+    references populate PART NO/CODE and only the final suffix becomes ITEM NO.
+    """
+    if not pdf_bytes:
+        return [], []
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return [], []
+
+    text_pages: list[tuple[int, str]] = []
+    for index, page in enumerate(reader.pages):
+        try:
+            text = page.extract_text(extraction_mode="layout") or page.extract_text() or ""
+        except Exception:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+        text_pages.append((index + 1, text))
+
+    series_sections = _illustrated_parts_series_sections(text_pages)
+    page_to_series: dict[int, dict[str, Any]] = {}
+    for series in series_sections:
+        for page_number in series.get("pages", set()):
+            page_to_series[int(page_number)] = series
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    generic_reference_re = re.compile(
+        r"(?<![A-Z0-9])([A-Z0-9][A-Z0-9._/]{2,}-\d+[A-Z]?)(?![A-Z0-9])",
+        re.I,
+    )
+    quantity_re = re.compile(r"\.{2,}\s*(\d+(?:[.,]\d+)?)\b")
+
+    for page_number, text in text_pages:
+        lowered = clean_text(text).lower()
+        if (
+            "parts list for figure" not in lowered
+            or "ref. no" not in lowered
+            or "part name" not in lowered
+        ):
+            continue
+        series = page_to_series.get(page_number)
+        manual_code = clean_text((series or {}).get("code", "")).upper()
+        if manual_code:
+            reference_re = re.compile(
+                rf"(?<![A-Z0-9])({re.escape(manual_code)}-\d+[A-Z]?)(?![A-Z0-9])",
+                re.I,
+            )
+        else:
+            reference_re = generic_reference_re
+        matches = list(reference_re.finditer(text))
+        for match_index, match in enumerate(matches):
+            identifier = clean_text(match.group(1)).upper()
+            reference_parts = _reference_identifier_parts(identifier)
+            if reference_parts is None:
+                continue
+            _, _, item_no = reference_parts
+            segment_end = matches[match_index + 1].start() if match_index + 1 < len(matches) else len(text)
+            segment = text[match.end():segment_end]
+            quantity_matches = list(quantity_re.finditer(segment))
+            if not quantity_matches:
+                continue
+            quantity_match = quantity_matches[-1]
+            description = clean_text(segment[:quantity_match.start()].replace("\n", " "))
+            description = re.sub(r"\.{2,}\s*$", "", description).strip(" .;:-")
+            if not description or description.upper() in {"NOT USED", "NOT USED."}:
+                continue
+            # Protect against the footer becoming attached to the last row.
+            if len(description) > 500:
+                continue
+            quantity = quantity_to_number(quantity_match.group(1))
+            key = (page_number, normalize_key(identifier))
+            if key in seen:
+                # A repeated Ref. No. on the same source page is ambiguous. Keep
+                # the first exact source occurrence; AI/drawing evidence may add a
+                # corrected distinct identifier separately (for example 03036-38).
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "source_page": page_number,
+                    "section_start_page": min(series.get("pages", {page_number})) if series else page_number,
+                    "section_code": clean_text((series or {}).get("code", "")),
+                    "section_name_english": clean_text((series or {}).get("name", "")).upper(),
+                    "detected_machinery": clean_text((series or {}).get("name", "")).upper(),
+                    "section_maker": "",
+                    "section_model": "",
+                    "table_title": clean_text((series or {}).get("name", "")).upper(),
+                    "ident_no": identifier,
+                    "part_no": identifier,
+                    "code": identifier,
+                    "item_no": item_no,
+                    "description_english": description.upper(),
+                    "description": description.upper(),
+                    "source_description_raw": description,
+                    "unit": "PCS",
+                    "quantity": quantity,
+                    "confidence": 0.99,
+                    "language_review": False,
+                    "description_source": "printed PDF text layer",
+                    "description_source_mismatch": False,
+                    "section_review": False,
+                    "section_assignment_source": "illustrated parts-list series" if series else "PDF text layer",
+                }
+            )
+
+    messages: list[str] = []
+    if rows:
+        messages.append(
+            f"PDF text-layer verification recovered {len(rows)} Ref. No. spare-part row(s) "
+            "and derived ITEM NO from the printed reference suffix."
+        )
+        if series_sections:
+            messages.append(
+                f"Detected {len(series_sections)} illustrated-parts series spanning "
+                f"{sum(len(section.get('pages', set())) for section in series_sections)} parts-list page(s)."
+            )
+    return rows, messages
 
 def build_section_catalog(
     extracted_pages: Sequence[tuple[int, str]],
@@ -3399,6 +3793,16 @@ def build_section_catalog(
     # stronger and is therefore registered with a higher priority below.
     for section in index_sections:
         register(section, priority=80)
+
+    illustrated_parts_page_map: dict[int, dict[str, Any]] = {}
+    for series in _illustrated_parts_series_sections(extracted_pages):
+        registered_series = register(series, priority=125)
+        registered_series["_illustrated_series_pages"] = {
+            int(series_page) for series_page in series.get("pages", set())
+        }
+        registered_series["_illustrated_parts_series"] = True
+        for series_page in series.get("pages", set()):
+            illustrated_parts_page_map[int(series_page)] = registered_series
 
     page_metadata: dict[int, dict[str, Any]] = {}
     page_heading_sections: dict[int, list[dict[str, Any]]] = {}
@@ -3519,6 +3923,12 @@ def build_section_catalog(
         for page, markdown in extracted_pages
         if int(page) not in index_pages and _looks_like_spare_table_page(markdown)
     }
+    # Every source page explicitly titled "Parts List for Figure ..." in a
+    # confirmed illustrated-parts series is a parts page even when OCR splits
+    # the header text (for example "Part Na me").
+    parts_pages.update(
+        page for page in illustrated_parts_page_map if page not in index_pages
+    )
     page_map: dict[int, dict[str, Any]] = {}
     page_map_sources: dict[int, str] = {}
     ambiguous_pages: set[int] = set()
@@ -3539,7 +3949,11 @@ def build_section_catalog(
         resolved: dict[str, Any] | None = None
         resolved_source = ""
 
-        if len(explicit_matches) == 1:
+        series_section = illustrated_parts_page_map.get(page)
+        if series_section is not None:
+            resolved = series_section
+            resolved_source = "illustrated parts-list series"
+        elif len(explicit_matches) == 1:
             resolved = explicit_matches[0]
             resolved_source = "exact page-header code"
         elif len(explicit_matches) > 1:
@@ -3559,7 +3973,11 @@ def build_section_catalog(
                 [
                     section
                     for section in sections
-                    if any(
+                    if (
+                        not section.get("_illustrated_series_pages")
+                        or page in section.get("_illustrated_series_pages", set())
+                    )
+                    and any(
                         alias_in_header(alias, header_text)
                         for alias in section.get("aliases", [])
                     )
@@ -3625,8 +4043,10 @@ def build_section_catalog(
             page_map[page] = resolved
             page_map_sources[page] = resolved_source
 
-    fallback_maker = global_maker or clean_text(main_row.get("MAKER", "")).upper()
-    fallback_model = global_model or clean_text(main_row.get("MODEL", "")).upper()
+    main_maker = clean_text(main_row.get("MAKER", "")).upper()
+    main_model = clean_text(main_row.get("MODEL", "")).upper()
+    fallback_maker = global_maker or main_maker
+    fallback_model = global_model or main_model
     final_sections: list[dict[str, Any]] = []
     seen_section_ids: set[int] = set()
     for section in sections:
@@ -3641,14 +4061,24 @@ def build_section_catalog(
         section["name"] = _clean_catalog_section_name(
             section.get("name", ""), section.get("code", "")
         )
-        section["maker"] = clean_text(section.get("maker", "")).upper() or fallback_maker
-        section["model"] = clean_text(section.get("model", "")).upper() or fallback_model
+        if section.get("_illustrated_parts_series"):
+            section["maker"] = (
+                clean_text(section.get("maker", "")).upper() or main_maker or global_maker
+            )
+            section["model"] = (
+                clean_text(section.get("model", "")).upper() or main_model or global_model
+            )
+        else:
+            section["maker"] = clean_text(section.get("maker", "")).upper() or fallback_maker
+            section["model"] = clean_text(section.get("model", "")).upper() or fallback_model
         section["first_page"] = min(pages) if pages else None
         section["last_page"] = max(pages) if pages else None
         section["pages"] = pages
         section.pop("_name_priority", None)
         section.pop("_maker_priority", None)
         section.pop("_model_priority", None)
+        section.pop("_illustrated_series_pages", None)
+        section.pop("_illustrated_parts_series", None)
         if section.get("code") or section.get("name"):
             final_sections.append(section)
     def section_sort_code(value: Any) -> tuple[Any, ...]:
@@ -3674,6 +4104,7 @@ def build_section_catalog(
         "parts_pages": parts_pages,
         "ambiguous_pages": ambiguous_pages,
         "unmapped_parts_pages": unmapped_parts_pages,
+        "illustrated_parts_page_map": illustrated_parts_page_map,
     }
 
 def _catalog_prompt_hint(sections: Sequence[dict[str, Any]]) -> str:
@@ -3698,13 +4129,21 @@ def _normalized_ai_row(row: dict[str, Any]) -> dict[str, Any]:
     section_code = clean_text(item.get("section_code", ""))
     if ident and section_code and normalize_key(ident) == normalize_key(section_code):
         ident = ""
+    item_no = clean_text(item.get("item_no", ""))
+    reference_parts = _reference_identifier_parts(ident)
+    if reference_parts is not None and section_code:
+        _, reference_prefix, reference_item = reference_parts
+        if normalize_key(reference_prefix) == normalize_key(section_code) and (
+            not item_no or normalize_key(item_no) == normalize_key(ident)
+        ):
+            item_no = reference_item
     description, language_review = _best_effort_english_description(
         item.get("description_english", item.get("description", ""))
     )
     return {
         **item,
         "ident_no": ident,
-        "item_no": clean_text(item.get("item_no", "")),
+        "item_no": item_no,
         "description_english": description,
         "language_review": bool(language_review),
         "section_code": section_code,
