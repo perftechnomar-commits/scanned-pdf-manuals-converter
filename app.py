@@ -37,6 +37,7 @@ from tools import (
     empty_submachinery_review_dataframe,
     enforce_english_only_with_ai,
     extract_spare_parts_from_markdown_tables,
+    extract_reference_parts_from_pdf,
     extract_spare_parts_with_ai,
     included_submachinery_rows,
     machinery_rows_from_main_and_additional,
@@ -78,7 +79,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.13.0"
+APP_VERSION = "4.13.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -3070,6 +3071,19 @@ if active_workflow_step == "2. OCR":
                         extraction_messages = list(dict.fromkeys(extraction_messages))
                     else:
                         ai_rows = []
+
+                    # Text-layer coverage safety net for OEM catalogues that use
+                    # Ref. No. / Part Name / Quantity across several illustrated
+                    # parts-list sheets. Source rows are prepended so Mistral can
+                    # still override a source-text typo when the drawing clearly
+                    # proves a distinct callout (for example 03036-38).
+                    if input_type == "PDF" and source_file is not None:
+                        pdf_reference_rows, pdf_reference_messages = (
+                            extract_reference_parts_from_pdf(source_file.getvalue())
+                        )
+                        if pdf_reference_rows:
+                            ai_rows = list(pdf_reference_rows) + list(ai_rows)
+                            extraction_messages.extend(pdf_reference_messages)
 
                     source_document_name = _source_document_name(
                         input_type, source_file, document_url, image_url
