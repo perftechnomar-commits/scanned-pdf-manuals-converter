@@ -52,6 +52,7 @@ from tools import (
     pdf_page_count,
     prepare_benefit_rows,
     recalculate_review_status,
+    recover_rotated_alfa_laval_drawing_pages,
     rows_to_review_dataframe,
     select_spare_table_pages,
     safe_filename,
@@ -79,7 +80,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.13.3"
+APP_VERSION = "4.13.4"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2418,10 +2419,15 @@ workflow_missing_sub_details = (
     and workflow_sub_columns.issubset(workflow_submachinery.columns)
     else 0
 )
-workflow_sub_ready = workflow_ocr_ready and workflow_missing_sub_details == 0
+workflow_rows_detected = not workflow_included.empty
+workflow_sub_ready = (
+    workflow_ocr_ready
+    and workflow_rows_detected
+    and workflow_missing_sub_details == 0
+)
 workflow_review_ready = (
     workflow_ocr_ready
-    and not workflow_included.empty
+    and workflow_rows_detected
     and workflow_blocked_count == 0
 )
 workflow_export_created = bool(st.session_state.output)
@@ -2433,7 +2439,11 @@ workflow_labels = {
         (
             "✓ 3. Sub-machineries"
             if workflow_sub_ready
-            else f"! 3. Sub-machineries ({workflow_missing_sub_details})"
+            else (
+                "! 3. Sub-machineries (no spare rows)"
+                if not workflow_rows_detected
+                else f"! 3. Sub-machineries ({workflow_missing_sub_details})"
+            )
         )
         if workflow_ocr_ready
         else "○ 3. Sub-machineries"
@@ -2441,7 +2451,11 @@ workflow_labels = {
     "4. Review spare parts": (
         "✓ 4. Review"
         if workflow_review_ready
-        else (f"! 4. Review ({workflow_blocked_count})" if workflow_ocr_ready else "○ 4. Review")
+        else (
+            "! 4. Review (no spare rows)"
+            if workflow_ocr_ready and not workflow_rows_detected
+            else (f"! 4. Review ({workflow_blocked_count})" if workflow_ocr_ready else "○ 4. Review")
+        )
     ),
     "5. Export": (
         "✓ 5. Exported"
@@ -2631,9 +2645,16 @@ if active_workflow_step == "3. Sub-machineries":
         st.session_state.submachinery_review = sub_frame
 
         if st.session_state.submachinery_review.empty:
-            st.info(
-                "No sub-machineries detected yet. Complete the main machinery and run OCR first."
-            )
+            if workflow_ocr_ready and st.session_state.spare_review.empty:
+                st.warning(
+                    "OCR is complete, but no genuine spare-part rows were detected. "
+                    "Return to Step 2 and inspect the AI model status / OCR recovery log; "
+                    "you do not need to re-enter the machinery data."
+                )
+            else:
+                st.info(
+                    "No sub-machineries detected yet. Complete the main machinery and run OCR first."
+                )
         else:
             candidate_frame = st.session_state.submachinery_review.copy()
             candidate_metrics = st.columns(4)
@@ -3042,6 +3063,32 @@ if active_workflow_step == "2. OCR":
                     if not extracted_pages:
                         raise RuntimeError("OCR completed but returned no pages.")
 
+                    rotated_rescue_messages: list[str] = []
+                    rotated_rescued_pages: list[int] = []
+                    if input_type == "PDF" and source_file is not None:
+                        # First identify likely table pages from the normal OCR. Alfa Laval
+                        # A3 drawings are sometimes embedded 90 degrees inside portrait
+                        # manual pages, causing the first pass to see the construction table
+                        # but miss the Article No. ordering table. Retry only those strong
+                        # drawing candidates after rotating the source PDF page clockwise.
+                        pre_candidate_pages, _ = classify_ocr_pages(
+                            extracted_pages,
+                            mode=page_filter_mode,
+                        )
+                        pre_structure_pages = select_spare_table_pages(
+                            extracted_pages,
+                            fallback_pages=pre_candidate_pages,
+                        )
+                        extracted_pages, rotated_rescue_messages, rotated_rescued_pages = (
+                            recover_rotated_alfa_laval_drawing_pages(
+                                api_key=api_key,
+                                pdf_bytes=pdf_bytes,
+                                extracted_pages=extracted_pages,
+                                candidate_page_numbers=[page for page, _ in pre_structure_pages],
+                                progress=show_progress,
+                            )
+                        )
+
                     candidate_pages, classification_frame = classify_ocr_pages(
                         extracted_pages,
                         mode=page_filter_mode,
@@ -3064,10 +3111,21 @@ if active_workflow_step == "2. OCR":
                             "Benefit-ready rows..."
                         ),
                     )
-                    extraction_messages: list[str] = []
+                    extraction_messages: list[str] = list(rotated_rescue_messages)
                     profile_messages: list[str] = []
                     document_profile: dict = {}
                     st.session_state.model_run_status = {
+                        "OCR": {"provider": "Mistral", "model": "mistral-ocr-latest", "status": "Completed", "detail": f"Processed {len(extracted_pages)} PDF/image page(s)."},
+                        "Rotated drawing OCR rescue": {
+                            "provider": "Mistral",
+                            "model": "mistral-ocr-latest",
+                            "status": "Completed" if rotated_rescued_pages else ("Attempted - no Article table found" if rotated_rescue_messages else "Not needed"),
+                            "detail": (
+                                f"Recovered Article No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}."
+                                if rotated_rescued_pages
+                                else (rotated_rescue_messages[-1] if rotated_rescue_messages else "No strongly rotated Alfa Laval drawing candidate required a second OCR pass.")
+                            ),
+                        },
                         "Row extraction": {"provider": "Mistral", "model": extraction_model.strip() or "mistral-small-latest", "status": "Pending" if structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
                         "Document analysis": {"provider": "Mistral", "model": analysis_model.strip() or "mistral-large-2512", "status": "Pending" if adaptive_analysis and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
                         "Independent verification": {"provider": "OpenAI", "model": openai_model.strip() or "gpt-5.6-terra", "status": "Pending" if openai_verification and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
@@ -3351,12 +3409,20 @@ if active_workflow_step == "2. OCR":
                     ready_count = int(assigned_review["READY"].astype(bool).sum()) if not assigned_review.empty else 0
                     exception_count = int((assigned_review["INCLUDE"].astype(bool) & ~assigned_review["READY"].astype(bool)).sum()) if not assigned_review.empty else 0
                     progress_bar.progress(1.0, text="OCR and automated matching complete")
-                    st.success(
+                    completion_message = (
                         f"OCR processed {len(extracted_pages)} page(s). The app identified "
                         f"{len(structure_pages)} genuine table page(s), created {len(new_review)} spare-part row(s), "
                         f"matched {len(merged_candidates)} source-coded sub-machinery section(s), and marked "
                         f"{ready_count} row(s) ready. Exceptions requiring review: {exception_count}."
                     )
+                    if len(new_review):
+                        st.success(completion_message)
+                    else:
+                        st.warning(
+                            completion_message
+                            + " No spare rows were created, so Steps 3 and 4 remain incomplete. "
+                            "Open AI model run status and the OCR recovery log below for the cause."
+                        )
                     # Replace the disabled control above with the enabled one as
                     # soon as processing completes, without requiring a rerun.
                     with ocr_actions_slot.container():
@@ -3540,7 +3606,14 @@ if active_workflow_step == "4. Review spare parts":
         )
 
         if st.session_state.spare_review.empty:
-            st.info("Run OCR first. Candidate spare-parts rows will appear here.")
+            if workflow_ocr_ready:
+                st.warning(
+                    "OCR completed, but zero genuine spare-part rows were extracted. "
+                    "Review Step 2 for the row-extraction result and rotated-drawing OCR "
+                    "status instead of running the same OCR again blindly."
+                )
+            else:
+                st.info("Run OCR first. Candidate spare-parts rows will appear here.")
         else:
             machinery_frame = current_machinery_frame()
             valid_machinery_names = [
