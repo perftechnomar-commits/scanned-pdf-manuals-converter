@@ -22,6 +22,11 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# Streamlit reruns the application script without necessarily re-importing already
+# cached helper modules. During an in-place deployment, that can leave a live browser
+# session executing an older tools.py even though app.py has been updated on disk.
+# Reload tools on every script rerun so a normal in-app navigation picks up the
+# deployed parser immediately while preserving st.session_state and existing OCR work.
 import tools as _tools_module
 importlib.invalidate_caches()
 _tools_module = importlib.reload(_tools_module)
@@ -45,6 +50,8 @@ from tools import (
     enforce_english_only_with_ai,
     extract_spare_parts_from_markdown_tables,
     extract_reference_parts_from_pdf,
+    extract_explicit_spare_number_rows,
+    extract_explicit_spares_from_pdf,
     extract_spare_parts_with_ai,
     included_submachinery_rows,
     machinery_rows_from_main_and_additional,
@@ -62,6 +69,8 @@ from tools import (
     recover_rotated_engineering_drawing_pages,
     rows_to_review_dataframe,
     select_spare_table_pages,
+    select_explicit_spare_number_pages,
+    select_spare_source_pages,
     safe_filename,
     validate_machinery_dataframe,
 )
@@ -87,7 +96,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.14.7"
+APP_VERSION = "4.15.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1700,11 +1709,17 @@ automatically uses Order-No. for both PART NO and CODE, uses Bild/Pict./Photo fo
 ITEM NO, selects only the English Designation column, and ignores the kg weight
 column as a quantity.
 
+The source-page classifier is not limited to formal tables. The same document may
+contain catalogue tables, illustrated parts lists, engineering drawings, and explicit
+maintenance/procurement lists such as **Spare part number: 9009521 80**. Clearly
+labelled spare-number rows are recovered from OCR and, for PDFs, independently from
+the source text layer. Repeated references are reconciled instead of exported twice.
+
 - The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
 - A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
 - **PARTS FOUND:** number of spare-part rows linked to the proposal.
-- **CONFIDENCE:** average extraction confidence for that detected section.
+- **CONFIDENCE:** hierarchy confidence based on source-code/name agreement and supporting spare rows, not merely raw OCR quality.
 - **VARIANTS:** different spellings found in the manual.
 - Maker/model printed in the section override the manually entered main-machinery defaults.
 - Changes save when you finish a cell. Renames, exclusions, and corrected details are applied automatically to linked spare-part rows.
@@ -3133,15 +3148,22 @@ if active_workflow_step == "2. OCR":
                             "Try Conservative or Off in the sidebar."
                         )
 
-                    structure_pages = select_spare_table_pages(
+                    table_source_pages = select_spare_table_pages(
+                        extracted_pages,
+                        fallback_pages=[],
+                    )
+                    explicit_source_pages = select_explicit_spare_number_pages(
+                        extracted_pages
+                    )
+                    structure_pages = select_spare_source_pages(
                         extracted_pages,
                         fallback_pages=candidate_pages,
                     )
                     progress_bar.progress(
                         0.0,
                         text=(
-                            f"Converting {len(structure_pages)} confirmed table page(s) into "
-                            "Benefit-ready rows..."
+                            f"Converting {len(structure_pages)} confirmed spare-source page(s) "
+                            "into import-ready rows..."
                         ),
                     )
                     extraction_messages: list[str] = list(rotated_rescue_messages)
@@ -3271,6 +3293,9 @@ if active_workflow_step == "2. OCR":
                     else:
                         ai_rows = []
 
+                    pdf_reference_rows: list[dict] = []
+                    explicit_pdf_rows: list[dict] = []
+
                     # Text-layer coverage safety net for OEM catalogues that use
                     # Ref. No. / Part Name / Quantity across several illustrated
                     # parts-list sheets. Source rows are prepended so Mistral can
@@ -3283,6 +3308,30 @@ if active_workflow_step == "2. OCR":
                         if pdf_reference_rows:
                             ai_rows = list(pdf_reference_rows) + list(ai_rows)
                             extraction_messages.extend(pdf_reference_messages)
+
+                    # Generic non-tabular spare-number safety net. Some manuals place
+                    # genuine orderable spares in maintenance/recommended-spares prose
+                    # rather than in a formal table. Recover only rows that carry an
+                    # explicit source label such as "Spare part number". The OCR path
+                    # supports scanned PDFs/images; the PDF text-layer path improves
+                    # precision when selectable source text is available.
+                    explicit_ocr_rows, explicit_ocr_messages = (
+                        extract_explicit_spare_number_rows(extracted_pages)
+                    )
+                    if explicit_ocr_rows:
+                        ai_rows = list(explicit_ocr_rows) + list(ai_rows)
+                        extraction_messages.extend(explicit_ocr_messages)
+
+                    if input_type == "PDF" and source_file is not None:
+                        explicit_pdf_rows, explicit_pdf_messages = (
+                            extract_explicit_spares_from_pdf(
+                                source_file.getvalue(),
+                                page_indexes=selected_pages,
+                            )
+                        )
+                        if explicit_pdf_rows:
+                            ai_rows = list(explicit_pdf_rows) + list(ai_rows)
+                            extraction_messages.extend(explicit_pdf_messages)
 
                     source_document_name = _source_document_name(
                         input_type, source_file, document_url, image_url
@@ -3459,11 +3508,34 @@ if active_workflow_step == "2. OCR":
                     ready_count = int(assigned_review["READY"].astype(bool).sum()) if not assigned_review.empty else 0
                     exception_count = int((assigned_review["INCLUDE"].astype(bool) & ~assigned_review["READY"].astype(bool)).sum()) if not assigned_review.empty else 0
                     progress_bar.progress(1.0, text="OCR and automated matching complete")
+                    explicit_page_numbers = {
+                        int(page) for page, _ in explicit_source_pages
+                    } | {
+                        int(row.get("source_page"))
+                        for row in explicit_pdf_rows
+                        if row.get("source_page")
+                    }
+                    table_page_numbers = {
+                        int(page) for page, _ in table_source_pages
+                    }
+                    recovered_reference_pages = {
+                        int(row.get("source_page"))
+                        for row in pdf_reference_rows
+                        if row.get("source_page")
+                    }
+                    all_spare_source_pages = (
+                        {int(page) for page, _ in structure_pages}
+                        | explicit_page_numbers
+                        | recovered_reference_pages
+                    )
                     completion_message = (
-                        f"OCR processed {len(extracted_pages)} page(s). The app identified "
-                        f"{len(structure_pages)} genuine table page(s), created {len(new_review)} spare-part row(s), "
-                        f"matched {len(merged_candidates)} source-coded sub-machinery section(s), and marked "
-                        f"{ready_count} row(s) ready. Exceptions requiring review: {exception_count}."
+                        f"OCR processed {len(extracted_pages)} page(s). The app identified/recovered "
+                        f"{len(all_spare_source_pages)} spare-source page(s) "
+                        f"({len(table_page_numbers)} table/drawing, "
+                        f"{len(explicit_page_numbers)} explicit spare-number), created "
+                        f"{len(new_review)} spare-part row(s), matched {len(merged_candidates)} "
+                        f"source-coded sub-machinery section(s), and marked {ready_count} row(s) ready. "
+                        f"Exceptions requiring review: {exception_count}."
                     )
                     if len(new_review):
                         st.success(completion_message)
