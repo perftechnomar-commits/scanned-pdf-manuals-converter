@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.14.7"
+TOOLS_VERSION = "4.15.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -880,6 +880,9 @@ _POSITIVE_PAGE_PHRASES: tuple[tuple[str, int], ...] = (
     ("ref no", 3),
     ("reference no", 3),
     ("replacement parts", 4),
+    ("recommended spare parts", 6),
+    ("spare part number", 6),
+    ("sparepart number", 6),
     ("illustrated parts", 4),
     ("item no", 3),
     ("item number", 3),
@@ -969,12 +972,14 @@ def classify_ocr_pages(
         table_rows, header_hits = _markdown_table_signal(text)
         identifier_hits = len(_PART_IDENTIFIER_PATTERN.findall(text))
 
+        explicit_spare_source = _looks_like_explicit_spare_number_page(text)
         positive_score = sum(weight for phrase, weight in _POSITIVE_PAGE_PHRASES if phrase in lowered)
         negative_score = sum(weight for phrase, weight in _NEGATIVE_PAGE_PHRASES if phrase in lowered)
         score = positive_score + min(table_rows, 8) + (header_hits * 3) + min(identifier_hits // 4, 5) - negative_score
 
         strong_candidate = (
-            positive_score >= 5
+            explicit_spare_source
+            or positive_score >= 5
             or header_hits >= 1
             or (table_rows >= 4 and identifier_hits >= 3)
         )
@@ -989,11 +994,16 @@ def classify_ocr_pages(
             process_page = True
             reason = "Filtering disabled"
         elif strong_candidate:
-            classification = "Spare-parts candidate"
+            classification = (
+                "Explicit spare-number source"
+                if explicit_spare_source
+                else "Spare-parts candidate"
+            )
             process_page = True
             reason = (
                 f"parts signals={positive_score}; table rows={table_rows}; "
-                f"header hits={header_hits}; identifiers={identifier_hits}"
+                f"header hits={header_hits}; identifiers={identifier_hits}; "
+                f"explicit spare label={'yes' if explicit_spare_source else 'no'}"
             )
         elif obvious_non_parts:
             classification = "Skipped obvious non-parts page"
@@ -1233,6 +1243,15 @@ Benefit mapping rules:
     one equipment section when the manual/equipment heading is unchanged. Do not
     create one sub-machinery per sheet. Keep the same section code/name across all
     list sheets, even when illustrated drawing pages occur between them.
+6e. Genuine spare rows can also appear outside formal tables. When prose/list text
+    explicitly labels a value as "Spare part number", "Sparepart number",
+    "Replacement part No.", or equivalent, create one row for that labelled part.
+    Use the nearest short item description (for example UV lamp set, temperature
+    transmitter, lamp power supply) as description_english. A nearby component
+    heading may be used as section_name_english, but NEVER invent section_code.
+    Repeated mentions of the same labelled spare number are evidence for one spare,
+    not separate orderable rows unless they clearly belong to different parent
+    components.
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
@@ -1261,8 +1280,10 @@ Benefit mapping rules:
 12a. section_name_english contains only the clean English assembly title. Do not
      append section_code in parentheses and do not append ordering notes or the
      description of the first spare part below the heading.
-13. Do not convert contents/index entries, drawing callouts without a parts table,
-    page numbers, headers, or prose into spare-part rows.
+13. Do not convert ordinary contents/index entries, drawing callouts, page numbers,
+    headers, or descriptive prose into spare-part rows. The exception is a high-signal
+    non-tabular list where the source explicitly labels the identifier as a spare or
+    replacement part number as described in rule 6e.
 14. confidence is 0 to 1 and reflects OCR quality, row alignment, English-language
     selection, and section matching.
 15. A weight column headed ca. kg, appr. kg, env. kg, weight, or equivalent is not
@@ -4629,6 +4650,158 @@ def _global_manual_maker_model(extracted_pages: Sequence[tuple[int, str]]) -> tu
     return maker, model
 
 
+_DRAWING_SECTION_HEADING_RE = re.compile(
+    r"^\s*\d{1,3}(?:\.\d{1,3}){1,5}\s+(.+?)\s*$",
+    flags=re.IGNORECASE,
+)
+_DRAWING_CODE_PREFIX_RE = re.compile(
+    r"^[A-Z0-9][A-Z0-9._/ -]{3,28}$",
+    flags=re.IGNORECASE,
+)
+_DRAWING_COMPONENT_NOUNS = {
+    "ASSEMBLY", "ACTUATOR", "BOILER", "CABINET", "CABLE", "CASE",
+    "COMPRESSOR", "CONTROLLER", "COOLER", "COUPLING", "CYLINDER",
+    "DEVICE", "DRIVE", "ENGINE", "EQUIPMENT", "FAN", "FILTER", "GAUGE",
+    "GEARBOX", "GENERATOR", "GOVERNOR", "HEAD", "HEATER", "MACHINERY",
+    "METER", "MODULE", "MONITOR", "MOTOR", "PANEL", "PISTON", "PUMP",
+    "PURIFIER", "REACTOR", "REGULATOR", "SENSOR", "SEPARATOR", "SKID",
+    "SLEEVE", "SWITCH", "SYSTEM", "TRANSMITTER", "TRANSFORMER", "TURBINE",
+    "UNIT", "VALVE",
+}
+
+
+def _clean_drawing_component_title(value: Any) -> str:
+    text = clean_text(value).strip(" -:;|")
+    if not text:
+        return ""
+    # Parentheticals describing pagination/applicability are navigation metadata,
+    # while short equipment acronyms such as (LDC) are part of the useful title.
+    text = re.sub(
+        r"\s*\((?:[^)]*\b(?:PAGES?|PREVIOUSLY|OPTIONAL|INCLUDING|INCL\.?)\b[^)]*)\)\s*",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" -:;|")
+    return _clean_machinery_name(text)
+
+
+def _valid_drawing_heading_code(value: Any) -> str:
+    """Return a high-precision source drawing/document code or blank.
+
+    Drawing headings are hierarchy evidence only when the nearby token looks like a
+    real engineering document identifier. Requiring at least five digits prevents TOC
+    section numbers, item tags, words and OCR fragments from becoming machinery codes.
+    """
+    text = clean_text(value).upper().strip(" .,:;|")
+    if not text or _is_date_like_section_code(text):
+        return ""
+    compact = normalize_key(text)
+    if sum(character.isdigit() for character in compact) < 5:
+        return ""
+    if re.search(r"\b(?:BOOK|PAGE|SHEET|REV(?:ISION)?|DATE)\b", text, flags=re.I):
+        return ""
+    candidate = _valid_automatic_section_code(text)
+    if not candidate or _chapter_like_section_code(candidate):
+        return ""
+    return candidate
+
+
+def _drawing_heading_sections(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> list[dict[str, Any]]:
+    """Detect source-backed component drawing headings without manufacturer rules.
+
+    A section is accepted only when a numbered component heading appears on the same
+    drawing-oriented page as a nearby, code-like document/drawing identifier. TOC rows
+    are rejected by their trailing page number and short chapter numbers cannot qualify
+    as drawing codes. The function is intentionally conservative because a missed code
+    can remain reviewable, while a fabricated hierarchy code would corrupt assignments.
+    """
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for page_number, raw_text in extracted_pages:
+        text = str(raw_text or "")
+        lines = [clean_text(line) for line in text.splitlines() if clean_text(line)]
+        if not lines:
+            continue
+        context = " ".join(lines[:12]).upper()
+        if not any(
+            token in context
+            for token in (
+                "DRAWING", "DRAWINGS", "DIMENSION", "SCHEMATIC",
+                "GENERAL ARRANGEMENT", "ASSEMBLY DRAWING", "PARTS DRAWING",
+            )
+        ):
+            continue
+
+        for index, line in enumerate(lines):
+            heading_match = _DRAWING_SECTION_HEADING_RE.match(line)
+            if not heading_match:
+                continue
+            raw_title = clean_text(heading_match.group(1))
+            # Contents/index rows normally end with their destination page number.
+            # A local drawing-page heading does not.
+            if re.search(r"\s\d{1,4}\s*$", raw_title):
+                continue
+            # Wrapped headings with an unfinished parenthesis are intentionally left
+            # unresolved rather than assigning a code to a truncated component name.
+            if raw_title.count("(") != raw_title.count(")"):
+                continue
+            title = _clean_drawing_component_title(raw_title)
+            if not title or _is_generic_machinery_name(title):
+                continue
+            title_key = normalize_key(title)
+            if title_key in {
+                "DRAWING", "DRAWINGS", "DIMENSIONDRAWING", "DIMENSIONDRAWINGS",
+                "ELECTRICALDRAWING", "ELECTRICALDRAWINGS", "TECHNICALDATA",
+            }:
+                continue
+            title_tokens = set(re.findall(r"[A-Z]+", title.upper()))
+            if not (title_tokens & _DRAWING_COMPONENT_NOUNS):
+                continue
+
+            code = ""
+            for following in lines[index + 1:index + 5]:
+                # PDF text extraction can concatenate the drawing number directly
+                # with "Book No." (e.g. 9024508Book No.9028195...). Strip it even
+                # when there is no word boundary before BOOK.
+                candidate_line = re.split(
+                    r"BOOK\s+NO\.?", following, maxsplit=1, flags=re.IGNORECASE
+                )[0].strip()
+                # The source-code line itself must be code-like. This rejects wrapped
+                # component prose such as "PT201-16, PI201-18, ..." even if its first
+                # token looks like an identifier.
+                if _DRAWING_SECTION_HEADING_RE.match(candidate_line):
+                    continue
+                if not _DRAWING_CODE_PREFIX_RE.fullmatch(candidate_line):
+                    continue
+                candidate = _valid_drawing_heading_code(candidate_line)
+                if not candidate:
+                    continue
+                code = candidate
+                break
+            if not code:
+                continue
+
+            key = (normalize_key(code), normalize_key(title))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(
+                {
+                    "code": code,
+                    "aliases": [code],
+                    "name": title,
+                    "maker": "",
+                    "model": "",
+                    "pages": {int(page_number)},
+                    "source": "numbered component drawing heading",
+                }
+            )
+    return results
+
+
 def _looks_like_spare_table_page(markdown: str) -> bool:
     text = clean_text(markdown).lower()
     has_description = any(
@@ -4681,6 +4854,501 @@ def select_spare_table_pages(
     if selected:
         return selected
     return list(fallback_pages if fallback_pages is not None else extracted_pages)
+
+
+
+_EXPLICIT_SPARE_LABEL_RE = re.compile(
+    r"\b(?:spare\s*part|sparepart|replacement\s*part)\s*(?:number|no\.?|nr\.?)\s*:",
+    flags=re.IGNORECASE,
+)
+_RECOMMENDED_SPARES_RE = re.compile(
+    r"\b(?:recommended\s+spare\s+parts?|spares?\s+recommended|spare\s+parts?\s+on\s+board)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_explicit_spare_source(markdown: str) -> bool:
+    """Return True when a page explicitly declares orderable spare identifiers.
+
+    This is intentionally independent of table syntax. Technical manuals often place
+    genuine spares in maintenance prose/list layouts using labels such as
+    ``Spare part number:``. Those pages are source candidates even when no Markdown
+    table exists.
+    """
+    text = clean_text(markdown)
+    if not text:
+        return False
+    label_count = len(_EXPLICIT_SPARE_LABEL_RE.findall(text))
+    if label_count >= 2:
+        return True
+    if label_count >= 1 and _RECOMMENDED_SPARES_RE.search(text):
+        return True
+    # A single explicit spare number in a maintenance instruction is still useful,
+    # provided the surrounding page speaks about replacement/maintenance rather than
+    # merely mentioning a catalogue.
+    lowered = text.lower()
+    return label_count >= 1 and any(
+        token in lowered
+        for token in ("replace", "replacement", "maintenance", "service", "recommended")
+    )
+
+
+def classify_spare_source_pages(
+    extracted_pages: Sequence[tuple[int, str]],
+    fallback_pages: Sequence[tuple[int, str]] | None = None,
+) -> tuple[list[tuple[int, str]], dict[str, list[int]]]:
+    """Classify page-level spare evidence without forcing one document-wide pattern."""
+    _, index_pages = _index_sections(extracted_pages)
+    roles: dict[str, list[int]] = {
+        "table_or_drawing": [],
+        "explicit_spare_number_list": [],
+        "fallback": [],
+    }
+    selected: list[tuple[int, str]] = []
+    selected_pages: set[int] = set()
+    for page, markdown in extracted_pages:
+        page_int = int(page)
+        if page_int in index_pages:
+            continue
+        is_table = _looks_like_spare_table_page(markdown)
+        is_explicit = _looks_like_explicit_spare_source(markdown)
+        if not (is_table or is_explicit):
+            continue
+        selected.append((page_int, markdown))
+        selected_pages.add(page_int)
+        if is_table:
+            roles["table_or_drawing"].append(page_int)
+        if is_explicit:
+            roles["explicit_spare_number_list"].append(page_int)
+    if not selected:
+        selected = list(fallback_pages if fallback_pages is not None else extracted_pages)
+        roles["fallback"] = [int(page) for page, _ in selected]
+    return selected, roles
+
+def _looks_like_spare_table_page(markdown: str) -> bool:
+    if _looks_like_explicit_spare_source(markdown):
+        return True
+    text = clean_text(markdown).lower()
+    has_description = any(
+        token in text for token in ("description", "designation", "benennung", "part name")
+    )
+    has_standard_identifier = any(
+        token in text
+        for token in (
+            "ident-nr", "ident-no", "ident no", "item no", "position",
+            "part no", "part-no", "article no", "article-no", "article number",
+            "code", "order-no", "order no",
+            "bestell-nr", "bestell nr", "no de commande", "pict.",
+        )
+    )
+    has_reference_no = bool(
+        re.search(r"\b(?:ref(?:erence)?\.?\s*no\.?)\b", text, flags=re.I)
+    )
+    compact_text = re.sub(r"\s+", "", text)
+    reference_parts_layout = has_reference_no and (
+        "part name" in text or "partname" in compact_text
+    )
+    article_parts_layout = _is_engineering_article_table(markdown)
+    has_identifier = has_standard_identifier or reference_parts_layout or article_parts_layout
+    has_quantity = any(token in text for token in ("qty", "quantity", "menge", "qnt"))
+    illustrated_ref_list = (
+        "parts list for figure" in text and has_reference_no and has_quantity
+    )
+    if illustrated_ref_list:
+        return True
+    return has_description and has_identifier and (
+        has_quantity
+        or (reference_parts_layout and "parts list" in text)
+        or article_parts_layout
+        or _is_multilingual_order_catalog(markdown)
+        or (has_standard_identifier and "|" in str(markdown or ""))
+    )
+
+
+def select_spare_table_pages(
+    extracted_pages: Sequence[tuple[int, str]],
+    fallback_pages: Sequence[tuple[int, str]] | None = None,
+) -> list[tuple[int, str]]:
+    """Backward-compatible selector for every page carrying spare-source evidence."""
+    selected, _ = classify_spare_source_pages(extracted_pages, fallback_pages=fallback_pages)
+    return selected
+
+
+_EXPLICIT_SPARE_LABEL_RE = re.compile(
+    r"\b(?:spare\s*part|sparepart|replacement\s+part)\s*(?:number|no\.?|nr\.?|code)\b\s*[:#-]?",
+    flags=re.IGNORECASE,
+)
+_EXPLICIT_SPARE_IDENTIFIER_RE = re.compile(
+    r"(?<![A-Z0-9])([A-Z0-9][A-Z0-9./_-]{3,}(?:[ \t]+[A-Z0-9][A-Z0-9./_-]{0,5})?)(?![A-Z0-9])",
+    flags=re.IGNORECASE,
+)
+_EXPLICIT_PARENT_NOUNS = {
+    "ASSEMBLY", "BOILER", "CABINET", "COMPRESSOR", "CONTROLLER", "COOLER",
+    "ENGINE", "EQUIPMENT", "FAN", "FILTER", "GEARBOX", "GENERATOR", "GOVERNOR",
+    "HEATER", "MACHINERY", "MOTOR", "MODULE", "PANEL", "PUMP", "PURIFIER",
+    "REACTOR", "SEPARATOR", "SYSTEM", "TURBINE", "UNIT", "VALVE",
+}
+_EXPLICIT_DESCRIPTION_SKIP_PREFIXES = (
+    "BOOK NO", "PAGE ", "CONTENT:", "CONTENTS:", "NOTE:", "TIME INTERVAL",
+    "INSTRUCTIONS", "MAINTENANCE SCHEDULE", "RECOMMENDED SPARE PARTS",
+    "ONE OF EACH SPARE PART", "SPARE PART NUMBER", "SPAREPART NUMBER",
+    "IMO REQUIREMENT", "EPA REQUIREMENT", "EVERY ", "ONCE ", "AFTER ",
+    "RECOMMENDED TO", "SEE ", "IF ", "WHEN ", "RULE OF THUMB",
+)
+
+
+def _valid_explicit_spare_identifier(value: Any) -> str:
+    text = clean_text(value).upper().strip(" .,:;|#")
+    if not text or _is_date_like_section_code(text):
+        return ""
+    if re.search(r"\b(?:BOOK|PAGE|SHEET|REV(?:ISION)?)\b", text, flags=re.I):
+        return ""
+    compact = normalize_key(text)
+    if len(compact) < 5 or len(compact) > 24:
+        return ""
+    if sum(character.isdigit() for character in compact) < 4:
+        return ""
+    if re.fullmatch(r"\d{1,4}", compact):
+        return ""
+    return text
+
+
+def _explicit_spare_identifier_from_text(value: Any) -> str:
+    text = clean_text(value).upper().lstrip(" :#-")
+    if not text:
+        return ""
+    for match in _EXPLICIT_SPARE_IDENTIFIER_RE.finditer(text[:80]):
+        candidate = _valid_explicit_spare_identifier(match.group(1))
+        if candidate:
+            return candidate
+    return ""
+
+
+def _looks_like_explicit_parent_heading(value: Any) -> bool:
+    text = clean_text(value).strip(" |:-")
+    if not text or len(text) > 90 or len(text.split()) > 8:
+        return False
+    if any(mark in text for mark in (",", ".", ";", "!", "?")):
+        return False
+    upper = text.upper()
+    if any(upper.startswith(prefix) for prefix in _EXPLICIT_DESCRIPTION_SKIP_PREFIXES):
+        return False
+    if _EXPLICIT_SPARE_LABEL_RE.search(text):
+        return False
+    if re.search(r"\b(?:CONTENT|QUANTITY|QTY|ARTICLE|PART\s+NO|ITEM\s+NO)\b", upper):
+        return False
+    tokens = {token for token in re.findall(r"[A-Z]+", upper)}
+    return bool(tokens & _EXPLICIT_PARENT_NOUNS)
+
+
+def _clean_explicit_spare_description(value: Any) -> str:
+    text = clean_text(value).strip(" |:-")
+    if not text:
+        return ""
+    text = re.split(r"\b(?:CONTENT|CONTENTS)\s*:", text, maxsplit=1, flags=re.I)[0]
+    text = re.sub(r"^\d+\s+", "", text).strip()
+    text = re.sub(
+        r"^(?:REPLACE(?:MENT)?(?:\s+OF)?|CHANGE|RENEW|INSTALL)\s+",
+        "",
+        text,
+        flags=re.I,
+    ).strip()
+    text = re.sub(r"\(\s*[A-Z]{1,5}\d{2,}[A-Z0-9–—._/-]*\s*\)\s*$", "", text, flags=re.I).strip()
+    if any(text.upper().startswith(prefix) for prefix in _EXPLICIT_DESCRIPTION_SKIP_PREFIXES):
+        return ""
+    if not re.search(r"[A-Za-z]", text):
+        return ""
+    return clean_text(text)
+
+
+def _explicit_description_from_fragments(fragments: Sequence[str]) -> str:
+    cleaned: list[str] = []
+    for fragment in fragments[-4:]:
+        value = _clean_explicit_spare_description(fragment)
+        if value:
+            cleaned.append(value)
+    if not cleaned:
+        return ""
+    # OCR often splits short noun phrases over two lines: "Quartz sleeve" / "set"
+    # or "Temperature" / "transmitter". Join only a compact tail so surrounding
+    # maintenance prose cannot leak into the spare description.
+    while len(cleaned) > 1 and len(" ".join(cleaned)) > 90:
+        cleaned.pop(0)
+    combined = clean_text(" ".join(cleaned))
+    combined = re.sub(r"\b(?:REPLACE|REPLACEMENT OF)\s+", "", combined, flags=re.I).strip()
+    return combined
+
+
+def _looks_like_explicit_spare_number_page(markdown: Any) -> bool:
+    lines = [clean_text(line) for line in str(markdown or "").splitlines()]
+    for index, line in enumerate(lines):
+        label = _EXPLICIT_SPARE_LABEL_RE.search(line)
+        if not label:
+            continue
+        identifier = _explicit_spare_identifier_from_text(line[label.end():])
+        if not identifier:
+            for next_line in lines[index + 1:index + 3]:
+                identifier = _explicit_spare_identifier_from_text(next_line)
+                if identifier:
+                    break
+        if identifier:
+            return True
+    return False
+
+
+def select_explicit_spare_number_pages(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Return pages containing clearly labelled spare-part identifiers outside tables."""
+    return [
+        (int(page), text)
+        for page, text in extracted_pages
+        if _looks_like_explicit_spare_number_page(text)
+    ]
+
+
+def select_spare_source_pages(
+    extracted_pages: Sequence[tuple[int, str]],
+    fallback_pages: Sequence[tuple[int, str]] | None = None,
+) -> list[tuple[int, str]]:
+    """Select all source-page families that can legitimately create spare rows.
+
+    This is intentionally broader than ``select_spare_table_pages``. A technical
+    manual may contain formal tables, illustrated lists, engineering drawings, and
+    prose/list sections with an explicit ``Spare part number`` label in the same PDF.
+    """
+    table_pages = select_spare_table_pages(extracted_pages, fallback_pages=[])
+    explicit_pages = select_explicit_spare_number_pages(extracted_pages)
+    selected_by_page: dict[int, str] = {}
+    for page, text in [*table_pages, *explicit_pages]:
+        selected_by_page[int(page)] = text
+    if selected_by_page:
+        return sorted(selected_by_page.items(), key=lambda item: item[0])
+    return list(fallback_pages if fallback_pages is not None else extracted_pages)
+
+
+def _deduplicate_explicit_spare_rows(
+    rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Deduplicate repeated references while preserving genuinely different parents."""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        identifier_key = normalize_key(row.get("ident_no", ""))
+        if identifier_key:
+            grouped.setdefault(identifier_key, []).append(dict(row))
+
+    output: list[dict[str, Any]] = []
+    removed = 0
+    for identifier_key, candidates in grouped.items():
+        # A dedicated recommended-spares/procurement list is stronger evidence than
+        # a maintenance-schedule reference to the same identifier. When such a
+        # high-priority source exists, use it to define the row/parent and treat
+        # lower-priority occurrences as corroborating evidence rather than a second
+        # import row. This prevents one part from duplicating merely because an
+        # earlier schedule page had ambiguous column reading order.
+        strongest_priority = max(int(row.get("source_priority", 0)) for row in candidates)
+        strongest = [
+            row for row in candidates
+            if int(row.get("source_priority", 0)) == strongest_priority
+        ]
+        if strongest_priority >= 3:
+            removed += len(candidates) - len(strongest)
+            candidates = strongest
+
+        parent_groups: dict[str, list[dict[str, Any]]] = {}
+        blank_parent: list[dict[str, Any]] = []
+        for row in candidates:
+            parent_key = normalize_key(row.get("section_name_english", ""))
+            if parent_key:
+                parent_groups.setdefault(parent_key, []).append(row)
+            else:
+                blank_parent.append(row)
+
+        if len(parent_groups) <= 1:
+            combined = candidates
+            best = max(
+                combined,
+                key=lambda row: (
+                    int(row.get("source_priority", 0)),
+                    bool(clean_text(row.get("section_name_english", ""))),
+                    bool(clean_text(row.get("description_english", ""))),
+                    -int(row.get("source_page") or 10**9),
+                ),
+            )
+            evidence_pages = sorted({int(row.get("source_page")) for row in combined if row.get("source_page")})
+            best["evidence_pages"] = evidence_pages
+            output.append(best)
+            removed += max(0, len(combined) - 1)
+            continue
+
+        # The same orderable part may legitimately be used under more than one
+        # parent component. Retain one best record per explicit parent. Parent-less
+        # duplicates are evidence only and are absorbed into the strongest group.
+        for parent_rows in parent_groups.values():
+            best = max(
+                parent_rows,
+                key=lambda row: (
+                    int(row.get("source_priority", 0)),
+                    bool(clean_text(row.get("description_english", ""))),
+                    -int(row.get("source_page") or 10**9),
+                ),
+            )
+            best["evidence_pages"] = sorted({int(row.get("source_page")) for row in parent_rows if row.get("source_page")})
+            output.append(best)
+            removed += max(0, len(parent_rows) - 1)
+        removed += len(blank_parent)
+
+    output.sort(key=lambda row: (int(row.get("source_page") or 10**9), clean_text(row.get("ident_no", ""))))
+    return output, removed
+
+
+def extract_explicit_spare_number_rows(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Recover non-tabular rows explicitly labelled as spare-part numbers.
+
+    The parser is manufacturer-neutral and deliberately high precision: a row is
+    created only when a source phrase such as ``Spare part number`` or ``Replacement
+    part No.`` is paired with a plausible identifier. Nearby short component headings
+    are retained as hierarchy context but never converted into fabricated codes.
+    """
+    rows: list[dict[str, Any]] = []
+    current_parent = ""
+    previous_page: int | None = None
+
+    for page_number, raw_text in sorted(
+        ((int(page), str(text or "")) for page, text in extracted_pages),
+        key=lambda item: item[0],
+    ):
+        if previous_page is not None and page_number - previous_page > 1:
+            current_parent = ""
+        previous_page = page_number
+        lines = [clean_text(line) for line in raw_text.splitlines()]
+        item_fragments: list[str] = []
+        page_recommended = "recommended spare parts" in clean_text(raw_text).lower()
+
+        for index, line in enumerate(lines):
+            if not line:
+                continue
+            label = _EXPLICIT_SPARE_LABEL_RE.search(line)
+            if label:
+                identifier = _explicit_spare_identifier_from_text(line[label.end():])
+                identifier_line_index = index
+                if not identifier:
+                    for offset, next_line in enumerate(lines[index + 1:index + 3], start=1):
+                        identifier = _explicit_spare_identifier_from_text(next_line)
+                        if identifier:
+                            identifier_line_index = index + offset
+                            break
+                if not identifier:
+                    item_fragments = []
+                    continue
+
+                row_parent = current_parent if page_recommended else ""
+
+                prefix = _clean_explicit_spare_description(line[:label.start()])
+                fragments = list(item_fragments)
+                if prefix:
+                    fragments.append(prefix)
+                description = _explicit_description_from_fragments(fragments)
+                if not description:
+                    description = "SPARE PART"
+
+                confidence = 0.92 if page_recommended else 0.86
+                source_priority = 3 if page_recommended else 2
+                rows.append(
+                    {
+                        "section_code": "",
+                        "section_name_english": clean_text(row_parent).upper(),
+                        "detected_machinery": clean_text(row_parent).upper(),
+                        "section_maker": "",
+                        "section_model": "",
+                        "table_title": (
+                            f"Recommended spare parts - {row_parent}"
+                            if page_recommended and row_parent
+                            else ("Recommended spare parts" if page_recommended else "Explicit spare-number list")
+                        ),
+                        "section_start_page": page_number,
+                        "source_part_no": "",
+                        "ident_no": identifier,
+                        "part_no": identifier,
+                        "code": identifier,
+                        "item_no": "",
+                        "description_english": description.upper(),
+                        "description": description.upper(),
+                        "unit": "PCS",
+                        "quantity": None,
+                        "source_page": page_number,
+                        "confidence": confidence,
+                        "source_pattern": "explicit spare-number list",
+                        "source_priority": source_priority,
+                        "explicit_spare_number": True,
+                    }
+                )
+                item_fragments = []
+                continue
+
+            cleaned_for_parent = _clean_explicit_spare_description(line)
+            if _looks_like_explicit_parent_heading(cleaned_for_parent):
+                current_parent = cleaned_for_parent
+                item_fragments = []
+                continue
+
+            upper = line.upper()
+            if any(upper.startswith(prefix) for prefix in _EXPLICIT_DESCRIPTION_SKIP_PREFIXES):
+                continue
+            if _explicit_spare_identifier_from_text(line) and not re.search(r"[A-Za-z]", line):
+                continue
+            fragment = _clean_explicit_spare_description(line)
+            if fragment:
+                item_fragments.append(fragment)
+                item_fragments = item_fragments[-4:]
+
+    deduplicated, duplicate_count = _deduplicate_explicit_spare_rows(rows)
+    messages: list[str] = []
+    if deduplicated:
+        pages = sorted({int(row["source_page"]) for row in deduplicated})
+        messages.append(
+            f"Explicit spare-number recovery found {len(deduplicated)} unique row(s) "
+            f"on source page(s) {', '.join(map(str, pages))}."
+        )
+    if duplicate_count:
+        messages.append(
+            f"Collapsed {duplicate_count} repeated explicit spare-number reference(s) "
+            "using identifier and compatible parent context."
+        )
+    return deduplicated, messages
+
+
+def extract_explicit_spares_from_pdf(
+    pdf_bytes: bytes,
+    page_indexes: Sequence[int] | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Text-layer safety net for explicit spare-number lists in PDF manuals."""
+    if not pdf_bytes:
+        return [], []
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return [], []
+    indexes = list(page_indexes) if page_indexes is not None else list(range(len(reader.pages)))
+    pages: list[tuple[int, str]] = []
+    for index in indexes:
+        if not 0 <= int(index) < len(reader.pages):
+            continue
+        page = reader.pages[int(index)]
+        try:
+            text = page.extract_text() or page.extract_text(extraction_mode="layout") or ""
+        except Exception:
+            try:
+                text = page.extract_text(extraction_mode="layout") or ""
+            except Exception:
+                text = ""
+        pages.append((int(index) + 1, text))
+    rows, messages = extract_explicit_spare_number_rows(pages)
+    if rows:
+        messages.insert(0, "PDF text-layer explicit-spare verification completed.")
+    return rows, messages
 
 
 
@@ -5047,6 +5715,9 @@ def build_section_catalog(
     for section in index_sections:
         register(section, priority=80)
 
+    for drawing_section in _drawing_heading_sections(extracted_pages):
+        register(drawing_section, priority=120)
+
     illustrated_parts_page_map: dict[int, dict[str, Any]] = {}
     for series in _illustrated_parts_series_sections(extracted_pages):
         registered_series = register(series, priority=125)
@@ -5206,7 +5877,11 @@ def build_section_catalog(
     parts_pages = {
         int(page)
         for page, markdown in extracted_pages
-        if int(page) not in index_pages and _looks_like_spare_table_page(markdown)
+        if int(page) not in index_pages
+        and (
+            _looks_like_spare_table_page(markdown)
+            or _looks_like_explicit_spare_number_page(markdown)
+        )
     }
     # Every source page explicitly titled "Parts List for Figure ..." in a
     # confirmed illustrated-parts series is a parts page even when OCR splits
@@ -5432,9 +6107,14 @@ def _normalized_ai_row(row: dict[str, Any]) -> dict[str, Any]:
             not item_no or normalize_key(item_no) == normalize_key(ident)
         ):
             item_no = reference_item
-    description, language_review = _best_effort_english_description(
-        item.get("description_english", item.get("description", ""))
-    )
+    explicit_source = normalize_key(item.get("source_pattern", "")) == normalize_key("explicit spare-number list")
+    if explicit_source:
+        description = clean_text(item.get("description_english", item.get("description", ""))).upper()
+        language_review = False
+    else:
+        description, language_review = _best_effort_english_description(
+            item.get("description_english", item.get("description", ""))
+        )
     return {
         **item,
         "ident_no": ident,
@@ -5866,6 +6546,23 @@ def prepare_benefit_rows(
         page_section = page_map.get(page) if page is not None else None
         ai_matches = exact_sections_for_code(ai_row.get("section_code", ""))
         conflict = False
+        explicit_spare_row = (
+            normalize_key(ai_row.get("source_pattern", ""))
+            == normalize_key("explicit spare-number list")
+        )
+
+        # Maintenance/procurement prose often contains component item tags such as
+        # QT201-50, PT201-16, etc. They are not automatically the parent machinery
+        # code. For an explicitly labelled spare-number row, prefer a strong parent
+        # NAME match from the document catalogue and otherwise keep the row on its
+        # source parent text/main machinery rather than borrowing a page-map code.
+        if explicit_spare_row and not direct_matches and not ai_matches:
+            explicit_name_match = fuzzy_section_for_name(
+                ai_row.get("section_name_english", "")
+            )
+            if explicit_name_match is not None:
+                return explicit_name_match, "explicit spare parent-title match", False
+            return None, "explicit spare parent unconfirmed", True
 
         if len(direct_matches) == 1:
             chosen = direct_matches[0]
@@ -6057,9 +6754,14 @@ def prepare_benefit_rows(
                 continue
             section, section_source, section_conflict = section_for(page, None, ai)
             ident_no = clean_text(ai.get("ident_no", ""))
-            description, language_review = _best_effort_english_description(
-                ai.get("description_english", "")
-            )
+            explicit_spare_row = normalize_key(ai.get("source_pattern", "")) == normalize_key("explicit spare-number list")
+            if explicit_spare_row:
+                description = clean_text(ai.get("description_english", "")).upper()
+                language_review = False
+            else:
+                description, language_review = _best_effort_english_description(
+                    ai.get("description_english", "")
+                )
             if not description or not (ident_no or clean_text(ai.get("item_no", ""))):
                 continue
             if allow_simple_section_codes and not ident_no:
@@ -6069,10 +6771,12 @@ def prepare_benefit_rows(
                 confidence = min(confidence, 0.60)
                 language_exceptions += 1
             if section_conflict:
-                confidence = min(confidence, 0.62)
+                if not explicit_spare_row:
+                    confidence = min(confidence, 0.62)
                 section_conflicts += 1
             if section is None:
-                confidence = min(confidence, 0.50)
+                if not explicit_spare_row:
+                    confidence = min(confidence, 0.50)
                 unconfirmed_sections += 1
             output.append(
                 {
@@ -6091,7 +6795,7 @@ def prepare_benefit_rows(
                     "source_section_name_raw": clean_text(ai.get("section_name_english", "")),
                     "confidence": confidence,
                     "language_review": language_review,
-                    "description_source": "AI English/translation",
+                    "description_source": "explicit printed spare-part number" if explicit_spare_row else "AI English/translation",
                     "description_source_mismatch": False,
                     "section_review": bool(section_conflict or section is None),
                     "section_assignment_source": section_source,
@@ -6099,7 +6803,8 @@ def prepare_benefit_rows(
                 }
             )
 
-    # AI-only rows are accepted only on pages that contain an actual parts table.
+    # AI-only/source-safety-net rows are accepted only on confirmed spare-source pages.
+    # This includes formal parts tables and explicit labelled spare-number lists.
     if direct_rows:
         existing_keys = {
             (
@@ -6119,9 +6824,14 @@ def prepare_benefit_rows(
             )
             if key in existing_keys:
                 continue
-            description, language_review = _best_effort_english_description(
-                ai.get("description_english", "")
-            )
+            explicit_spare_row = normalize_key(ai.get("source_pattern", "")) == normalize_key("explicit spare-number list")
+            if explicit_spare_row:
+                description = clean_text(ai.get("description_english", "")).upper()
+                language_review = False
+            else:
+                description, language_review = _best_effort_english_description(
+                    ai.get("description_english", "")
+                )
             if description and (
                 clean_text(ai.get("ident_no", ""))
                 or (
@@ -6133,15 +6843,17 @@ def prepare_benefit_rows(
                     ai.get("source_page"), None, ai
                 )
                 ident_no = clean_text(ai.get("ident_no", ""))
-                confidence = min(clamp_confidence(ai.get("confidence", 0.70)), 0.82)
+                confidence = clamp_confidence(ai.get("confidence", 0.70)) if explicit_spare_row else min(clamp_confidence(ai.get("confidence", 0.70)), 0.82)
                 if language_review:
                     confidence = min(confidence, 0.60)
                     language_exceptions += 1
                 if section_conflict:
-                    confidence = min(confidence, 0.62)
+                    if not explicit_spare_row:
+                        confidence = min(confidence, 0.62)
                     section_conflicts += 1
                 if section is None:
-                    confidence = min(confidence, 0.50)
+                    if not explicit_spare_row:
+                        confidence = min(confidence, 0.50)
                     unconfirmed_sections += 1
                 output.append(
                     {
@@ -6160,7 +6872,7 @@ def prepare_benefit_rows(
                         "source_section_name_raw": clean_text(ai.get("section_name_english", "")),
                         "confidence": confidence,
                         "language_review": language_review,
-                        "description_source": "AI-only row",
+                        "description_source": "explicit printed spare-part number" if explicit_spare_row else "AI-only row",
                         "description_source_mismatch": False,
                         "section_review": bool(section_conflict or section is None),
                         "section_assignment_source": section_source,
@@ -6189,7 +6901,10 @@ def prepare_benefit_rows(
 
     for row in output:
         identifier_key = normalize_key(row.get("ident_no", row.get("code", "")))
-        if allow_simple_section_codes and identifier_key:
+        explicit_row = bool(row.get("explicit_spare_number", False)) or normalize_key(row.get("source_pattern", "")) == normalize_key("explicit spare-number list")
+        if identifier_key and explicit_row:
+            key = ("EXPLICIT", identifier_key, normalize_key(row.get("description_english", row.get("description", ""))))
+        elif allow_simple_section_codes and identifier_key:
             # Order-No. is the unique catalogue identifier. If the same code is
             # printed again for another applicability line, keep one import row.
             key = ("ORDERNO", "", identifier_key)
@@ -6225,7 +6940,7 @@ def prepare_benefit_rows(
         deduplicated.append(row)
 
     messages = [
-        f"Deterministic table verification found {len(direct_rows)} spare-part row(s).",
+        f"Deterministic table verification found {len(direct_rows)} table-derived spare-part row(s).",
         f"Detected {len(sections)} source-coded sub-machinery section(s).",
     ]
     messages.extend(parent_identity_messages)
@@ -7018,7 +7733,52 @@ def merge_review_dataframes(existing: pd.DataFrame, new: pd.DataFrame) -> pd.Dat
         )
 
     keys = combined.apply(merge_key, axis=1)
-    return combined.loc[~keys.duplicated()].reset_index(drop=True)
+    merged = combined.loc[~keys.duplicated()].copy()
+
+    # Cross-range append de-duplication for explicitly labelled spare-number lists.
+    # A maintenance schedule can mention a spare first and a later recommended-spares
+    # section can repeat the same identifier. Prefer the later/more complete row for
+    # the same parent, absorb parent-less duplicates when a parent-backed row exists,
+    # but preserve the same identifier under genuinely different parent components.
+    explicit_mask = merged["TABLE TITLE"].fillna("").astype(str).str.lower().apply(
+        lambda value: (
+            "explicit spare-number" in value
+            or "recommended spare parts" in value
+        )
+    )
+    explicit_indexes = list(merged.index[explicit_mask])
+    drop_indexes: set[Any] = set()
+    groups: dict[str, list[Any]] = {}
+    for index in explicit_indexes:
+        identifier = normalize_key(
+            merged.at[index, "CODE"] or merged.at[index, "PART NO"]
+        )
+        if identifier:
+            groups.setdefault(identifier, []).append(index)
+    for indexes in groups.values():
+        if len(indexes) < 2:
+            continue
+        by_parent: dict[str, list[Any]] = {}
+        blank_parent: list[Any] = []
+        for index in indexes:
+            parent = normalize_key(merged.at[index, "DETECTED MACHINERY"])
+            if parent:
+                by_parent.setdefault(parent, []).append(index)
+            else:
+                blank_parent.append(index)
+        for parent_indexes in by_parent.values():
+            # Existing rows are concatenated before new append rows, so keep the last
+            # occurrence to allow a later recommended-spares source to improve an
+            # earlier maintenance-schedule reference without creating a duplicate.
+            drop_indexes.update(parent_indexes[:-1])
+        if by_parent:
+            drop_indexes.update(blank_parent)
+        elif len(blank_parent) > 1:
+            drop_indexes.update(blank_parent[:-1])
+
+    if drop_indexes:
+        merged = merged.drop(index=list(drop_indexes))
+    return merged.reset_index(drop=True)
 
 
 def machinery_rows_from_main_and_additional(
