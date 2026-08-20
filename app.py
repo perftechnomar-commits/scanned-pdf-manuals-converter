@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import io
 import inspect
+import importlib
 import re
 import secrets
 import smtplib
@@ -20,6 +21,15 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+# Streamlit reruns the application script without necessarily re-importing already
+# cached helper modules. During an in-place deployment, that can leave a live browser
+# session executing an older tools.py even though app.py has been updated on disk.
+# Reload tools on every script rerun so a normal in-app navigation picks up the
+# deployed parser immediately while preserving st.session_state and existing OCR work.
+import tools as _tools_module
+importlib.invalidate_caches()
+_tools_module = importlib.reload(_tools_module)
 
 from tools import (
     TOOLS_VERSION,
@@ -82,7 +92,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.14.6"
+APP_VERSION = "4.14.7"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
