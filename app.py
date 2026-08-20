@@ -22,6 +22,7 @@ import pandas as pd
 import streamlit as st
 
 from tools import (
+    TOOLS_VERSION,
     PAGE_FILTER_MODES,
     REVIEW_COLUMNS,
     SUBMACHINERY_REVIEW_COLUMNS,
@@ -80,7 +81,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.14.3"
+APP_VERSION = "4.14.4"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1634,9 +1635,16 @@ pin_persistent_input_state()
 save_loaded_job_state()
 
 st.title("📄 Spare Parts OCR Import Builder")
+VERSION_MISMATCH = str(TOOLS_VERSION).strip() != APP_VERSION
 st.caption(
+    f"Build {APP_VERSION} · Parser {TOOLS_VERSION} · "
     "Convert scanned spare-parts manuals into reviewed, import-ready Excel workbooks."
 )
+if VERSION_MISMATCH:
+    st.error(
+        "Deployment version mismatch: app.py and tools.py are from different builds. "
+        "Replace both files together and reboot before running OCR."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2985,11 +2993,15 @@ if active_workflow_step == "2. OCR":
             "Run OCR and extract spare-parts rows",
             type="primary",
             use_container_width=True,
-            disabled=not main_machinery_is_ready(),
+            disabled=(not main_machinery_is_ready() or VERSION_MISMATCH),
             help=(
-                "Complete the required machinery fields in step 1 before running OCR."
-                if not main_machinery_is_ready()
-                else "Run OCR using the selected processing mode and active advanced settings."
+                "Replace app.py and tools.py with matching builds and reboot first."
+                if VERSION_MISMATCH
+                else (
+                    "Complete the required machinery fields in step 1 before running OCR."
+                    if not main_machinery_is_ready()
+                    else "Run OCR using the selected processing mode and active advanced settings."
+                )
             ),
         )
         # Keep the normal workflow control above the optional diagnostics. A long
