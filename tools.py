@@ -1541,7 +1541,7 @@ def _openai_json_request(
         raise RuntimeError("OpenAI verification key is not configured.")
     endpoint = os.getenv("OPENAI_RESPONSES_URL", "https://api.openai.com/v1/responses")
     payload = {
-        "model": clean_text(model) or "gpt-5.6-terra",
+        "model": clean_text(model) or "gpt-5.6-sol",
         "input": [
             {
                 "role": "system",
@@ -1857,7 +1857,7 @@ def verify_document_profile_with_openai(
         return original, [
             "Optional OpenAI verification was skipped because OPENAI_API_KEY is not configured."
         ]
-    selected_model = clean_text(model) or "gpt-5.6-terra"
+    selected_model = clean_text(model) or "gpt-5.6-sol"
     try:
         sample = _representative_profile_pages(
             extracted_pages,
