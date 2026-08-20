@@ -80,7 +80,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.14.1"
+APP_VERSION = "4.14.2"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -3120,7 +3120,13 @@ if active_workflow_step == "2. OCR":
                             "model": "mistral-ocr-latest",
                             "status": "Completed" if rotated_rescued_pages else ("Attempted - no Article table found" if rotated_rescue_messages else "Not needed"),
                             "detail": (
-                                f"Recovered orderable Article No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}."
+                                (
+                                    f"Recovered orderable Article No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}. "
+                                    + " ".join(
+                                        message for message in rotated_rescue_messages
+                                        if "focused region OCR" in message
+                                    )
+                                ).strip()
                                 if rotated_rescued_pages
                                 else (rotated_rescue_messages[-1] if rotated_rescue_messages else "No engineering drawing showed enough evidence to require an alternate-orientation OCR pass.")
                             ),
