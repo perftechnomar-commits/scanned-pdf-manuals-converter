@@ -96,7 +96,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.15.0"
+APP_VERSION = "4.15.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1607,9 +1607,18 @@ def recalculate_review_with_verification(
     included = result["INCLUDE"].astype(bool)
     low_confidence = included & (confidence < float(confidence_threshold))
 
-    # Business rule: a spare-part CODE must be unique across the complete import.
+    # Business rule: a spare-part CODE must be unique across the rows that are
+    # actually selected for export. Excluded duplicate evidence must never block
+    # the retained included row. _consolidate_duplicate_part_codes() may keep an
+    # excluded occurrence in the review table for audit/source traceability, so
+    # duplicate detection must be scoped strictly to INCLUDE=True rows.
     code_values = result["CODE"].fillna("").astype(str).map(_normalise_source_code)
-    duplicate_codes = included & code_values.ne("") & code_values.duplicated(keep=False)
+    active_code_values = code_values.where(included, "")
+    duplicate_codes = (
+        included
+        & active_code_values.ne("")
+        & active_code_values.duplicated(keep=False)
+    )
     for index in result.index[duplicate_codes]:
         result.at[index, "READY"] = False
         current_warning = result.at[index, "WARNING"]
