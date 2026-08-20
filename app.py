@@ -22,11 +22,6 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# Streamlit reruns the application script without necessarily re-importing already
-# cached helper modules. During an in-place deployment, that can leave a live browser
-# session executing an older tools.py even though app.py has been updated on disk.
-# Reload tools on every script rerun so a normal in-app navigation picks up the
-# deployed parser immediately while preserving st.session_state and existing OCR work.
 import tools as _tools_module
 importlib.invalidate_caches()
 _tools_module = importlib.reload(_tools_module)
