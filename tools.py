@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.14.4"
+TOOLS_VERSION = "4.14.5"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -5626,6 +5626,29 @@ def _reconcile_engineering_article_parent_identity(
 
         resolved_code = explicit_code or (repeated_stem if strong_stem else "")
         resolved_name = explicit_name or (dominant_name if strong_name else "")
+        if explicit_name and strong_name and normalize_key(explicit_name) != normalize_key(dominant_name):
+            evidence = clean_text(title_block.get("section_name_evidence", "")).lower()
+            weak_pairing = (
+                not evidence
+                or "next-line" in evidence
+                or "offset" in evidence
+            )
+            dominant_pattern = re.compile(
+                rf"(?<![A-Z0-9]){re.escape(dominant_name)}(?![A-Z0-9])",
+                flags=re.IGNORECASE,
+            )
+            broad_navigation = bool(
+                dominant_pattern.search(explicit_name)
+                and len(explicit_name) >= len(dominant_name) + 8
+                and (
+                    "/" in explicit_name
+                    or " AND " in f" {explicit_name} "
+                    or "DRAWING" in explicit_name
+                    or "TECHNICAL DATA" in explicit_name
+                )
+            )
+            if weak_pairing and broad_navigation:
+                resolved_name = dominant_name
         if not resolved_code:
             continue
 
@@ -6411,10 +6434,19 @@ def _submachinery_hierarchy_confidence(
         1 for observation in observations
         if normalize_key(observation.get("code", "")) == code_key
     ) / count
-    name_support = sum(
+    hierarchy_name_support = sum(
         1 for observation in observations
         if normalize_key(observation.get("name", "")) == name_key
     ) / count
+    source_description_support = sum(
+        1 for observation in observations
+        if normalize_key(observation.get("part_description", "")) == name_key
+    ) / count
+    # A repeated source Name/Designation is independent evidence for the hierarchy
+    # name on engineering Article-No. families. This lets a difficult title-block
+    # OCR remain low quality without dragging a strongly corroborated parent name
+    # down with it.
+    name_support = max(hierarchy_name_support, source_description_support)
 
     # The strongest generic evidence is that the orderable spare identifiers
     # themselves encode the same parent/drawing stem. Examples include
@@ -6463,6 +6495,82 @@ def _submachinery_hierarchy_confidence(
     return baseline
 
 
+def _submachinery_name_from_source_consensus(
+    observations: Sequence[dict[str, Any]],
+    resolved_code: str,
+    current_name: str,
+) -> str:
+    """Prefer a strongly corroborated source designation over broad navigation text.
+
+    This is intentionally generic and conservative. It activates only when at least
+    three spare identifiers independently encode the same parent/drawing stem and at
+    least 75% of those rows repeat the same concise source description. A broad
+    chapter/navigation label can then be replaced by that repeated source designation.
+    Exact short assembly titles are otherwise preserved.
+    """
+    if not observations:
+        return clean_text(current_name).upper()
+
+    code_key = normalize_key(resolved_code)
+    current = clean_text(current_name).upper()
+    if not code_key:
+        return current
+
+    count = len(observations)
+    stems = [
+        _engineering_article_parent_stem(obs.get("part_identifier", ""))
+        for obs in observations
+    ]
+    stem_matches = sum(1 for stem in stems if stem and normalize_key(stem) == code_key)
+    if count < 3 or stem_matches < 3 or stem_matches / count < 0.75:
+        return current
+
+    descriptions = [
+        clean_text(obs.get("part_description", "")).upper()
+        for obs in observations
+        if clean_text(obs.get("part_description", ""))
+    ]
+    if not descriptions:
+        return current
+    description_counts = {value: descriptions.count(value) for value in set(descriptions)}
+    dominant, dominant_count = max(description_counts.items(), key=lambda item: item[1])
+    if (
+        dominant_count < 3
+        or dominant_count / count < 0.90
+        or len(dominant) > 80
+        or _is_generic_machinery_name(dominant)
+    ):
+        return current
+
+    if not current:
+        return dominant
+    if normalize_key(current) == normalize_key(dominant):
+        return current
+
+    # Only replace a broader label when the repeated designation is a complete
+    # word/phrase within it. This avoids turning VALVES into VALVE or replacing an
+    # unrelated explicit assembly title merely because descriptions are repetitive.
+    dominant_pattern = re.compile(
+        rf"(?<![A-Z0-9]){re.escape(dominant)}(?![A-Z0-9])",
+        flags=re.IGNORECASE,
+    )
+    dominant_is_component = bool(dominant_pattern.search(current))
+    broader_context = (
+        len(current) >= len(dominant) + 8
+        and len(current.split()) >= 5
+    )
+    navigation_like = bool(
+        "/" in current
+        or " AND " in f" {current} "
+        or " INCLUDING " in f" {current} "
+        or "DRAWING" in current
+        or "TECHNICAL DATA" in current
+    )
+    if dominant_is_component and broader_context and navigation_like:
+        return dominant
+    return current
+
+
 def build_submachinery_candidates(
     review_frame: pd.DataFrame,
     main_row: dict[str, Any],
@@ -6497,6 +6605,7 @@ def build_submachinery_candidates(
                 "part_identifier": clean_text(
                     row.get("CODE", row.get("PART NO", ""))
                 ),
+                "part_description": clean_text(row.get("DESCRIPTION", "")).upper(),
             }
         )
     if not observations:
@@ -6517,6 +6626,9 @@ def build_submachinery_candidates(
         model_values = [obs["model"] for obs in group_observations if obs["model"]]
         code = max(set(code_values), key=code_values.count) if code_values else ""
         name = max(set(name_values), key=lambda value: (name_values.count(value), -len(value))) if name_values else ""
+        name = _submachinery_name_from_source_consensus(
+            group_observations, code, name
+        )
         maker = max(set(maker_values), key=maker_values.count) if maker_values else clean_text(main_row.get("MAKER", "")).upper()
         model = max(set(model_values), key=model_values.count) if model_values else clean_text(main_row.get("MODEL", "")).upper()
         pages = [obs["source_page"] for obs in group_observations if obs["source_page"] is not None]
