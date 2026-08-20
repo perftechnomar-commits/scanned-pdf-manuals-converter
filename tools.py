@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.14.3"
+TOOLS_VERSION = "4.14.4"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -4252,9 +4252,137 @@ def _plain_orderable_article_rows(
     return rows
 
 
+
+def _engineering_article_consensus_metadata(
+    rows: Sequence[dict[str, Any]],
+    page_number: int | None = None,
+    markdown: str = "",
+) -> dict[str, Any]:
+    """Derive parent hierarchy from a coherent orderable Article-No. table.
+
+    This is a generic evidence-reconciliation rule for engineering drawings. OCR
+    can recover the orderable rows while failing to pair the nearby ``Document
+    No.`` and ``Title`` labels. When several source-backed Article-No. values share
+    one stable prefix, that prefix is strong evidence for the parent drawing code.
+    A repeated spare description may identify the title only when it dominates the
+    same source table. The rule never activates for ordinary parts catalogues,
+    varied descriptions, dates, or a single isolated article.
+    """
+    source_rows = [dict(row) for row in rows if isinstance(row, dict)]
+    if not source_rows:
+        return {}
+
+    def article_stem(value: Any) -> str:
+        text_value = re.sub(r"\s+", " ", clean_text(value)).strip(" .;,|:").upper()
+        match = re.fullmatch(
+            r"([A-Z0-9][A-Z0-9._/-]{4,24})\s+([A-Z0-9._/-]{1,6})",
+            text_value,
+            flags=re.I,
+        )
+        if not match:
+            return ""
+        prefix = match.group(1).strip(" .;,|:").upper()
+        if _is_date_like_section_code(prefix):
+            return ""
+        if not re.search(r"\d{5}", prefix):
+            return ""
+        if not _valid_automatic_section_code(prefix):
+            return ""
+        return prefix
+
+    stem_rows: dict[str, list[dict[str, Any]]] = {}
+    for row in source_rows:
+        identifier = clean_text(
+            row.get("ident_no", row.get("code", row.get("part_no", "")))
+        )
+        stem = article_stem(identifier)
+        if stem:
+            stem_rows.setdefault(stem, []).append(row)
+
+    if not stem_rows:
+        return {}
+    stem, matching_rows = max(
+        stem_rows.items(),
+        key=lambda item: (len(item[1]), len(item[0])),
+    )
+    identifiable_rows = sum(len(values) for values in stem_rows.values())
+    required = max(2, (identifiable_rows * 3 + 4) // 5)  # at least 60% agreement
+    if len(matching_rows) < required:
+        return {}
+
+    # Prefer an explicitly labelled title if the title-block parser managed to
+    # recover one. The consensus code can still replace an unrelated chapter code.
+    labelled = _engineering_title_block_metadata(markdown) if markdown else {}
+    labelled_title = clean_text(labelled.get("section_name_english", "")).upper()
+
+    excluded_descriptions = {
+        "PURCHASED ARTICLE", "BOUGHT OUT ITEM", "BOUGHT-OUT ITEM",
+        "STANDARD ARTICLE", "MATERIAL", "BLANK", "MATERIAL/BLANK",
+        "NOTE", "ART. REV.", "ARTICLE",
+    }
+    description_groups: dict[str, list[str]] = {}
+    for row in matching_rows:
+        description = clean_text(
+            row.get(
+                "description_raw",
+                row.get("description_english", row.get("description", "")),
+            )
+        ).upper()
+        if not description or description in excluded_descriptions:
+            continue
+        if not re.search(r"[A-Z]", description):
+            continue
+        key = normalize_key(description)
+        if key:
+            description_groups.setdefault(key, []).append(description)
+
+    consensus_title = ""
+    if description_groups:
+        _, values = max(
+            description_groups.items(),
+            key=lambda item: (len(item[1]), -len(item[1][0])),
+        )
+        title_required = max(2, (len(matching_rows) * 3 + 4) // 5)
+        if len(values) >= title_required:
+            consensus_title = max(set(values), key=values.count)
+
+    title = labelled_title or consensus_title
+    # When a labelled title is long navigation/chapter text but every orderable
+    # row independently repeats one concise designation, the table consensus is
+    # more specific to the parent article family.
+    if labelled_title and consensus_title:
+        if normalize_key(labelled_title) != normalize_key(consensus_title):
+            if len(consensus_title) < len(labelled_title) and len(matching_rows) >= 3:
+                title = consensus_title
+
+    result: dict[str, Any] = {
+        "section_code": stem,
+        "section_code_source": "engineering article-table consensus",
+        "section_code_evidence": (
+            f"{len(matching_rows)} source Article-No. rows share prefix {stem}"
+        ),
+        "confidence": 0.92,
+    }
+    if page_number is not None:
+        result["page"] = int(page_number)
+    if title:
+        result.update(
+            {
+                "section_name_raw": title,
+                "section_name_english": title,
+                "section_name_evidence": (
+                    "dominant Name/Designation value"
+                    if consensus_title and normalize_key(title) == normalize_key(consensus_title)
+                    else "labelled engineering title"
+                ),
+            }
+        )
+    return result
+
 def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for page_number, markdown in extracted_pages:
+        page_row_start = len(rows)
         classic_catalog = _is_multilingual_order_catalog(markdown)
         article_drawing = _is_engineering_article_table(markdown)
         metadata = _page_metadata(int(page_number), markdown)
@@ -4424,6 +4552,33 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
             rows.extend(_plain_orderable_article_rows(int(page_number), markdown, metadata))
         if article_drawing and not any(int(row.get("source_page") or 0) == int(page_number) for row in rows):
             rows.extend(_columnar_orderable_article_rows(int(page_number), markdown, metadata))
+
+        # Reconcile the hierarchy only after the orderable rows are available. A
+        # document-wide section heading such as 4.3.21 is navigation context, while
+        # seven Article-No. values sharing 9007280 and the same CABLE designation
+        # are direct source evidence for the drawing parent. This rule is generic
+        # and applies to any coherent engineering Article-No. table.
+        if article_drawing and len(rows) > page_row_start:
+            page_rows = rows[page_row_start:]
+            consensus = _engineering_article_consensus_metadata(
+                page_rows, int(page_number), markdown
+            )
+            if consensus:
+                for row in page_rows:
+                    row["section_code"] = consensus.get("section_code", row.get("section_code", ""))
+                    if clean_text(consensus.get("section_name_english", "")):
+                        row["section_name_english"] = consensus["section_name_english"]
+                        row["table_title"] = consensus.get(
+                            "section_name_raw", consensus["section_name_english"]
+                        )
+                    row["section_start_page"] = int(page_number)
+                    row["section_context_source"] = consensus.get(
+                        "section_code_source", "engineering article-table consensus"
+                    )
+                    row["confidence"] = max(
+                        clamp_confidence(row.get("confidence", 0.88)),
+                        float(consensus.get("confidence", 0.92)),
+                    )
     return rows
 
 def _index_sections(extracted_pages: Sequence[tuple[int, str]]) -> tuple[list[dict[str, Any]], set[int]]:
@@ -4785,6 +4940,25 @@ def build_section_catalog(
     sections: list[dict[str, Any]] = []
     by_alias: dict[str, dict[str, Any]] = {}
 
+    markdown_by_page = {int(page): markdown for page, markdown in extracted_pages}
+    rows_by_page: dict[int, list[dict[str, Any]]] = {}
+    for extracted_row in extracted_rows or []:
+        source_page_value = quantity_to_number(extracted_row.get("source_page"))
+        if source_page_value is None:
+            continue
+        rows_by_page.setdefault(int(source_page_value), []).append(dict(extracted_row))
+
+    engineering_consensus_by_page: dict[int, dict[str, Any]] = {}
+    for source_page, source_rows in rows_by_page.items():
+        page_markdown = markdown_by_page.get(source_page, "")
+        if not page_markdown or not _is_engineering_article_table(page_markdown):
+            continue
+        consensus = _engineering_article_consensus_metadata(
+            source_rows, source_page, page_markdown
+        )
+        if consensus:
+            engineering_consensus_by_page[source_page] = consensus
+
     def catalog_code_tokens(value: Any) -> list[str]:
         text = clean_text(value).upper().strip().rstrip(".")
         if _is_date_like_section_code(text):
@@ -4888,6 +5062,18 @@ def build_section_catalog(
     for page_number, markdown in extracted_pages:
         page = int(page_number)
         metadata = _page_metadata(page, markdown)
+        consensus = engineering_consensus_by_page.get(page)
+        if consensus:
+            metadata["section_code"] = consensus.get("section_code", "")
+            metadata["section_code_source"] = consensus.get(
+                "section_code_source", "engineering article-table consensus"
+            )
+            metadata["section_code_evidence"] = consensus.get("section_code_evidence", "")
+            if clean_text(consensus.get("section_name_english", "")):
+                metadata["section_name_raw"] = consensus.get(
+                    "section_name_raw", consensus["section_name_english"]
+                )
+                metadata["section_name_english"] = consensus["section_name_english"]
         page_metadata[page] = metadata
         if page in index_pages:
             continue
@@ -4910,7 +5096,7 @@ def build_section_catalog(
             if registered_headings:
                 page_heading_sections[page] = registered_headings
                 continue
-        if clean_text(metadata.get("section_code_source", "")) == "engineering drawing title block":
+        if clean_text(metadata.get("section_code_source", "")) in {"engineering drawing title block", "engineering article-table consensus"}:
             printed_code = clean_text(metadata.get("section_code", "")).upper()
             code_tokens = [printed_code] if printed_code else []
         else:
@@ -4918,7 +5104,7 @@ def build_section_catalog(
         if code_tokens:
             is_title_block = (
                 clean_text(metadata.get("section_code_source", ""))
-                == "engineering drawing title block"
+                in {"engineering drawing title block", "engineering article-table consensus"}
             )
             registered = register(
                 {
@@ -4947,7 +5133,7 @@ def build_section_catalog(
         source_page_value = quantity_to_number(row.get("source_page"))
         source_page = int(source_page_value) if source_page_value is not None else None
         source_metadata = page_metadata.get(source_page, {}) if source_page is not None else {}
-        if clean_text(source_metadata.get("section_code_source", "")) == "engineering drawing title block":
+        if clean_text(source_metadata.get("section_code_source", "")) in {"engineering drawing title block", "engineering article-table consensus"}:
             printed_code = clean_text(source_metadata.get("section_code", "")).upper()
             code_tokens = [printed_code] if printed_code else []
         else:
@@ -5319,6 +5505,199 @@ def _carry_forward_merged_item_numbers(
     return result, inherited_count
 
 
+
+def _engineering_article_parent_stem(value: Any) -> str:
+    """Return the parent/drawing stem from a structured Article No. value.
+
+    This deliberately requires a clear parent + variant suffix pattern. It does
+    not split ordinary one-piece part numbers and therefore cannot create a
+    hierarchy merely because several unrelated identifiers share leading digits.
+    """
+    text = clean_text(value).upper().strip(" .;,:|-")
+    match = re.fullmatch(
+        r"([A-Z0-9]{5,12})[\s._/-]+([A-Z0-9]{1,4})",
+        text,
+        flags=re.I,
+    )
+    if not match:
+        return ""
+    parent = _valid_automatic_section_code(match.group(1))
+    suffix = clean_text(match.group(2))
+    if not parent or not suffix or normalize_key(parent) == normalize_key(suffix):
+        return ""
+    return parent
+
+
+def _chapter_like_section_code(value: Any) -> bool:
+    """Return True for navigation/section numbering rather than drawing identity."""
+    text = clean_text(value).strip().rstrip(".")
+    return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){1,5}", text))
+
+
+def _reconcile_engineering_article_parent_identity(
+    rows: Sequence[dict[str, Any]],
+    extracted_pages: Sequence[tuple[int, str]],
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    """Correct parent hierarchy from cumulative, source-backed article evidence.
+
+    OCR reading order can expose a chapter heading (for example 4.3.21) while the
+    actual labelled drawing number/title remain difficult to pair. Once the page
+    has yielded several genuine Article-No. rows, their common structured stem and
+    repeated short Name/Designation provide independent source evidence for the
+    parent drawing. This reconciliation is generic and runs only on confirmed
+    engineering Article-No. tables.
+    """
+    result = [dict(row) for row in rows if isinstance(row, dict)]
+    if not result:
+        return result, 0, []
+
+    page_lookup = {int(page): str(markdown or "") for page, markdown in extracted_pages}
+    row_indexes_by_page: dict[int, list[int]] = {}
+    for index, row in enumerate(result):
+        page_value = quantity_to_number(row.get("source_page"))
+        if page_value is None:
+            continue
+        row_indexes_by_page.setdefault(int(page_value), []).append(index)
+
+    changed_rows = 0
+    messages: list[str] = []
+    for page_number, indexes in sorted(row_indexes_by_page.items()):
+        markdown = page_lookup.get(page_number, "")
+        if not markdown or not _is_engineering_article_table(markdown):
+            continue
+        if len(indexes) < 3:
+            continue
+
+        title_block = _engineering_title_block_metadata(markdown)
+        explicit_code = _valid_automatic_section_code(
+            title_block.get("section_code", "")
+        )
+        explicit_name = clean_text(
+            title_block.get("section_name_english", "")
+        ).upper()
+
+        identifiers = [
+            clean_text(result[index].get("ident_no", result[index].get("code", "")))
+            for index in indexes
+        ]
+        stems = [
+            stem
+            for stem in (_engineering_article_parent_stem(value) for value in identifiers)
+            if stem
+        ]
+        stem_counts = {stem: stems.count(stem) for stem in set(stems)}
+        repeated_stem = ""
+        repeated_count = 0
+        if stem_counts:
+            repeated_stem, repeated_count = max(
+                stem_counts.items(), key=lambda item: item[1]
+            )
+        strong_stem = bool(
+            repeated_stem
+            and repeated_count >= 3
+            and repeated_count / max(1, len(indexes)) >= 0.75
+        )
+
+        descriptions = [
+            clean_text(
+                result[index].get(
+                    "description_english", result[index].get("description", "")
+                )
+            ).upper()
+            for index in indexes
+        ]
+        descriptions = [value for value in descriptions if value]
+        description_counts = {
+            value: descriptions.count(value) for value in set(descriptions)
+        }
+        dominant_name = ""
+        dominant_count = 0
+        if description_counts:
+            dominant_name, dominant_count = max(
+                description_counts.items(), key=lambda item: item[1]
+            )
+        strong_name = bool(
+            dominant_name
+            and dominant_count >= 3
+            and dominant_count / max(1, len(indexes)) >= 0.75
+            and len(dominant_name) <= 80
+            and not _is_generic_machinery_name(dominant_name)
+        )
+
+        resolved_code = explicit_code or (repeated_stem if strong_stem else "")
+        resolved_name = explicit_name or (dominant_name if strong_name else "")
+        if not resolved_code:
+            continue
+
+        page_changes = 0
+        for index in indexes:
+            row = result[index]
+            current_code = clean_text(row.get("section_code", "")).upper()
+            current_name = clean_text(
+                row.get("section_name_english", row.get("detected_machinery", ""))
+            ).upper()
+
+            replace_code = bool(
+                explicit_code
+                or not current_code
+                or _is_date_like_section_code(current_code)
+                or _chapter_like_section_code(current_code)
+                or normalize_key(current_code) == normalize_key(repeated_stem)
+            )
+            if replace_code and normalize_key(current_code) != normalize_key(resolved_code):
+                row["section_code"] = resolved_code
+                page_changes += 1
+
+            navigation_like_name = bool(
+                "/" in current_name
+                or "DRAWING" in current_name
+                or "DIMENSION" in current_name
+                or "TECHNICAL DATA" in current_name
+            )
+            replace_name = bool(
+                resolved_name
+                and (
+                    explicit_name
+                    or not current_name
+                    or navigation_like_name
+                    or _is_generic_machinery_name(current_name)
+                )
+            )
+            if replace_name and normalize_key(current_name) != normalize_key(resolved_name):
+                row["section_name_english"] = resolved_name
+                row["detected_machinery"] = resolved_name
+                row["table_title"] = resolved_name
+                page_changes += 1
+
+            row["section_start_page"] = int(page_number)
+            row["section_assignment_source"] = "engineering title-block/article evidence"
+            row["section_review"] = False
+            if resolved_name:
+                row["confidence"] = max(
+                    clamp_confidence(row.get("confidence", 0.0), fallback=0.0),
+                    0.90,
+                )
+
+        if page_changes:
+            changed_rows += len(indexes)
+            source_description = (
+                "labelled title block"
+                if explicit_code
+                else "repeated Article-No. parent stem"
+            )
+            name_description = (
+                "labelled title"
+                if explicit_name
+                else ("repeated Name/Designation" if resolved_name else "existing title")
+            )
+            messages.append(
+                f"PDF page {page_number}: reconciled {len(indexes)} engineering article "
+                f"row(s) to parent {resolved_code} / {resolved_name or 'existing name'} "
+                f"using {source_description} and {name_description}."
+            )
+
+    return result, changed_rows, messages
+
 def prepare_benefit_rows(
     ai_rows: Sequence[dict[str, Any]],
     extracted_pages: Sequence[tuple[int, str]],
@@ -5390,7 +5769,7 @@ def prepare_benefit_rows(
             variant["identifier_rejected"] = False
             normalized_ai.append(variant)
 
-    catalog = build_section_catalog(section_context_pages, normalized_ai, main_row)
+    catalog = build_section_catalog(section_context_pages, [*normalized_ai, *direct_rows], main_row)
     sections = catalog["sections"]
     page_map = catalog["page_map"]
     page_map_sources = catalog.get("page_map_sources", {})
@@ -5602,6 +5981,14 @@ def prepare_benefit_rows(
                 confidence = min(confidence, 0.62)
             if section is None:
                 confidence = min(confidence, 0.50)
+            source_backed_engineering_row = bool(
+                extraction_profile == ENGINEERING_ARTICLE_DRAWING_PROFILE
+                and clean_text(direct.get("ident_no", ""))
+                and clean_text(direct.get("section_context_source", ""))
+                == "engineering article-table consensus"
+            )
+            if source_backed_engineering_row and not language_review and not section_conflict:
+                confidence = max(confidence, 0.90)
 
             ident_no = clean_text(direct.get("ident_no", ""))
             resolved_item_no = clean_text(direct.get("item_no", "")) or clean_text(
@@ -5758,6 +6145,10 @@ def prepare_benefit_rows(
                     }
                 )
 
+    output, reconciled_parent_rows, parent_identity_messages = (
+        _reconcile_engineering_article_parent_identity(output, extracted_pages)
+    )
+
     output, inherited_item_count = _carry_forward_merged_item_numbers(output)
 
     # Deterministic de-duplication by source page + item + identifier. In the
@@ -5814,6 +6205,7 @@ def prepare_benefit_rows(
         f"Deterministic table verification found {len(direct_rows)} spare-part row(s).",
         f"Detected {len(sections)} source-coded sub-machinery section(s).",
     ]
+    messages.extend(parent_identity_messages)
     if rejected_non_article_ai_rows:
         messages.append(
             f"Rejected {rejected_non_article_ai_rows} AI row(s) from construction/composition tables because no genuine Article No. was present."
