@@ -32,6 +32,7 @@ from tools import (
     apply_submachinery_assignments,
     build_audit_workbook,
     build_submachinery_candidates,
+    refresh_submachinery_derived_fields,
     build_workbook,
     classify_ocr_pages,
     empty_review_dataframe,
@@ -81,7 +82,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.14.5"
+APP_VERSION = "4.14.6"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2651,6 +2652,22 @@ if active_workflow_step == "3. Sub-machineries":
             sub_frame = sub_frame[SUBMACHINERY_REVIEW_COLUMNS]
             sub_frame["MCH_TP(M/S/U)"] = "SubMachinery"
         st.session_state.submachinery_review = sub_frame
+
+        # Self-heal derived Step-3 evidence from the current spare review. This is
+        # intentionally local/deterministic: it performs no OCR or AI call and it
+        # preserves all user-editable proposal fields. It also upgrades persisted
+        # document jobs whose confidence was calculated by an older parser build.
+        if not st.session_state.spare_review.empty:
+            source_name = active_job.get("file_name", "") if active_job else ""
+            refreshed_submachineries = refresh_submachinery_derived_fields(
+                st.session_state.submachinery_review,
+                st.session_state.spare_review,
+                current_main_row(),
+                source_document_name=source_name,
+            )
+            if not refreshed_submachineries.equals(st.session_state.submachinery_review):
+                st.session_state.submachinery_review = refreshed_submachineries
+                save_loaded_job_state()
 
         if st.session_state.submachinery_review.empty:
             if workflow_ocr_ready and st.session_state.spare_review.empty:
