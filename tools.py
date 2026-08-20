@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.14.5"
+TOOLS_VERSION = "4.14.6"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -6602,8 +6602,17 @@ def build_submachinery_candidates(
                 "source_page": int(source) if source is not None else None,
                 "section_page": int(section) if section is not None else None,
                 "confidence": clamp_confidence(row.get("CONFIDENCE", 0.70)),
-                "part_identifier": clean_text(
-                    row.get("CODE", row.get("PART NO", ""))
+                "part_identifier": next(
+                    (
+                        value
+                        for value in (
+                            clean_text(row.get("CODE", "")),
+                            clean_text(row.get("PART NO", "")),
+                        )
+                        if value and _engineering_article_parent_stem(value)
+                    ),
+                    clean_text(row.get("CODE", ""))
+                    or clean_text(row.get("PART NO", "")),
                 ),
                 "part_description": clean_text(row.get("DESCRIPTION", "")).upper(),
             }
@@ -6682,6 +6691,70 @@ def build_submachinery_candidates(
     frame["PARTS FOUND"] = pd.to_numeric(frame["PARTS FOUND"], errors="coerce").fillna(0).astype(int)
     frame["CONFIDENCE"] = pd.to_numeric(frame["CONFIDENCE"], errors="coerce").fillna(0.70)
     return frame.sort_values(["FIRST PAGE", "NAME"], na_position="last").reset_index(drop=True)
+
+
+def refresh_submachinery_derived_fields(
+    existing: pd.DataFrame | None,
+    review_frame: pd.DataFrame | None,
+    main_row: dict[str, Any],
+    source_document_name: str = "",
+) -> pd.DataFrame:
+    """Recalculate read-only proposal evidence from the current spare review.
+
+    Document jobs persist their Step-3 proposal dataframe in session/job state. After a
+    parser upgrade, that stored dataframe can therefore retain an old confidence value
+    even though the underlying spare rows now contain enough evidence for the newer
+    hierarchy-confidence logic. This helper self-heals only derived/read-only fields;
+    user-editable machinery values are left untouched. No OCR or AI call is made.
+    """
+    if review_frame is None or review_frame.empty:
+        return existing.copy() if existing is not None else empty_submachinery_review_dataframe()
+
+    detected = build_submachinery_candidates(
+        review_frame,
+        main_row,
+        source_document_name=source_document_name,
+    )
+    if existing is None or existing.empty:
+        return detected
+    if detected.empty:
+        return existing.copy()
+
+    result = existing.copy()
+    for column in SUBMACHINERY_REVIEW_COLUMNS:
+        if column not in result.columns:
+            result[column] = False if column == "INCLUDE" else ""
+    result = result[SUBMACHINERY_REVIEW_COLUMNS]
+
+    for index, old_row in result.iterrows():
+        old_code = normalize_key(old_row.get("CODE", ""))
+        old_keys = _split_detection_keys(old_row.get("DETECTION KEYS", ""))
+        matched = None
+        for _, new_row in detected.iterrows():
+            new_code = normalize_key(new_row.get("CODE", ""))
+            new_keys = _split_detection_keys(new_row.get("DETECTION KEYS", ""))
+            if (old_code and new_code == old_code) or bool(old_keys & new_keys):
+                matched = new_row
+                break
+        if matched is None:
+            continue
+        for column in ("FIRST PAGE", "LAST PAGE", "PARTS FOUND", "CONFIDENCE"):
+            result.at[index, column] = matched.get(column, result.at[index, column])
+
+    result["MCH_TP(M/S/U)"] = "SubMachinery"
+    result["CONFIDENCE"] = pd.to_numeric(
+        result["CONFIDENCE"], errors="coerce"
+    ).fillna(0.70)
+    result["PARTS FOUND"] = pd.to_numeric(
+        result["PARTS FOUND"], errors="coerce"
+    ).fillna(0).astype(int)
+    result["FIRST PAGE"] = pd.to_numeric(
+        result["FIRST PAGE"], errors="coerce"
+    ).astype("Int64")
+    result["LAST PAGE"] = pd.to_numeric(
+        result["LAST PAGE"], errors="coerce"
+    ).astype("Int64")
+    return result.reset_index(drop=True)
 
 
 def merge_submachinery_candidates(
