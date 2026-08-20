@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.15.0"
+TOOLS_VERSION = "4.15.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
