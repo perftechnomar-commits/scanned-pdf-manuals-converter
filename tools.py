@@ -6376,6 +6376,93 @@ def _generated_submachinery_code(position: int, existing_codes: set[str]) -> str
         counter += 1
 
 
+def _submachinery_hierarchy_confidence(
+    observations: Sequence[dict[str, Any]],
+    resolved_code: str,
+    resolved_name: str,
+) -> float:
+    """Return confidence in the *parent hierarchy*, not raw row OCR quality.
+
+    Spare-row confidence and hierarchy confidence are different signals. A difficult
+    rotated scan can legitimately give individual OCR rows very low confidence while
+    the parent sub-machinery is still strongly proven by cumulative source evidence.
+
+    The only strong automatic uplift is source-backed: at least three spare identifiers
+    must independently expose the same structured parent stem as ``resolved_code`` and
+    the detected hierarchy name must also agree across the group. Merely repeating the
+    same low-confidence AI guess is not enough to manufacture a high confidence score.
+    """
+    if not observations:
+        return 0.70
+
+    row_confidences = [
+        clamp_confidence(observation.get("confidence", 0.70))
+        for observation in observations
+    ]
+    baseline = sum(row_confidences) / max(1, len(row_confidences))
+
+    code_key = normalize_key(resolved_code)
+    name_key = normalize_key(resolved_name)
+    count = len(observations)
+    if not code_key or not name_key:
+        return baseline
+
+    code_support = sum(
+        1 for observation in observations
+        if normalize_key(observation.get("code", "")) == code_key
+    ) / count
+    name_support = sum(
+        1 for observation in observations
+        if normalize_key(observation.get("name", "")) == name_key
+    ) / count
+
+    # The strongest generic evidence is that the orderable spare identifiers
+    # themselves encode the same parent/drawing stem. Examples include
+    # ``9007280 99`` -> ``9007280`` and ``03036-58A`` -> ``03036``.
+    stem_matches = 0
+    stem_candidates = 0
+    for observation in observations:
+        stem = _engineering_article_parent_stem(
+            observation.get("part_identifier", "")
+        )
+        if not stem:
+            continue
+        stem_candidates += 1
+        if normalize_key(stem) == code_key:
+            stem_matches += 1
+
+    stem_support_all_rows = stem_matches / count
+    stem_support_candidates = (
+        stem_matches / stem_candidates if stem_candidates else 0.0
+    )
+
+    section_pages = [
+        observation.get("section_page")
+        for observation in observations
+        if observation.get("section_page") is not None
+    ]
+    page_consistency = 0.0
+    if section_pages:
+        dominant_page_count = max(section_pages.count(page) for page in set(section_pages))
+        page_consistency = dominant_page_count / len(section_pages)
+
+    strong_source_consensus = bool(
+        count >= 3
+        and stem_matches >= 3
+        and stem_support_all_rows >= 0.75
+        and stem_support_candidates >= 0.90
+        and code_support >= 0.75
+        and name_support >= 0.75
+    )
+    if strong_source_consensus:
+        # 0.92 means strong corroboration rather than perfect certainty. Give a
+        # small additional uplift when all source rows agree on one section page.
+        evidence_confidence = 0.94 if page_consistency >= 0.90 else 0.92
+        return max(baseline, evidence_confidence)
+
+    return baseline
+
+
 def build_submachinery_candidates(
     review_frame: pd.DataFrame,
     main_row: dict[str, Any],
@@ -6407,6 +6494,9 @@ def build_submachinery_candidates(
                 "source_page": int(source) if source is not None else None,
                 "section_page": int(section) if section is not None else None,
                 "confidence": clamp_confidence(row.get("CONFIDENCE", 0.70)),
+                "part_identifier": clean_text(
+                    row.get("CODE", row.get("PART NO", ""))
+                ),
             }
         )
     if not observations:
@@ -6441,7 +6531,9 @@ def build_submachinery_candidates(
                 "first_page": first_page,
                 "last_page": max(pages) if pages else first_page,
                 "parts": len(group_observations),
-                "confidence": sum(obs["confidence"] for obs in group_observations) / max(1, len(group_observations)),
+                "confidence": _submachinery_hierarchy_confidence(
+                    group_observations, code, name
+                ),
                 "detection_keys": "|".join(sorted({normalize_key(obs["name"]) for obs in group_observations if obs["name"]} | {normalize_key(code)})),
                 "variants": " | ".join(sorted(set(name_values), key=str.upper)),
             }
