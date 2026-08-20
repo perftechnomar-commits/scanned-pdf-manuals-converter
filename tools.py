@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.14.2"
+TOOLS_VERSION = "4.14.3"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -2734,7 +2734,9 @@ def _markdown_table_blocks(markdown: str) -> list[list[list[str]]]:
                 "article no", "article number", "ident", "order-no", "order no",
                 "part no", "part-no", "ref. no", "ref no", "item no", "position",
                 "description", "designation", "part name", "quantity", "qty",
-                "material/blank", "composition",
+                "material/blank", "composition", "document no", "document number",
+                "drawing no", "drawing number", "dwg no", "title", "sheet no",
+                "revision no", "responsible department", "creator", "approved",
             )
         )
         if header_signal:
@@ -3468,92 +3470,289 @@ def _page_header_text(markdown: str, max_lines: int = 28) -> str:
     return "\n".join(dict.fromkeys(clean_text(value) for value in candidates if clean_text(value)))
 
 
-def _engineering_title_block_metadata(markdown: str) -> dict[str, str]:
-    """Extract an assembly title and drawing/document number from a title block.
+def _is_date_like_section_code(value: Any) -> bool:
+    """Return True for values that are clearly calendar dates, not hierarchy codes.
 
-    The detector is manufacturer-neutral and only activates on pages that also
-    contain a coherent orderable Article-No./Name-Designation table. This prevents
-    chapter numbers, revisions, dates, and ordinary drawing callouts from becoming
-    sub-machinery identifiers.
+    Automatic hierarchy detection must never promote drawing dates such as
+    ``2018-05-31`` to sub-machinery codes. Manual user-entered codes are not touched.
+    """
+    text = clean_text(value).strip().upper()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    date_patterns = (
+        r"(?:19|20)\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])",
+        r"(?:0?[1-9]|[12]\d|3[01])[-/.](?:0?[1-9]|1[0-2])[-/.](?:19|20)\d{2}",
+        r"(?:19|20)\d{6}",
+    )
+    return any(re.fullmatch(pattern, compact) for pattern in date_patterns)
+
+
+def _valid_automatic_section_code(value: Any) -> str:
+    """Normalize an automatically detected hierarchy code and reject metadata noise."""
+    text = clean_text(value).strip(" :;|,").upper()
+    if not text or _is_date_like_section_code(text):
+        return ""
+    normalized = normalize_key(text)
+    if normalized in {
+        "DATE", "REV", "REVISION", "REVISIONNO", "SHEET", "SHEETNO",
+        "NOOFSHEETS", "PAGE", "PAGENO", "TITLE", "DOCUMENTNO",
+        "DOCUMENTNUMBER", "DRAWINGNO", "DRAWINGNUMBER", "DWGNO",
+    }:
+        return ""
+    return text
+
+
+def _engineering_title_block_metadata(markdown: str) -> dict[str, str]:
+    """Extract labelled hierarchy metadata from an engineering drawing title block.
+
+    The logic is manufacturer-neutral and deliberately label-aware. Explicit
+    ``Document No./Drawing No./DWG No.`` and ``Title/Assembly/Equipment`` fields
+    outrank nearby dates, revisions, sheet numbers, chapter headings, and OCR
+    reading-order noise. Unlabelled standalone numbers are never accepted as a
+    title-block code.
     """
     if not _is_engineering_article_table(markdown):
         return {}
-    document_no = ""
-    title = ""
 
-    def _value(v: Any) -> str:
-        return clean_text(v).strip(" :;|-")
+    raw = str(markdown or "")
+
+    def value_text(value: Any) -> str:
+        return clean_text(value).strip(" :;|-\t")
 
     code_labels = {
-        "documentno", "documentnumber", "docno",
+        "documentno", "documentnumber", "docno", "docnumber",
         "drawingno", "drawingnumber", "dwgno", "dwgnumber",
     }
     title_labels = {"title", "assembly", "equipment", "drawingtitle"}
-    excluded_titles = {
-        "TITLE", "ASSEMBLY", "EQUIPMENT", "DRAWINGTITLE",
-        "DOCUMENTNO", "DOCUMENTNUMBER", "DRAWINGNO", "DRAWINGNUMBER",
-        "SHEET", "SHEETNO", "NOOFSHEETS", "REVISION", "REVISIONNO",
-        "RESPONSIBLEDEPARTMENT", "CREATOR", "APPROVED", "PURCHASEDARTICLE",
+    metadata_labels = code_labels | title_labels | {
+        "date", "sheet", "sheetno", "sheetnumber", "noofsheets",
+        "numberofsheets", "revision", "revisionno", "revisionnumber", "rev",
+        "responsibledepartment", "department", "creator", "createdby",
+        "approved", "approvedby", "checker", "checkedby", "scale",
+        "format", "project", "projectno", "bookno", "pageno", "page",
     }
 
-    for block in _markdown_table_blocks(markdown):
-        for row in block:
-            cells = [_value(cell) for cell in row]
-            for i, cell in enumerate(cells):
-                key = re.sub(r"[^a-z0-9]+", "", cell.lower())
-                if key in code_labels:
-                    for candidate in cells[i + 1:] + cells[:i]:
-                        compact = re.sub(r"\s+", "", candidate)
-                        if re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{4,19}", compact, flags=re.I) and re.search(r"\d", compact):
-                            document_no = compact.upper()
-                            break
-                elif key in title_labels:
-                    for candidate in cells[i + 1:] + cells[:i]:
-                        candidate = _value(candidate)
-                        if re.search(r"[A-Za-z]", candidate) and 1 < len(candidate) <= 120:
-                            if normalize_key(candidate) not in excluded_titles:
-                                title = candidate
-                                break
-            if document_no and title:
+    def key_of(value: Any) -> str:
+        return re.sub(r"[^a-z0-9]+", "", value_text(value).lower())
+
+    def code_candidate(value: Any) -> str:
+        candidate = value_text(value)
+        if not candidate or key_of(candidate) in metadata_labels:
+            return ""
+        candidate = re.sub(r"\s+", "", candidate).upper()
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9._/-]{3,29}", candidate, flags=re.I):
+            return ""
+        if not re.search(r"\d", candidate):
+            return ""
+        if _is_date_like_section_code(candidate):
+            return ""
+        # Prevent ordinary section numbers and obvious sheet/revision values from
+        # masquerading as drawing/document identifiers.
+        if re.fullmatch(r"\d{1,3}(?:[._/-]\d{1,3}){0,2}", candidate):
+            return ""
+        return candidate
+
+    def title_candidate(value: Any) -> str:
+        candidate = value_text(value)
+        if not candidate or key_of(candidate) in metadata_labels:
+            return ""
+        if _is_date_like_section_code(candidate):
+            return ""
+        if not re.search(r"[A-Za-zÀ-ÿ]", candidate):
+            return ""
+        if len(candidate) > 140:
+            return ""
+        if re.fullmatch(r"\d+(?:[ ._/-]\d+)*", candidate):
+            return ""
+        return candidate
+
+    # Candidate tuples are (score, value, evidence). Highest score wins.
+    code_candidates: list[tuple[int, str, str]] = []
+    title_candidates: list[tuple[int, str, str]] = []
+
+    blocks = _markdown_table_blocks(markdown)
+    for block in blocks:
+        for row_index, row in enumerate(block):
+            cells = [value_text(cell) for cell in row]
+            keys = [key_of(cell) for cell in cells]
+            for column_index, label_key in enumerate(keys):
+                is_code = label_key in code_labels
+                is_title = label_key in title_labels
+                if not (is_code or is_title):
+                    continue
+
+                target = code_candidates if is_code else title_candidates
+                validator = code_candidate if is_code else title_candidate
+
+                # 1) Label and value in adjacent cells on the same row.
+                for offset, score in ((1, 130), (2, 112)):
+                    candidate_index = column_index + offset
+                    if candidate_index >= len(cells):
+                        continue
+                    # Stop once another known field label starts; do not jump across
+                    # Date/Sheet/Revision cells to steal their values.
+                    if keys[candidate_index] in metadata_labels:
+                        break
+                    candidate = validator(cells[candidate_index])
+                    if candidate:
+                        target.append((score, candidate, "same-row labelled field"))
+
+                # 2) Common title-block layout: labels in one row, values directly below.
+                if row_index + 1 < len(block):
+                    below = block[row_index + 1]
+                    if column_index < len(below):
+                        candidate = validator(below[column_index])
+                        if candidate:
+                            target.append((126, candidate, "label-over-value field"))
+                    if column_index + 1 < len(below):
+                        candidate = validator(below[column_index + 1])
+                        if candidate:
+                            target.append((105, candidate, "offset label-over-value field"))
+
+    # 3) Inline / line-oriented OCR. Restrict the captured value to the current
+    # line so a label cannot consume a following Date or Revision field.
+    code_pattern = re.compile(
+        r"(?im)^\s*(?:Document|Drawing|DWG)\s*(?:No\.?|Number)\s*[:|\-]?\s*([^\n|]{1,40})"
+    )
+    for match in code_pattern.finditer(raw):
+        candidate = code_candidate(match.group(1))
+        if candidate:
+            code_candidates.append((118, candidate, "inline labelled field"))
+
+    title_pattern = re.compile(
+        r"(?im)^\s*(?:Title|Assembly|Equipment|Drawing\s+Title)\s*[:|\-]?\s*([^\n|]{1,140})"
+    )
+    for match in title_pattern.finditer(raw):
+        candidate = title_candidate(match.group(1))
+        if candidate:
+            title_candidates.append((118, candidate, "inline labelled field"))
+
+    # 4) Column-major OCR often prints the label on one line and the value on the
+    # next. Scan only a very small window and stop at the next recognized label.
+    lines = [value_text(line) for line in raw.splitlines() if value_text(line)]
+    for index, line in enumerate(lines):
+        label_key = key_of(line)
+        if label_key not in code_labels and label_key not in title_labels:
+            continue
+        target = code_candidates if label_key in code_labels else title_candidates
+        validator = code_candidate if label_key in code_labels else title_candidate
+        for distance in (1, 2):
+            if index + distance >= len(lines):
                 break
-        if document_no and title:
-            break
+            next_line = lines[index + distance]
+            if key_of(next_line) in metadata_labels:
+                break
+            candidate = validator(next_line)
+            if candidate:
+                target.append((116 - distance * 4, candidate, "next-line labelled field"))
+                break
 
-    raw = str(markdown or "")
+    # Repeated Name/Designation values provide useful corroboration when OCR has
+    # placed more than one text value beside the explicit Title label. They never
+    # create a title by themselves; they only help choose among labelled candidates.
+    description_counts: dict[str, tuple[int, str]] = {}
+    for block in blocks:
+        header_index = _find_data_header_index(block)
+        if header_index is None:
+            continue
+        headers = block[header_index]
+        header_keys = {
+            re.sub(r"[^a-z0-9]+", "", clean_text(header).lower())
+            for header in headers
+        }
+        if not header_keys.intersection({"articleno", "articlenumber", "articlenr"}):
+            continue
+        mappings = [_canonical_source_header(header) for header in headers]
+        try:
+            ident_index = mappings.index("ident_no")
+            description_index = mappings.index("description_raw")
+        except ValueError:
+            continue
+        for row in block[header_index + 1:]:
+            if ident_index >= len(row) or description_index >= len(row):
+                continue
+            identifier = clean_text(row[ident_index])
+            description = clean_text(row[description_index])
+            if not identifier or not description or not re.search(r"[A-Za-zÀ-ÿ]", description):
+                continue
+            if not re.search(r"\d{5}", identifier):
+                continue
+            key = normalize_key(description)
+            if not key:
+                continue
+            count, representative = description_counts.get(key, (0, description))
+            description_counts[key] = (count + 1, representative)
+
+    dominant_description_key = ""
+    if description_counts:
+        key, (count, _) = max(description_counts.items(), key=lambda item: item[1][0])
+        if count >= 2:
+            dominant_description_key = key
+
+    def best(candidates: list[tuple[int, str, str]], *, title_field: bool = False) -> tuple[str, str]:
+        if not candidates:
+            return "", ""
+        # Prefer repeated agreement across extraction views when scores tie. For a
+        # title field, repeated orderable-row descriptions can corroborate the same
+        # explicitly labelled title (for example CABLE) without inventing a title.
+        counts: dict[str, int] = {}
+        for _, value, _ in candidates:
+            counts[normalize_key(value)] = counts.get(normalize_key(value), 0) + 1
+
+        def rank(item: tuple[int, str, str]) -> tuple[int, int, int]:
+            base_score, value, _ = item
+            value_key = normalize_key(value)
+            corroboration = 24 if title_field and dominant_description_key and value_key == dominant_description_key else 0
+            return (
+                base_score + corroboration,
+                counts.get(value_key, 0),
+                -len(value),
+            )
+
+        score, value, evidence = max(candidates, key=rank)
+        return value, evidence
+
+    document_no, code_evidence = best(code_candidates)
+    title, title_evidence = best(title_candidates, title_field=True)
+
+    # Cross-check against the orderable article identifiers. On many engineering
+    # drawings the spare article numbers share the drawing/document stem. This is
+    # supportive evidence only; it never overrides a valid explicitly labelled code.
+    article_identifiers = _engineering_article_identifier_evidence(markdown, "")
+    article_stems = [
+        re.split(r"\s+", clean_text(identifier), maxsplit=1)[0].upper()
+        for identifier in article_identifiers
+        if clean_text(identifier)
+    ]
+    repeated_stem = ""
+    if article_stems:
+        stem_counts = {stem: article_stems.count(stem) for stem in set(article_stems)}
+        stem, count = max(stem_counts.items(), key=lambda item: item[1])
+        if count >= 2 and re.search(r"\d{5}", stem) and not _is_date_like_section_code(stem):
+            repeated_stem = stem
+
+    if not document_no and repeated_stem:
+        document_no = repeated_stem
+        code_evidence = "repeated Article-No. stem fallback"
+
     if not document_no:
-        for pattern in (
-            r"(?:Document|Drawing|DWG)\s*(?:No\.?|Number)\s*[:|\-]?\s*([A-Z0-9][A-Z0-9._/ -]{4,24})",
-        ):
-            match = re.search(pattern, raw, flags=re.I)
-            if match:
-                candidate = re.sub(r"\s+", "", _value(match.group(1))).upper()
-                if re.search(r"\d", candidate):
-                    document_no = candidate
-                    break
-    if not title:
-        for pattern in (
-            r"(?:^|\n)\s*(?:Title|Assembly|Equipment)\s*[:|\-]?\s*([^\n|]{2,120})",
-            r"\|\s*(?:Title|Assembly|Equipment)\s*\|\s*([^|]{2,120})\|",
-        ):
-            match = re.search(pattern, raw, flags=re.I)
-            if match:
-                candidate = _value(match.group(1))
-                if re.search(r"[A-Za-z]", candidate) and normalize_key(candidate) not in excluded_titles:
-                    title = candidate
-                    break
-    if not document_no:
-        candidates = re.findall(r"(?m)^\s*([A-Z0-9][A-Z0-9._/-]{5,19})\s*$", raw, flags=re.I)
-        numeric_like = [candidate for candidate in candidates if re.search(r"\d", candidate)]
-        if numeric_like:
-            document_no = numeric_like[-1].upper()
-    if not document_no or not title:
         return {}
-    return {
+
+    result = {
         "section_code": document_no,
-        "section_name_raw": title,
-        "section_name_english": title.upper(),
         "section_code_source": "engineering drawing title block",
+        "section_code_evidence": code_evidence,
     }
+    if title:
+        result.update(
+            {
+                "section_name_raw": title,
+                "section_name_english": title.upper(),
+                "section_name_evidence": title_evidence,
+            }
+        )
+    return result
 
 
 # Compatibility alias retained for previous app imports/tests.
@@ -3661,6 +3860,10 @@ def _page_metadata(page_number: int, markdown: str) -> dict[str, Any]:
             metadata["section_name_raw"] = "\n".join(title_lines[:3])
         elif title_lines:
             metadata["section_name_raw"] = title_lines[0]
+
+    if _is_date_like_section_code(metadata.get("section_code", "")):
+        metadata["section_code"] = ""
+        metadata["section_code_source"] = ""
 
     metadata["section_name_english"] = _english_variant(metadata["section_name_raw"])
     if classic_catalog:
@@ -3791,6 +3994,34 @@ def _classic_english_description_index(
     return description_indexes[0]
 
 
+def _is_engineering_article_identifier_value(value: Any, section_code: Any = "") -> bool:
+    """Validate one orderable Article-No. value without relying on table layout."""
+    text = re.sub(r"\s+", " ", clean_text(value)).strip(" .;,|:")
+    if not text or normalize_key(text) == normalize_key(section_code):
+        return False
+    upper = text.upper()
+    if any(token in upper for token in (
+        "PAGE", "SHEET", "REV", "BOOK", "DATE", "RESCUE", "ARTICLE",
+        "POSITION", " POS", "TITLE", "DOCUMENT", "DRAWING", "CREATOR",
+        "APPROVED", "DEPARTMENT", "MATERIAL", "NOTE",
+    )):
+        return False
+    if _is_date_like_section_code(text):
+        return False
+    first_token = re.split(r"\s+", text, maxsplit=1)[0]
+    digits = sum(character.isdigit() for character in first_token)
+    letters = sum(character.isalpha() for character in first_token)
+    if digits < 5 or letters > digits:
+        return False
+    return bool(
+        re.fullmatch(
+            r"[A-Z0-9][A-Z0-9._/-]{5,19}(?:\s+[A-Z0-9._/-]{1,5})?",
+            text,
+            flags=re.I,
+        )
+    )
+
+
 def _engineering_article_identifier_evidence(
     markdown: Any,
     section_code: Any = "",
@@ -3820,22 +4051,9 @@ def _engineering_article_identifier_evidence(
         for match in re.finditer(pattern, raw, flags=re.I):
             value = re.sub(r"\s+", " ", clean_text(match.group(1))).strip(" .;,|:")
             key = normalize_key(value)
-            if not key or key == section_key or key in seen or not re.search(r"\d", value):
+            if not key or key == section_key or key in seen:
                 continue
-            # Filter obvious header/title/recovery fragments that merely happen to
-            # contain digits. Engineering article identifiers are code-like and
-            # normally contain a substantial numeric stem; ordinary prose such as
-            # ``4.3.21 UV`` or marker text such as ``RESCUE 90`` is not an article.
-            upper = value.upper()
-            if any(token in upper for token in (
-                "PAGE", "SHEET", "REV", "BOOK", "DATE", "RESCUE",
-                "ARTICLE", "POSITION", " POS", "TITLE", "DOCUMENT", "DRAWING",
-            )):
-                continue
-            first_token = re.split(r"\s+", value, maxsplit=1)[0]
-            first_digits = sum(character.isdigit() for character in first_token)
-            first_letters = sum(character.isalpha() for character in first_token)
-            if first_digits < 5 or first_letters > first_digits:
+            if not _is_engineering_article_identifier_value(value, section_code):
                 continue
             seen.add(key)
             candidates.append(value)
@@ -4187,6 +4405,10 @@ def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[
                     description_raw = clean_text(record.get("description_raw", ""))
                     ident_no = clean_text(record.get("ident_no", ""))
                     item_no = clean_text(record.get("item_no", ""))
+                    if article_drawing and ident_no and not _is_engineering_article_identifier_value(
+                        ident_no, active_metadata.get("section_code", "")
+                    ):
+                        continue
                     if (
                         description_raw
                         and description_raw.upper() not in {"NOT USED", "NOT USED."}
@@ -4565,6 +4787,8 @@ def build_section_catalog(
 
     def catalog_code_tokens(value: Any) -> list[str]:
         text = clean_text(value).upper().strip().rstrip(".")
+        if _is_date_like_section_code(text):
+            return []
         if allow_simple_section_codes:
             # This profile prints numeric hierarchy codes. Model names such as
             # SQM10 and ASZ12 are applicability data, never sub-machinery codes.
@@ -4579,9 +4803,10 @@ def build_section_catalog(
         aliases = [
             clean_text(value).upper()
             for value in section.get("aliases", [])
-            if clean_text(value)
+            if clean_text(value) and not _is_date_like_section_code(value)
         ]
-        code = clean_text(section.get("code", "")).upper() or _join_section_codes(aliases)
+        raw_code = clean_text(section.get("code", "")).upper()
+        code = ("" if _is_date_like_section_code(raw_code) else raw_code) or _join_section_codes(aliases)
         if not aliases and code:
             aliases = catalog_code_tokens(code) or [code]
         aliases = list(dict.fromkeys(aliases))
@@ -4691,6 +4916,10 @@ def build_section_catalog(
         else:
             code_tokens = catalog_code_tokens(metadata.get("section_code", ""))
         if code_tokens:
+            is_title_block = (
+                clean_text(metadata.get("section_code_source", ""))
+                == "engineering drawing title block"
+            )
             registered = register(
                 {
                     "code": _join_section_codes(code_tokens),
@@ -4700,9 +4929,11 @@ def build_section_catalog(
                     "model": metadata.get("model", ""),
                     "pages": {page},
                 },
-                priority=100,
+                priority=145 if is_title_block else 100,
             )
             registered["pages"].add(page)
+            if is_title_block:
+                registered.setdefault("_authoritative_start_pages", set()).add(page)
 
     # AI catalogue values can fill gaps but must never overwrite an exact printed
     # header title such as RESILIENT MOUNTING with a paraphrase such as ELASTIC MOUNTING.
@@ -4939,14 +5170,24 @@ def build_section_catalog(
         else:
             section["maker"] = clean_text(section.get("maker", "")).upper() or fallback_maker
             section["model"] = clean_text(section.get("model", "")).upper() or fallback_model
-        section["first_page"] = min(pages) if pages else None
-        section["last_page"] = max(pages) if pages else None
+        authoritative_start_pages = sorted(
+            int(page)
+            for page in section.get("_authoritative_start_pages", set())
+            if page is not None
+        )
+        section["first_page"] = (
+            min(authoritative_start_pages)
+            if authoritative_start_pages
+            else (min(pages) if pages else None)
+        )
+        section["last_page"] = max(pages) if pages else section["first_page"]
         section["pages"] = pages
         section.pop("_name_priority", None)
         section.pop("_maker_priority", None)
         section.pop("_model_priority", None)
         section.pop("_illustrated_series_pages", None)
         section.pop("_illustrated_parts_series", None)
+        section.pop("_authoritative_start_pages", None)
         if section.get("code") or section.get("name"):
             final_sections.append(section)
     def section_sort_code(value: Any) -> tuple[Any, ...]:
@@ -5093,6 +5334,13 @@ def prepare_benefit_rows(
     allow_simple_section_codes = (
         extraction_profile == MULTILINGUAL_ORDER_CATALOG_PROFILE
     )
+
+    def safe_section_code(value: Any) -> str:
+        text_value = clean_text(value).upper().strip().rstrip(".")
+        if allow_simple_section_codes and re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", text_value):
+            return text_value
+        return _valid_automatic_section_code(text_value)
+
     page_markdown_lookup = {int(page): markdown for page, markdown in extracted_pages}
     normalized_ai: list[dict[str, Any]] = []
     rejected_ai_identifiers = 0
@@ -5107,9 +5355,10 @@ def prepare_benefit_rows(
         if page_markdown and _is_engineering_article_table(page_markdown):
             title_block = _engineering_title_block_metadata(page_markdown)
             if title_block:
-                normalized["section_code"] = title_block["section_code"]
-                normalized["section_name_english"] = title_block["section_name_english"]
-                normalized["detected_machinery"] = title_block["section_name_english"]
+                normalized["section_code"] = safe_section_code(title_block.get("section_code", ""))
+                if clean_text(title_block.get("section_name_english", "")):
+                    normalized["section_name_english"] = title_block["section_name_english"]
+                    normalized["detected_machinery"] = title_block["section_name_english"]
             # This page pattern has no drawing-position or quantity field in the
             # Article No. table. Art. Rev. and Note lengths must never leak into them.
             normalized["item_no"] = ""
@@ -5311,10 +5560,17 @@ def prepare_benefit_rows(
                 unconfirmed_sections += 1
 
             # Printed page data wins over AI fallbacks for section identity and title.
-            section_code = (
-                clean_text((section or {}).get("code", ""))
-                or clean_text(direct.get("section_code", ""))
-                or clean_text((ai or {}).get("section_code", ""))
+            section_code = next(
+                (
+                    candidate
+                    for candidate in (
+                        safe_section_code((section or {}).get("code", "")),
+                        safe_section_code(direct.get("section_code", "")),
+                        safe_section_code((ai or {}).get("section_code", "")),
+                    )
+                    if candidate
+                ),
+                "",
             )
             section_name = (
                 clean_text((section or {}).get("name", ""))
@@ -5411,7 +5667,7 @@ def prepare_benefit_rows(
             output.append(
                 {
                     **ai,
-                    "section_code": clean_text((section or {}).get("code", ai.get("section_code", ""))),
+                    "section_code": safe_section_code((section or {}).get("code", "")) or safe_section_code(ai.get("section_code", "")),
                     "section_name_english": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
                     "detected_machinery": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
                     "section_maker": clean_text((section or {}).get("maker", "")) or clean_text(ai.get("section_maker", "")),
@@ -5480,7 +5736,7 @@ def prepare_benefit_rows(
                 output.append(
                     {
                         **ai,
-                        "section_code": clean_text((section or {}).get("code", ai.get("section_code", ""))),
+                        "section_code": safe_section_code((section or {}).get("code", "")) or safe_section_code(ai.get("section_code", "")),
                         "section_name_english": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
                         "detected_machinery": clean_text((section or {}).get("name", ai.get("section_name_english", ""))).upper(),
                         "section_maker": clean_text((section or {}).get("maker", "")) or clean_text(ai.get("section_maker", "")),
