@@ -16,9 +16,10 @@ import pandas as pd
 import requests
 from openpyxl import load_workbook
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.14.1"
+TOOLS_VERSION = "4.14.2"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -601,6 +602,151 @@ def _orientation_table_evidence(markdown: Any) -> int:
     return score
 
 
+def _cropped_rotated_pdf_page_bytes(
+    pdf_bytes: bytes,
+    page_number: int,
+    rotation: int,
+    fractions: tuple[float, float, float, float],
+) -> bytes:
+    """Return one cropped PDF page for focused OCR without raster dependencies.
+
+    ``fractions`` is (left, bottom, right, top) in the original page coordinate
+    system. The crop deliberately overlaps neighbouring regions in callers so a
+    table that sits on a split boundary is still visible in at least one request.
+    This is generic engineering-drawing recovery and is not tied to any maker.
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    page = reader.pages[int(page_number) - 1]
+    media = page.mediabox
+    left, bottom, right, top = fractions
+    width = float(media.right) - float(media.left)
+    height = float(media.top) - float(media.bottom)
+    x0 = float(media.left) + max(0.0, min(1.0, left)) * width
+    y0 = float(media.bottom) + max(0.0, min(1.0, bottom)) * height
+    x1 = float(media.left) + max(0.0, min(1.0, right)) * width
+    y1 = float(media.bottom) + max(0.0, min(1.0, top)) * height
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("Invalid engineering-drawing OCR crop.")
+    box = RectangleObject([x0, y0, x1, y1])
+    page.cropbox = box
+    page.trimbox = box
+    page.mediabox = box
+    if rotation:
+        page.rotate(int(rotation) % 360)
+    writer = PdfWriter()
+    writer.add_page(page)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def _focused_engineering_region_ocr(
+    api_key: str,
+    pdf_bytes: bytes,
+    page_number: int,
+    rotation: int,
+    base_markdown: str,
+    max_regions: int = 4,
+) -> tuple[str, list[str]]:
+    """Recover tiny orderable tables that full-page OCR can detect but not read.
+
+    A common failure on dense technical drawings is that full-page OCR recognizes
+    the semantic table headers but the actual article identifiers are too small to
+    survive. In that case we OCR overlapping half-page regions at the already
+    selected orientation. The resulting text is appended only when it increases
+    source-backed identifier evidence or otherwise strengthens the table evidence.
+    """
+    combined = clean_markdown(base_markdown)
+    messages: list[str] = []
+    if not combined or not _is_engineering_article_table(combined):
+        return combined, messages
+
+    metadata = _engineering_title_block_metadata(combined)
+    section_code = clean_text(metadata.get("section_code", ""))
+    identifier_count = len(
+        _engineering_article_identifier_evidence(combined, section_code)
+    )
+    # If the full-page pass already exposed several identifiers, region OCR would
+    # add cost without useful recovery value.
+    if identifier_count >= 2:
+        return combined, messages
+
+    # Overlapping halves preserve the full width/height of wide tables better than
+    # four isolated quadrants. Rotating occurs after cropping, using the same
+    # orientation that won the full-page rescue.
+    regions = [
+        ("LEFT HALF", (0.00, 0.00, 0.58, 1.00)),
+        ("RIGHT HALF", (0.42, 0.00, 1.00, 1.00)),
+        ("BOTTOM HALF", (0.00, 0.00, 1.00, 0.58)),
+        ("TOP HALF", (0.00, 0.42, 1.00, 1.00)),
+    ][: max(1, int(max_regions))]
+
+    best_score = _orientation_table_evidence(combined)
+    used_regions = 0
+    for label, fractions in regions:
+        try:
+            crop_bytes = _cropped_rotated_pdf_page_bytes(
+                pdf_bytes=pdf_bytes,
+                page_number=page_number,
+                rotation=rotation,
+                fractions=fractions,
+            )
+            response = _mistral_ocr_request(
+                api_key=api_key,
+                document={
+                    "type": "document_url",
+                    "document_url": _pdf_data_url(crop_bytes),
+                },
+            )
+            response_pages = _response_pages(response)
+            region_markdown = (
+                clean_markdown(response_pages[0].get("markdown", ""))
+                if response_pages else ""
+            )
+            if not region_markdown:
+                continue
+            candidate = (
+                combined
+                + f"\n\n===== FOCUSED REGION OCR {label} =====\n"
+                + region_markdown
+            ).strip()
+            candidate_metadata = _engineering_title_block_metadata(candidate)
+            candidate_code = clean_text(
+                candidate_metadata.get("section_code", section_code)
+            )
+            candidate_count = len(
+                _engineering_article_identifier_evidence(candidate, candidate_code)
+            )
+            candidate_score = _orientation_table_evidence(candidate)
+            if candidate_count > identifier_count or candidate_score > best_score + 2:
+                combined = candidate
+                identifier_count = candidate_count
+                best_score = candidate_score
+                section_code = candidate_code
+                used_regions += 1
+            if identifier_count >= 3:
+                break
+        except Exception as exc:
+            messages.append(
+                f"PDF page {page_number}: focused {label.lower()} OCR was unavailable; "
+                f"other recovery paths continued. Details: {_safe_api_error_text(exc, api_key)}"
+            )
+
+    if used_regions:
+        messages.insert(
+            0,
+            f"PDF page {page_number}: focused region OCR added {used_regions} higher-resolution "
+            f"drawing region(s) and recovered {identifier_count} source Article-No. candidate(s).",
+        )
+    elif identifier_count < 2:
+        messages.insert(
+            0,
+            f"PDF page {page_number}: the full-page OCR recognized an orderable table, but "
+            "focused region OCR still could not read enough source identifiers.",
+        )
+    return combined, messages
+
+
 def recover_rotated_engineering_drawing_pages(
     api_key: str,
     pdf_bytes: bytes,
@@ -675,6 +821,17 @@ def recover_rotated_engineering_drawing_pages(
                     break
 
             if best_markdown and _is_engineering_article_table(best_markdown) and best_score > original_score:
+                # Full-page OCR can recognize a table header while its actual article
+                # numbers remain too small. Before downstream extraction, selectively
+                # re-OCR overlapping half-page regions at the winning orientation.
+                focused_markdown, focused_messages = _focused_engineering_region_ocr(
+                    api_key=api_key,
+                    pdf_bytes=pdf_bytes,
+                    page_number=page_number,
+                    rotation=best_rotation,
+                    base_markdown=best_markdown,
+                )
+                best_markdown = focused_markdown or best_markdown
                 updated[page_number] = (
                     original_lookup[page_number]
                     + f"\n\n===== ORIENTATION OCR RESCUE {best_rotation} DEG =====\n"
@@ -684,6 +841,7 @@ def recover_rotated_engineering_drawing_pages(
                 messages.append(
                     f"PDF page {page_number}: orientation OCR recovered an orderable Article No./Name-Designation table at {best_rotation} degrees."
                 )
+                messages.extend(focused_messages)
             else:
                 messages.append(
                     f"PDF page {page_number}: alternate-orientation OCR was attempted but did not reveal a stronger orderable-parts table, so the original OCR was kept."
@@ -3664,9 +3822,20 @@ def _engineering_article_identifier_evidence(
             key = normalize_key(value)
             if not key or key == section_key or key in seen or not re.search(r"\d", value):
                 continue
-            # Filter obvious header/title fragments that merely happen to contain digits.
+            # Filter obvious header/title/recovery fragments that merely happen to
+            # contain digits. Engineering article identifiers are code-like and
+            # normally contain a substantial numeric stem; ordinary prose such as
+            # ``4.3.21 UV`` or marker text such as ``RESCUE 90`` is not an article.
             upper = value.upper()
-            if any(token in upper for token in ("PAGE", "SHEET", "REV", "BOOK", "DATE")):
+            if any(token in upper for token in (
+                "PAGE", "SHEET", "REV", "BOOK", "DATE", "RESCUE",
+                "ARTICLE", "POSITION", " POS", "TITLE", "DOCUMENT", "DRAWING",
+            )):
+                continue
+            first_token = re.split(r"\s+", value, maxsplit=1)[0]
+            first_digits = sum(character.isdigit() for character in first_token)
+            first_letters = sum(character.isalpha() for character in first_token)
+            if first_digits < 5 or first_letters > first_digits:
                 continue
             seen.add(key)
             candidates.append(value)
