@@ -224,7 +224,7 @@ PROCESSING_PRESETS = {
         "adaptive_analysis": True,
         "analysis_model": "mistral-large-2512",
         "openai_verification": True,
-        "openai_model": "gpt-5.6-terra",
+        "openai_model": "gpt-5.6-sol",
         "ocr_pages_per_request": 25,
         "extraction_pages_per_batch": 3,
         "extraction_max_chars": 12000,
@@ -241,7 +241,7 @@ PROCESSING_PRESETS = {
         "adaptive_analysis": True,
         "analysis_model": "mistral-large-2512",
         "openai_verification": True,
-        "openai_model": "gpt-5.6-terra",
+        "openai_model": "gpt-5.6-sol",
         "ocr_pages_per_request": 35,
         "extraction_pages_per_batch": 4,
         "extraction_max_chars": 16000,
@@ -258,7 +258,7 @@ PROCESSING_PRESETS = {
         "adaptive_analysis": True,
         "analysis_model": "mistral-large-2512",
         "openai_verification": True,
-        "openai_model": "gpt-5.6-terra",
+        "openai_model": "gpt-5.6-sol",
         "ocr_pages_per_request": 12,
         "extraction_pages_per_batch": 1,
         "extraction_max_chars": 8000,
@@ -1192,7 +1192,7 @@ def render_processing_mode_controls() -> None:
                 structure_mode != "AI JSON extraction (recommended)"
                 or not openai_verification
             ),
-            help="Default: gpt-5.6-terra. The model must be available to the OpenAI project.",
+            help="Default: gpt-5.6-sol. The model must be available to the OpenAI project.",
         )
         if openai_key_available:
             st.caption("OpenAI verification key detected in Streamlit Secrets.")
@@ -3133,7 +3133,7 @@ if active_workflow_step == "2. OCR":
                         },
                         "Row extraction": {"provider": "Mistral", "model": extraction_model.strip() or "mistral-small-latest", "status": "Pending" if structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
                         "Document analysis": {"provider": "Mistral", "model": analysis_model.strip() or "mistral-large-2512", "status": "Pending" if adaptive_analysis and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
-                        "Independent verification": {"provider": "OpenAI", "model": openai_model.strip() or "gpt-5.6-terra", "status": "Pending" if openai_verification and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
+                        "Independent verification": {"provider": "OpenAI", "model": openai_model.strip() or "gpt-5.6-sol", "status": "Pending" if openai_verification and structure_mode == "AI JSON extraction (recommended)" else "Not used", "detail": ""},
                     }
                     if (
                         adaptive_analysis
@@ -3189,7 +3189,7 @@ if active_workflow_step == "2. OCR":
                         document_profile, openai_messages = (
                             verify_document_profile_with_openai(
                                 api_key=openai_api_key,
-                                model=openai_model.strip() or "gpt-5.6-terra",
+                                model=openai_model.strip() or "gpt-5.6-sol",
                                 extracted_pages=extracted_pages,
                                 existing_profile=document_profile,
                                 additional_instructions=extra_prompt,
