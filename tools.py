@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.17.0"
+TOOLS_VERSION = "4.18.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -3504,6 +3504,8 @@ def _is_date_like_section_code(value: Any) -> bool:
     date_patterns = (
         r"(?:19|20)\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])",
         r"(?:0?[1-9]|[12]\d|3[01])[-/.](?:0?[1-9]|1[0-2])[-/.](?:19|20)\d{2}",
+        r"(?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])[-/.]\d{2}",
+        r"(?:0?[1-9]|[12]\d|3[01])[-/.](?:0?[1-9]|1[0-2])[-/.]\d{2}",
         r"(?:19|20)\d{6}",
     )
     return any(re.fullmatch(pattern, compact) for pattern in date_patterns)
@@ -3520,6 +3522,47 @@ def _valid_automatic_section_code(value: Any) -> str:
         "NOOFSHEETS", "PAGE", "PAGENO", "TITLE", "DOCUMENTNO",
         "DOCUMENTNUMBER", "DRAWINGNO", "DRAWINGNUMBER", "DWGNO",
     }:
+        return ""
+    return text
+
+
+def _credible_section_maker(value: Any) -> str:
+    """Return a plausible printed manufacturer or blank for shifted OCR prose."""
+    text = clean_text(value).upper().strip(" -:;|,.")
+    if not text or len(text) > 70 or len(text.split()) > 8:
+        return ""
+    if not re.search(r"[A-Z]", text):
+        return ""
+    normalized = normalize_key(text)
+    if normalized in {
+        "ALARMID", "ALARM", "ID", "DESCRIPTION", "DESIGNATION", "TITLE",
+        "DRAWING", "DOCUMENT", "COMPONENT", "MODEL", "MANUFACTURER",
+    }:
+        return ""
+    if any(
+        phrase in text
+        for phrase in (
+            "STARTED BY", "SIGNAL FROM", "IS DIRECTED", "SEE DRAWING",
+            "REPLACE ", "CHECK ", "BOOK NO", "PAGE ",
+        )
+    ):
+        return ""
+    return text
+
+
+def _credible_section_model(value: Any) -> str:
+    """Return a plausible equipment model or blank for narrative OCR fragments."""
+    text = clean_text(value).upper().strip(" -:;|,.")
+    if not text or len(text) > 90 or len(text.split()) > 12:
+        return ""
+    if not re.search(r"[A-Z0-9]", text):
+        return ""
+    if text.startswith(("STARTED ", "DIRECTED ", "WHEN ", "IF ", "SEE ", "REPLACE ", "CHECK ")):
+        return ""
+    if any(
+        phrase in text
+        for phrase in ("SIGNAL FROM", "BOOK NO", "PAGE ", "ALARM ID", "DESCRIPTION")
+    ):
         return ""
     return text
 
@@ -4702,7 +4745,20 @@ def _valid_drawing_heading_code(value: Any) -> str:
     compact = normalize_key(text)
     if sum(character.isdigit() for character in compact) < 5:
         return ""
-    if re.search(r"\b(?:BOOK|PAGE|SHEET|REV(?:ISION)?|DATE)\b", text, flags=re.I):
+    if re.search(
+        r"\b(?:BOOK|PAGE|SHEET|REV(?:ISION)?|DATE|DN\s*\d+|PN\s*\d+)\b",
+        text,
+        flags=re.I,
+    ):
+        return ""
+    if re.fullmatch(
+        r"(?:P|V|PT|TT|TS|LS|QT|PI|FIT|FIC|SV|XV|KS|M)\d{2,4}[-–—]\d+(?:\.X)?",
+        text,
+        flags=re.I,
+    ):
+        return ""
+    words = re.findall(r"[A-Z]{2,}", text)
+    if len(words) >= 2 or text.count("/") >= 2:
         return ""
     candidate = _valid_automatic_section_code(text)
     if not candidate or _chapter_like_section_code(candidate):
@@ -6092,10 +6148,10 @@ def build_section_catalog(
             page_map[page] = resolved
             page_map_sources[page] = resolved_source
 
-    main_maker = clean_text(main_row.get("MAKER", "")).upper()
-    main_model = clean_text(main_row.get("MODEL", "")).upper()
-    fallback_maker = global_maker or main_maker
-    fallback_model = global_model or main_model
+    main_maker = _credible_section_maker(main_row.get("MAKER", ""))
+    main_model = _credible_section_model(main_row.get("MODEL", ""))
+    fallback_maker = main_maker or _credible_section_maker(global_maker)
+    fallback_model = main_model or _credible_section_model(global_model)
     final_sections: list[dict[str, Any]] = []
     seen_section_ids: set[int] = set()
     for section in sections:
@@ -6112,14 +6168,14 @@ def build_section_catalog(
         )
         if section.get("_illustrated_parts_series"):
             section["maker"] = (
-                clean_text(section.get("maker", "")).upper() or main_maker or global_maker
+                _credible_section_maker(section.get("maker", "")) or fallback_maker
             )
             section["model"] = (
-                clean_text(section.get("model", "")).upper() or main_model or global_model
+                _credible_section_model(section.get("model", "")) or fallback_model
             )
         else:
-            section["maker"] = clean_text(section.get("maker", "")).upper() or fallback_maker
-            section["model"] = clean_text(section.get("model", "")).upper() or fallback_model
+            section["maker"] = _credible_section_maker(section.get("maker", "")) or fallback_maker
+            section["model"] = _credible_section_model(section.get("model", "")) or fallback_model
         authoritative_start_pages = sorted(
             int(page)
             for page in section.get("_authoritative_start_pages", set())
@@ -6841,9 +6897,11 @@ def prepare_benefit_rows(
             page = ai.get("source_page")
             if page in index_pages:
                 continue
+            explicit_spare_row = normalize_key(ai.get("source_pattern", "")) == normalize_key("explicit spare-number list")
+            if not explicit_spare_row and page not in parts_pages:
+                continue
             section, section_source, section_conflict = section_for(page, None, ai)
             ident_no = clean_text(ai.get("ident_no", ""))
-            explicit_spare_row = normalize_key(ai.get("source_pattern", "")) == normalize_key("explicit spare-number list")
             if explicit_spare_row:
                 description = clean_text(ai.get("description_english", "")).upper()
                 language_review = False
@@ -7136,11 +7194,14 @@ _GENERIC_MACHINERY_NAMES = {
     "PART NUMBER", "QUANTITY", "DRAWING", "DRAWING NO", "TABLE",
     "CONTINUED", "LIST OF SPARE PARTS",
     "DIMENSION DRAWINGS INCLUDING TECHNICAL DATA",
+    "DRAWINGS", "GENERAL DRAWINGS", "RECOMMENDED SPARE PARTS ON BOARD",
 }
 
 
 def _clean_machinery_name(value: Any) -> str:
-    text = clean_text(value).strip(" -:;|/")
+    text = clean_text(value)
+    text = re.sub(r"^\s*#{1,6}\s*", "", text).strip(" -:;|/")
+    text = re.sub(r"^\d{1,3}(?:\.\d{1,3}){1,5}\s+", "", text)
     text = re.sub(
         r"^(?:spare\s+parts(?:\s+list)?|parts\s+list|list\s+of\s+parts)\s*(?:for|of)?\s*[:\-]*\s*",
         "",
@@ -7159,6 +7220,17 @@ def _is_generic_machinery_name(value: Any) -> bool:
     normalized = re.sub(r"[^A-Z0-9 ]+", " ", text.upper())
     normalized = re.sub(r"\s+", " ", normalized).strip()
     if normalized in _GENERIC_MACHINERY_NAMES:
+        return True
+    if normalized.startswith(("REPLACE ", "RENEW ", "INSTALL ", "CHECK ", "REMOVE ")):
+        return True
+    if any(
+        phrase in normalized
+        for phrase in (
+            "INTERCONNECTION DIAGRAM", "CONNECTION DIAGRAM", "WIRING DIAGRAM",
+            "CIRCUIT DIAGRAM", "FLOW DIAGRAM", "FLOW CHART", "CABLE LIST",
+            "GENERAL ARRANGEMENT", "OPERATING SYSTEM PLAN",
+        )
+    ):
         return True
     if re.fullmatch(r"(?:FIG(?:URE)?|DWG|DRAWING|PAGE|TABLE)\s*[A-Z0-9./_-]*", normalized):
         return True
@@ -7432,7 +7504,8 @@ def _is_equipment_component_title(value: Any) -> bool:
             "GENERAL ARRANGEMENT", "FLOW DIAGRAM", "FLOW SCHEME", "PIPING DIAGRAM",
             "CONNECTION LIST", "CABLE LIST", "SYSTEM SCHEMATIC", "SYSTEM LAYOUT",
             "INSTALLATION PRINCIPLE", "CIRCUIT DIAGRAM", "WIRING DIAGRAM",
-            "FLOW CHART",
+            "FLOW CHART", "INTERCONNECTION DIAGRAM", "CONNECTION DIAGRAM",
+            "SYSTEM PLAN", "OPERATING SYSTEM PLAN",
         )
     ):
         return False
@@ -7510,11 +7583,7 @@ def build_component_drawing_candidates(
     grouped: dict[str, list[dict[str, Any]]] = {}
     for item in discoveries:
         source = clean_text(item.get("source", "")).lower()
-        code = (
-            _valid_automatic_section_code(item.get("code", ""))
-            if "title block" in source
-            else _valid_drawing_heading_code(item.get("code", ""))
-        )
+        code = _valid_drawing_heading_code(item.get("code", ""))
         name = _clean_equipment_drawing_title(item.get("name", ""))
         if not code or not _is_equipment_component_title(name):
             continue
@@ -7609,7 +7678,7 @@ def build_submachinery_candidates(
             row.get("SECTION CODE", ""),
         )
         code = clean_text(row.get("SECTION CODE", "")).upper()
-        if _is_generic_machinery_name(name) and not code:
+        if _is_generic_machinery_name(name):
             continue
         source = quantity_to_number(row.get("SOURCE PAGE"))
         section = quantity_to_number(row.get("SECTION START PAGE"))
@@ -7635,6 +7704,7 @@ def build_submachinery_candidates(
                     or clean_text(row.get("PART NO", "")),
                 ),
                 "part_description": clean_text(row.get("DESCRIPTION", "")).upper(),
+                "item_no": clean_text(row.get("ITEM NO", "")),
             }
         )
     if not observations:
@@ -7658,6 +7728,13 @@ def build_submachinery_candidates(
         name = _submachinery_name_from_source_consensus(
             group_observations, code, name
         )
+        if re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", clean_text(code)) and not any(
+            clean_text(observation.get("item_no", ""))
+            for observation in group_observations
+        ):
+            continue
+        if not _valid_automatic_section_code(code):
+            continue
         maker = max(set(maker_values), key=maker_values.count) if maker_values else clean_text(main_row.get("MAKER", "")).upper()
         model = max(set(model_values), key=model_values.count) if model_values else clean_text(main_row.get("MODEL", "")).upper()
         pages = [obs["source_page"] for obs in group_observations if obs["source_page"] is not None]
@@ -7918,8 +7995,8 @@ def rows_to_review_dataframe(
         item_no = clean_text(raw.get("item_no", raw.get("ITEM NO", "")))
         detected_machinery = _clean_machinery_name(raw.get("section_name_english", raw.get("detected_machinery", raw.get("DETECTED MACHINERY", ""))))
         section_code = clean_text(raw.get("section_code", raw.get("SECTION CODE", ""))).upper()
-        section_maker = clean_text(raw.get("section_maker", raw.get("SECTION MAKER", ""))).upper()
-        section_model = clean_text(raw.get("section_model", raw.get("SECTION MODEL", ""))).upper()
+        section_maker = _credible_section_maker(raw.get("section_maker", raw.get("SECTION MAKER", "")))
+        section_model = _credible_section_model(raw.get("section_model", raw.get("SECTION MODEL", "")))
         table_title = clean_text(raw.get("table_title", raw.get("TABLE TITLE", detected_machinery)))
         source_page = quantity_to_number(raw.get("source_page", raw.get("SOURCE PAGE")))
         source_page_int = int(source_page) if source_page is not None else None
