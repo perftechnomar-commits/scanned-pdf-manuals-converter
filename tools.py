@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.2"
+TOOLS_VERSION = "4.18.3"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -8054,9 +8054,11 @@ def refresh_submachinery_derived_fields(
 ) -> pd.DataFrame:
     """Refresh Step-3 evidence from both spare rows and component drawings.
 
-    A genuine equipment drawing may have zero spare rows, so Step 3 cannot be
-    reconstructed solely from ``review_frame``. Manual edits remain authoritative
-    because ``merge_submachinery_candidates`` preserves manually overridden values.
+    A genuine equipment drawing may have zero spare rows, so Step 3 audit evidence
+    cannot be reconstructed solely from ``review_frame``. Export later removes
+    zero-part candidates from the import hierarchy. Manual edits remain
+    authoritative because ``merge_submachinery_candidates`` preserves manually
+    overridden values.
     """
     spare_detected = (
         build_submachinery_candidates(
@@ -8429,6 +8431,136 @@ def machinery_rows_from_main_and_additional(
     return pd.DataFrame(records, columns=MACHINERY_COLUMNS)
 
 
+def linked_machinery_rows_for_export(
+    machinery_frame: pd.DataFrame,
+    review_frame: pd.DataFrame,
+    *,
+    ready_only: bool = False,
+) -> pd.DataFrame:
+    """Keep the main machinery and only sub-machineries used by spare rows.
+
+    Drawing/equipment candidates remain useful review and audit evidence, but the
+    import workbook is a strict parent-child hierarchy: an exported sub-machinery
+    must own at least one included spare-part row.
+    """
+    if machinery_frame is None or machinery_frame.empty:
+        return pd.DataFrame(columns=MACHINERY_COLUMNS)
+    machinery_frame = machinery_frame.copy()
+    for column in MACHINERY_COLUMNS:
+        if column not in machinery_frame.columns:
+            machinery_frame[column] = ""
+
+    selected = (
+        review_frame.copy()
+        if review_frame is not None
+        else pd.DataFrame(columns=REVIEW_COLUMNS)
+    )
+    if not selected.empty and "INCLUDE" in selected.columns:
+        selected = selected[selected["INCLUDE"].astype(bool)]
+    if ready_only and not selected.empty and "READY" in selected.columns:
+        selected = selected[selected["READY"].astype(bool)]
+
+    linked_names = {
+        normalize_key(value)
+        for value in selected.get("MACHINERY", pd.Series(dtype=str)).tolist()
+        if clean_text(value)
+    }
+    machinery_types = machinery_frame.get(
+        "MCH_TP(M/S/U)", pd.Series("", index=machinery_frame.index)
+    ).map(clean_text)
+    machinery_names = machinery_frame.get(
+        "NAME", pd.Series("", index=machinery_frame.index)
+    ).map(normalize_key)
+    keep = machinery_types.eq("Main Machinery") | (
+        machinery_types.eq("SubMachinery") & machinery_names.isin(linked_names)
+    )
+    return machinery_frame.loc[keep, MACHINERY_COLUMNS].reset_index(drop=True)
+
+
+def validate_spare_machinery_hierarchy(
+    machinery_frame: pd.DataFrame,
+    review_frame: pd.DataFrame,
+) -> list[str]:
+    """Validate the strict Main -> Sub-machinery -> Spare relationship."""
+    errors: list[str] = []
+    selected = (
+        review_frame.copy()
+        if review_frame is not None
+        else pd.DataFrame(columns=REVIEW_COLUMNS)
+    )
+    if not selected.empty and "INCLUDE" in selected.columns:
+        selected = selected[selected["INCLUDE"].astype(bool)]
+    if selected.empty:
+        return [
+            "At least one included spare-part row is required; machinery without "
+            "linked spare parts remains audit-only."
+        ]
+
+    frame = (
+        machinery_frame.copy()
+        if machinery_frame is not None
+        else pd.DataFrame(columns=MACHINERY_COLUMNS)
+    )
+    for column in MACHINERY_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = ""
+    machinery_types = frame.get(
+        "MCH_TP(M/S/U)", pd.Series("", index=frame.index)
+    ).map(clean_text)
+    main_names = {
+        normalize_key(value)
+        for value in frame.loc[machinery_types.eq("Main Machinery"), "NAME"].tolist()
+        if clean_text(value)
+    }
+    sub_names = {
+        normalize_key(value)
+        for value in frame.loc[machinery_types.eq("SubMachinery"), "NAME"].tolist()
+        if clean_text(value)
+    }
+    parent_labels: dict[str, str] = {}
+    for value in selected.get("MACHINERY", pd.Series(dtype=str)).tolist():
+        label = clean_text(value)
+        if label:
+            parent_labels.setdefault(normalize_key(label), label)
+    parent_names = set(parent_labels)
+
+    direct_main = sorted(parent_names & main_names)
+    if direct_main:
+        errors.append(
+            "Every included spare part must belong to a sub-machinery, not directly "
+            "to the main machinery: "
+            + ", ".join(parent_labels[key] for key in direct_main)
+            + "."
+        )
+
+    missing_parents = sorted(parent_names - sub_names - main_names)
+    if missing_parents:
+        errors.append(
+            "Included spare rows reference missing sub-machineries: "
+            + ", ".join(parent_labels[key] for key in missing_parents)
+            + "."
+        )
+
+    unlinked_subs = sorted(sub_names - parent_names)
+    if unlinked_subs:
+        display_by_key = {
+            normalize_key(row.get("NAME", "")): clean_text(row.get("NAME", ""))
+            for _, row in frame.loc[machinery_types.eq("SubMachinery")].iterrows()
+        }
+        errors.append(
+            "Sub-machineries without included spare parts cannot be exported: "
+            + ", ".join(display_by_key[key] for key in unlinked_subs)
+            + "."
+        )
+
+    if len(sub_names) > len(selected):
+        errors.append(
+            f"Sub-machinery count ({len(sub_names)}) cannot exceed included spare-part "
+            f"count ({len(selected)})."
+        )
+    return errors
+
+
 def validate_machinery_dataframe(frame: pd.DataFrame) -> list[str]:
     errors: list[str] = []
     if frame is None or frame.empty:
@@ -8591,14 +8723,24 @@ def build_benefit_workbook(
     review_frame: pd.DataFrame,
     clear_existing: bool = True,
 ) -> bytes:
-    if len(machinery_frame) > MAX_MACHINERY_ROWS:
-        raise ValueError(f"Too many machinery rows; maximum is {MAX_MACHINERY_ROWS}.")
-
     selected = review_frame[
         review_frame["INCLUDE"].astype(bool) & review_frame["READY"].astype(bool)
     ].copy()
     if len(selected) > MAX_SPARE_ROWS:
         raise ValueError(f"Too many spare-parts rows; maximum is {MAX_SPARE_ROWS}.")
+
+    export_machinery_frame = linked_machinery_rows_for_export(
+        machinery_frame,
+        selected,
+    )
+    hierarchy_errors = validate_spare_machinery_hierarchy(
+        export_machinery_frame,
+        selected,
+    )
+    if hierarchy_errors:
+        raise ValueError(" ".join(hierarchy_errors))
+    if len(export_machinery_frame) > MAX_MACHINERY_ROWS:
+        raise ValueError(f"Too many machinery rows; maximum is {MAX_MACHINERY_ROWS}.")
 
     workbook = load_workbook(io.BytesIO(template_bytes), data_only=False, keep_links=True)
     missing_sheets = [
@@ -8617,7 +8759,7 @@ def build_benefit_workbook(
         _clear_values(machinery_sheet, 5, 609, 1, 8)
         _clear_values(spare_sheet, 4, 1441, 1, 7)
 
-    for offset, (_, row) in enumerate(machinery_frame.iterrows(), start=5):
+    for offset, (_, row) in enumerate(export_machinery_frame.iterrows(), start=5):
         for column_index, column_name in enumerate(MACHINERY_COLUMNS, start=1):
             cell = machinery_sheet.cell(row=offset, column=column_index)
             cell.value = excel_safe_text(row.get(column_name, ""))
