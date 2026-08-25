@@ -1,10 +1,26 @@
-# Spare Parts OCR Import Builder — hierarchy and natural sorting 4.11.0
+# Spare Parts OCR Import Builder — native-PDF hierarchy recovery 4.18.1
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.18.1 BWTS hierarchy and maintenance-spares correction
+
+- Uses the PDF's searchable text layer as independent evidence alongside Mistral
+  OCR. This restores drawing titles and document numbers when OCR damages rotated
+  title blocks, while OCR remains responsible for spatial table reconstruction.
+- Normalizes source-layout artifacts such as `90121 03` to drawing code `9012103`
+  and separates a drawing revision from codes such as `590066 1`.
+- Lets authoritative equipment drawings replace weaker spare-heading proposals,
+  preventing spare descriptions and generic page labels from becoming machinery.
+- Retains genuine semantic parents that have no printed drawing code by assigning a
+  stable `SUB-###` review code; the parent is no longer discarded before Step 3.
+- Recovers maintenance-list and recommended-spares rows, including bare procurement
+  labels such as `Part number: 596250 01`, their quantity, unit, and owning module.
+- Keeps strict export uniqueness while allowing duplicated source evidence to be
+  reconciled during review rather than blocked prematurely.
 
 ### 4.11.0 source hierarchy and code-aware sorting
 
