@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.1"
+TOOLS_VERSION = "4.18.2"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -5611,6 +5611,68 @@ def extract_explicit_spares_from_pdf(
     return rows, messages
 
 
+def apply_authoritative_explicit_spare_rows(
+    rows: Sequence[dict[str, Any]],
+    authoritative_rows: Sequence[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Replace OCR/AI duplicates with canonical PDF text-layer spare rows.
+
+    Explicitly labelled source rows are stronger than page-level OCR hierarchy.
+    This prevents a maintenance table's preceding section from overwriting a row
+    whose printed description and surrounding source text prove another owner.
+    It also restores a source row if a page-role pass accidentally dropped it.
+    """
+    canonical_by_identifier: dict[str, dict[str, Any]] = {}
+    for raw in authoritative_rows:
+        if not isinstance(raw, dict):
+            continue
+        identifier = normalize_key(
+            raw.get("ident_no", raw.get("code", raw.get("part_no", "")))
+        )
+        if not identifier:
+            continue
+        existing = canonical_by_identifier.get(identifier)
+        if existing is None or int(raw.get("source_priority", 0)) >= int(
+            existing.get("source_priority", 0)
+        ):
+            canonical_by_identifier[identifier] = dict(raw)
+
+    if not canonical_by_identifier:
+        return [dict(row) for row in rows if isinstance(row, dict)], 0, 0
+
+    retained: list[dict[str, Any]] = []
+    replaced = 0
+    present_before = {
+        normalize_key(
+            row.get("ident_no", row.get("code", row.get("part_no", "")))
+        )
+        for row in rows
+        if isinstance(row, dict)
+    }
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        identifier = normalize_key(
+            raw.get("ident_no", raw.get("code", raw.get("part_no", "")))
+        )
+        if identifier in canonical_by_identifier:
+            replaced += 1
+            continue
+        retained.append(dict(raw))
+
+    restored = sum(
+        1 for identifier in canonical_by_identifier if identifier not in present_before
+    )
+    retained.extend(dict(row) for row in canonical_by_identifier.values())
+    retained.sort(
+        key=lambda row: (
+            int(row.get("source_page") or 10**9),
+            clean_text(row.get("ident_no", row.get("code", ""))),
+        )
+    )
+    return retained, replaced, restored
+
+
 
 _PARTS_LIST_FIGURE_RE = re.compile(
     r"\bPARTS\s+LIST\s+FOR\s+FIGURE\s+([A-Z0-9]+(?:[.-][A-Z0-9]+)*)",
@@ -7310,7 +7372,7 @@ _GENERIC_MACHINERY_NAMES = {
     "CONTINUED", "LIST OF SPARE PARTS",
     "DIMENSION DRAWINGS INCLUDING TECHNICAL DATA",
     "DRAWINGS", "GENERAL DRAWINGS", "RECOMMENDED SPARE PARTS ON BOARD",
-    "DETAILED PAGE DESCRIPTIONS",
+    "DETAILED PAGE DESCRIPTIONS", "SECTION ON PAGE DESCRIPTION",
 }
 
 
@@ -7338,6 +7400,19 @@ def _is_generic_machinery_name(value: Any) -> bool:
     if normalized in _GENERIC_MACHINERY_NAMES:
         return True
     if normalized.startswith(("REPLACE ", "RENEW ", "INSTALL ", "CHECK ", "REMOVE ")):
+        return True
+    if re.search(r"\|\s*\d{1,4}\s*$", clean_text(value)):
+        return True
+    words = re.findall(r"[A-Z0-9]+", normalized)
+    if len(text) > 72 and len(words) > 9:
+        return True
+    if any(
+        phrase in normalized
+        for phrase in (
+            "CAN EASILY BECOME DAMAGED", "EXERCISE GREAT CARE",
+            "SECTION ON PAGE DESCRIPTION",
+        )
+    ):
         return True
     if any(
         phrase in normalized
@@ -7775,6 +7850,41 @@ def build_component_drawing_candidates(
     frame["CONFIDENCE"] = pd.to_numeric(frame["CONFIDENCE"], errors="coerce").fillna(0.90)
     return frame.sort_values(["FIRST PAGE", "NAME"], na_position="last").reset_index(drop=True)
 
+
+def merge_component_candidates_with_native_priority(
+    ocr_candidates: pd.DataFrame | None,
+    native_candidates: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Use native drawing evidence as the sole automatic result for its pages.
+
+    OCR remains the fallback for scanned/image-only pages. When the PDF text layer
+    proves a component on a page, every OCR-only proposal beginning on that same
+    page is suppressed before merging. This prevents a damaged OCR code/name from
+    surviving beside the correct native candidate as a false duplicate.
+    """
+    ocr = (
+        ocr_candidates.copy()
+        if ocr_candidates is not None
+        else empty_submachinery_review_dataframe()
+    )
+    native = (
+        native_candidates.copy()
+        if native_candidates is not None
+        else empty_submachinery_review_dataframe()
+    )
+    if native.empty:
+        return ocr
+    if ocr.empty:
+        return native
+
+    native_pages = {
+        int(value)
+        for value in pd.to_numeric(native["FIRST PAGE"], errors="coerce").dropna()
+    }
+    ocr_pages = pd.to_numeric(ocr["FIRST PAGE"], errors="coerce")
+    ocr = ocr.loc[~ocr_pages.isin(native_pages)].copy()
+    return merge_submachinery_candidates(ocr, native)
+
 def build_submachinery_candidates(
     review_frame: pd.DataFrame,
     main_row: dict[str, Any],
@@ -7792,9 +7902,28 @@ def build_submachinery_candidates(
             ),
             row.get("SECTION CODE", ""),
         )
-        code = clean_text(row.get("SECTION CODE", "")).upper()
+        raw_code = clean_text(row.get("SECTION CODE", "")).upper()
+        table_title = clean_text(row.get("TABLE TITLE", ""))
+        explicit_source = any(
+            marker in table_title.lower()
+            for marker in (
+                "explicit spare-number", "recommended spare parts",
+            )
+        )
+        structured_short_code = bool(
+            clean_text(row.get("ITEM NO", ""))
+            and re.fullmatch(r"\d{1,2}(?:\.\d{1,2})?", raw_code)
+        )
+        valid_code = _valid_automatic_section_code(raw_code) if raw_code else ""
         if _is_generic_machinery_name(name):
             continue
+        # Code-less semantic parents are accepted only from explicitly labelled
+        # spare lists. Invalid OCR codes from prose/warnings cannot manufacture a
+        # new SUB-### proposal. Numbered catalogue parents retain their established
+        # item-position evidence.
+        if not valid_code and not (explicit_source or structured_short_code):
+            continue
+        code = valid_code
         source = quantity_to_number(row.get("SOURCE PAGE"))
         section = quantity_to_number(row.get("SECTION START PAGE"))
         observations.append(
@@ -7941,12 +8070,30 @@ def refresh_submachinery_derived_fields(
     # Spare-table headings establish semantic parents, while a corroborating
     # equipment drawing supplies the authoritative printed code/name.
     detected = merge_submachinery_candidates(spare_detected, component_candidates)
-    if existing is None or existing.empty:
-        return detected
-    if detected is None or detected.empty:
-        return existing.copy()
+    # Automatic proposals are derived state: rebuild them from current evidence
+    # instead of accumulating stale OCR candidates across Streamlit reruns. Only
+    # rows explicitly edited/created by the user survive independently.
+    manual_existing = empty_submachinery_review_dataframe()
+    if existing is not None and not existing.empty:
+        working_existing = existing.copy()
+        for column in SUBMACHINERY_REVIEW_COLUMNS:
+            if column not in working_existing.columns:
+                working_existing[column] = False if column == "INCLUDE" else ""
+        origin = working_existing["ORIGIN"].fillna("").astype(str)
+        manual_existing = working_existing.loc[
+            ~origin.str.startswith("Auto")
+        , SUBMACHINERY_REVIEW_COLUMNS].copy()
 
-    result = merge_submachinery_candidates(existing, detected)
+    result = (
+        detected.copy()
+        if detected is not None
+        else empty_submachinery_review_dataframe()
+    )
+    if not manual_existing.empty:
+        result = merge_submachinery_candidates(result, manual_existing)
+    if result.empty:
+        return empty_submachinery_review_dataframe()
+
     result["MCH_TP(M/S/U)"] = "SubMachinery"
     result["CONFIDENCE"] = pd.to_numeric(result["CONFIDENCE"], errors="coerce").fillna(0.70)
     result["PARTS FOUND"] = pd.to_numeric(result["PARTS FOUND"], errors="coerce").fillna(0).astype(int)
