@@ -92,7 +92,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.0"
+APP_VERSION = "4.18.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1502,6 +1502,75 @@ def _extract_printed_english_from_pdf(pdf_bytes: bytes) -> tuple[dict[str, dict[
     return part_overrides, section_names
 
 
+def _extract_native_pdf_context_pages(
+    pdf_bytes: bytes,
+    page_indexes: list[int] | tuple[int, ...] | None = None,
+) -> list[tuple[int, str]]:
+    """Return trustworthy text-layer evidence alongside OCR markdown.
+
+    Engineering drawings often contain a clean searchable heading and document
+    number even when OCR damages the same rotated title block. Native text is used
+    only as additional evidence; scanned/image-only pages simply return no text.
+    """
+    if not pdf_bytes:
+        return []
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return []
+
+    indexes = (
+        list(page_indexes)
+        if page_indexes is not None
+        else list(range(len(reader.pages)))
+    )
+    pages: list[tuple[int, str]] = []
+    for raw_index in indexes:
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= index < len(reader.pages):
+            continue
+        page = reader.pages[index]
+        text = ""
+        try:
+            # Plain extraction keeps rotated drawing-footer values separate (for
+            # example ``590066 1Book No...``). Layout extraction can visually align
+            # that footer by prepending the printed page number and silently turn a
+            # genuine drawing code into a different number. OCR remains available in
+            # the merged page evidence for spatial table reconstruction.
+            text = page.extract_text() or ""
+        except Exception:
+            try:
+                text = page.extract_text(extraction_mode="layout") or ""
+            except Exception:
+                text = ""
+        if text.strip():
+            pages.append((index + 1, text))
+    return pages
+
+
+def _merge_pdf_context_pages(
+    ocr_pages: list[tuple[int, str]],
+    native_pages: list[tuple[int, str]],
+) -> list[tuple[int, str]]:
+    """Merge page evidence with native text first and OCR retained for tables."""
+    native_lookup = {int(page): str(text or "") for page, text in native_pages}
+    ocr_lookup = {int(page): str(text or "") for page, text in ocr_pages}
+    merged: list[tuple[int, str]] = []
+    for page in sorted(set(native_lookup) | set(ocr_lookup)):
+        native = native_lookup.get(page, "").strip()
+        ocr = ocr_lookup.get(page, "").strip()
+        if native and ocr and native != ocr:
+            merged.append((page, f"{native}\n\n{ocr}"))
+        else:
+            merged.append((page, native or ocr))
+    return merged
+
+
 def _apply_printed_pdf_overrides(
     review: pd.DataFrame,
     pdf_bytes: bytes,
@@ -1593,7 +1662,10 @@ def recalculate_review_with_verification(
     result = recalculate_review_status(
         deduplicated,
         valid_machinery_names=valid_machinery_names,
-        allow_duplicates=False,
+        # Exact CODE uniqueness is enforced below after CODE consolidation.
+        # The lower-level row-similarity check remains advisory so a distinct
+        # source record cannot stay blocked after mass verification.
+        allow_duplicates=True,
     )
     if result.empty:
         return result
@@ -3352,21 +3424,31 @@ if active_workflow_step == "2. OCR":
                     source_document_name = _source_document_name(
                         input_type, source_file, document_url, image_url
                     )
-                    catalog_context_pages = list(extracted_pages)
+                    native_context_pages: list[tuple[int, str]] = []
+                    if input_type == "PDF" and source_file is not None:
+                        native_context_pages = _extract_native_pdf_context_pages(
+                            source_file.getvalue(),
+                            page_indexes=selected_pages,
+                        )
+                    catalog_context_pages = _merge_pdf_context_pages(
+                        list(extracted_pages),
+                        native_context_pages,
+                    )
                     if append_results and st.session_state.extracted_pages:
                         context_lookup = {
                             int(page): markdown
                             for page, markdown in st.session_state.extracted_pages
                         }
-                        context_lookup.update(
-                            {int(page): markdown for page, markdown in extracted_pages}
-                        )
+                        context_lookup.update({
+                            int(page): markdown
+                            for page, markdown in catalog_context_pages
+                        })
                         catalog_context_pages = sorted(
                             context_lookup.items(), key=lambda value: value[0]
                         )
                     rows, automation_messages = prepare_benefit_rows(
                         ai_rows=ai_rows,
-                        extracted_pages=extracted_pages,
+                        extracted_pages=catalog_context_pages,
                         source_document_name=source_document_name,
                         main_row=current_main_row(),
                         default_unit=default_unit,
@@ -3440,7 +3522,7 @@ if active_workflow_step == "2. OCR":
                             for page, text in st.session_state.extracted_pages
                         }
                         merged_pages.update(
-                            {int(page): text for page, text in extracted_pages}
+                            {int(page): text for page, text in catalog_context_pages}
                         )
                         st.session_state.extracted_pages = sorted(
                             merged_pages.items(),
@@ -3473,7 +3555,7 @@ if active_workflow_step == "2. OCR":
                         )
                         previous_candidates = st.session_state.submachinery_review
                     else:
-                        st.session_state.extracted_pages = list(extracted_pages)
+                        st.session_state.extracted_pages = list(catalog_context_pages)
                         st.session_state.page_classification = classification_frame
                         st.session_state.extraction_log = extraction_messages
                         combined_review = new_review
@@ -3483,10 +3565,21 @@ if active_workflow_step == "2. OCR":
 
                     st.session_state.document_profile = document_profile
 
-                    component_candidates = build_component_drawing_candidates(
-                        catalog_context_pages,
+                    ocr_component_candidates = build_component_drawing_candidates(
+                        extracted_pages,
                         current_main_row(),
                         source_document_name=source_document_name,
+                    )
+                    native_component_candidates = build_component_drawing_candidates(
+                        native_context_pages,
+                        current_main_row(),
+                        source_document_name=source_document_name,
+                    )
+                    # Native searchable text is authoritative for drawing headings
+                    # and document numbers; OCR candidates still recover scans.
+                    component_candidates = merge_submachinery_candidates(
+                        ocr_component_candidates,
+                        native_component_candidates,
                     )
                     spare_candidates = build_submachinery_candidates(
                         combined_review,
@@ -3494,8 +3587,8 @@ if active_workflow_step == "2. OCR":
                         source_document_name=source_document_name,
                     )
                     detected_candidates = merge_submachinery_candidates(
-                        component_candidates,
                         spare_candidates,
+                        component_candidates,
                     )
                     merged_candidates = merge_submachinery_candidates(
                         previous_candidates,
