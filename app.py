@@ -36,6 +36,7 @@ from tools import (
     analyze_document_profile_with_ai,
     apply_submachinery_assignments,
     build_audit_workbook,
+    build_component_drawing_candidates,
     build_submachinery_candidates,
     refresh_submachinery_derived_fields,
     build_workbook,
@@ -91,7 +92,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.15.1"
+APP_VERSION = "4.16.0"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1701,7 +1702,7 @@ and continuation rules. The saved profile guides every extraction batch. It is
 advisory only: printed source evidence, unique-code enforcement, and review checks
 remain authoritative, and processing safely continues if the analysis call fails.
 
-The app uses the drawing/table code printed in each PDF page header as the internal key and assigns every spare by that exact key. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
+The app discovers machinery independently from spare rows. A genuine equipment drawing with a labelled Document/Drawing No. and concrete equipment Title can create a sub-machinery even when that drawing contains zero spare rows. Spare rows are then linked to the same source-backed machinery when evidence exists. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
 
 For older German/English/French catalogues, the app also recognizes simple numbered
 section headings printed inside the table (for example **3. Servo drive for oil
@@ -1722,7 +1723,7 @@ the source text layer. Repeated references are reconciled instead of exported tw
 - The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
 - A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
-- **PARTS FOUND:** number of spare-part rows linked to the proposal.
+- **PARTS FOUND:** number of spare-part rows linked to the proposal. A genuine drawing-only machinery can correctly show 0.
 - **CONFIDENCE:** hierarchy confidence based on source-code/name agreement and supporting spare rows, not merely raw OCR quality.
 - **VARIANTS:** different spellings found in the manual.
 - Maker/model printed in the section override the manually entered main-machinery defaults.
@@ -2453,15 +2454,21 @@ workflow_missing_sub_details = (
     else 0
 )
 workflow_rows_detected = not workflow_included.empty
+workflow_sub_rows_included = (
+    workflow_submachinery[workflow_submachinery["INCLUDE"].astype(bool)]
+    if not workflow_submachinery.empty and "INCLUDE" in workflow_submachinery.columns
+    else workflow_submachinery
+)
+workflow_component_detected = not workflow_sub_rows_included.empty
 workflow_sub_ready = (
     workflow_ocr_ready
-    and workflow_rows_detected
+    and workflow_component_detected
     and workflow_missing_sub_details == 0
 )
 workflow_review_ready = (
     workflow_ocr_ready
-    and workflow_rows_detected
-    and workflow_blocked_count == 0
+    and workflow_sub_ready
+    and (workflow_blocked_count == 0 if workflow_rows_detected else True)
 )
 workflow_export_created = bool(st.session_state.output)
 
@@ -2473,8 +2480,8 @@ workflow_labels = {
             "✓ 3. Sub-machineries"
             if workflow_sub_ready
             else (
-                "! 3. Sub-machineries (no spare rows)"
-                if not workflow_rows_detected
+                "! 3. Sub-machineries (none detected)"
+                if not workflow_component_detected
                 else f"! 3. Sub-machineries ({workflow_missing_sub_details})"
             )
         )
@@ -2485,8 +2492,8 @@ workflow_labels = {
         "✓ 4. Review"
         if workflow_review_ready
         else (
-            "! 4. Review (no spare rows)"
-            if workflow_ocr_ready and not workflow_rows_detected
+            "✓ 4. Review (no spare rows)"
+            if workflow_ocr_ready and workflow_sub_ready and not workflow_rows_detected
             else (f"! 4. Review ({workflow_blocked_count})" if workflow_ocr_ready else "○ 4. Review")
         )
     ),
@@ -2681,13 +2688,19 @@ if active_workflow_step == "3. Sub-machineries":
         # intentionally local/deterministic: it performs no OCR or AI call and it
         # preserves all user-editable proposal fields. It also upgrades persisted
         # document jobs whose confidence was calculated by an older parser build.
-        if not st.session_state.spare_review.empty:
+        if st.session_state.extracted_pages:
             source_name = active_job.get("file_name", "") if active_job else ""
+            component_candidates = build_component_drawing_candidates(
+                st.session_state.extracted_pages,
+                current_main_row(),
+                source_document_name=source_name,
+            )
             refreshed_submachineries = refresh_submachinery_derived_fields(
                 st.session_state.submachinery_review,
                 st.session_state.spare_review,
                 current_main_row(),
                 source_document_name=source_name,
+                component_candidates=component_candidates,
             )
             if not refreshed_submachineries.equals(st.session_state.submachinery_review):
                 st.session_state.submachinery_review = refreshed_submachineries
@@ -2696,9 +2709,9 @@ if active_workflow_step == "3. Sub-machineries":
         if st.session_state.submachinery_review.empty:
             if workflow_ocr_ready and st.session_state.spare_review.empty:
                 st.warning(
-                    "OCR is complete, but no genuine spare-part rows were detected. "
-                    "Return to Step 2 and inspect the AI model status / OCR recovery log; "
-                    "you do not need to re-enter the machinery data."
+                    "OCR is complete, but no source-backed sub-machinery was detected. "
+                    "Return to Step 2 and inspect the OCR/source evidence; you do not need "
+                    "to re-enter the machinery data."
                 )
             else:
                 st.info(
@@ -3471,12 +3484,19 @@ if active_workflow_step == "2. OCR":
 
                     st.session_state.document_profile = document_profile
 
-                    detected_candidates = build_submachinery_candidates(
+                    component_candidates = build_component_drawing_candidates(
+                        catalog_context_pages,
+                        current_main_row(),
+                        source_document_name=source_document_name,
+                    )
+                    spare_candidates = build_submachinery_candidates(
                         combined_review,
                         current_main_row(),
-                        source_document_name=_source_document_name(
-                            input_type, source_file, document_url, image_url
-                        ),
+                        source_document_name=source_document_name,
+                    )
+                    detected_candidates = merge_submachinery_candidates(
+                        component_candidates,
+                        spare_candidates,
                     )
                     merged_candidates = merge_submachinery_candidates(
                         previous_candidates,
@@ -3546,8 +3566,10 @@ if active_workflow_step == "2. OCR":
                     else:
                         st.warning(
                             completion_message
-                            + " No spare rows were created, so Steps 3 and 4 remain incomplete. "
-                            "Open AI model run status and the OCR recovery log below for the cause."
+                            + (" No spare rows were created, but source-backed machinery drawings may still be available in Step 3. "
+                               "Review Step 3 before deciding whether another extraction pass is needed."
+                               if len(merged_candidates) else
+                               " No spare rows or source-backed machinery were created. Open AI model run status and the OCR recovery log below for the cause.")
                         )
                     # Replace the disabled control above with the enabled one as
                     # soon as processing completes, without requiring a rerun.
@@ -3732,16 +3754,15 @@ if active_workflow_step == "4. Review spare parts":
             next_help=(
                 f"Resolve {workflow_blocked_count} included row(s) before export."
                 if workflow_blocked_count
-                else "Process and review at least one included spare-part row first."
+                else ("Complete Step 3 first." if not workflow_sub_ready else "")
             ) if not workflow_review_ready else None,
         )
 
         if st.session_state.spare_review.empty:
             if workflow_ocr_ready:
                 st.warning(
-                    "OCR completed, but zero genuine spare-part rows were extracted. "
-                    "Review Step 2 for the row-extraction result and rotated-drawing OCR "
-                    "status instead of running the same OCR again blindly."
+                    "No spare-part rows were extracted for this document/range. Source-backed machinery "
+                    "can still be exported when Step 3 is complete; no spare rows will be written to sheet 2."
                 )
             else:
                 st.info("Run OCR first. Candidate spare-parts rows will appear here.")
@@ -4348,8 +4369,11 @@ def build_multi_document_package(
             if not vessels:
                 reasons.append("no vessels assigned")
             reasons.extend(machinery_errors)
-            if included.empty:
-                reasons.append("no included spare-part rows")
+            included_subs = included_submachinery_rows(
+                job.get("submachinery_review", empty_submachinery_review_dataframe())
+            )
+            if included.empty and included_subs.empty:
+                reasons.append("no included spare-part rows or source-backed sub-machinery rows")
             elif not blocked.empty:
                 reasons.append(f"{len(blocked)} row(s) still need correction")
 
@@ -4507,7 +4531,7 @@ if active_workflow_step == "5. Export":
         if blocked.empty and not included.empty:
             st.success(f"{len(included)} included spare-part row(s) are ready.")
         elif included.empty:
-            st.warning("No spare-part rows are currently included.")
+            st.info("No spare-part rows are included. The workbook can still export the validated machinery/sub-machinery rows; sheet 2 will remain empty.")
         else:
             st.error(f"Correct {len(blocked)} included row(s) before export.")
             blocked_display = blocked[
@@ -4536,7 +4560,7 @@ if active_workflow_step == "5. Export":
             template_bytes is not None
             and bool(vessels)
             and not machinery_errors
-            and not included.empty
+            and workflow_sub_ready
             and blocked.empty
         )
 
