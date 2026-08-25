@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.16.0"
+TOOLS_VERSION = "4.17.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -4805,6 +4805,92 @@ def _drawing_heading_sections(
     return results
 
 
+def _unnumbered_equipment_drawing_sections(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> list[dict[str, Any]]:
+    """Detect an equipment drawing whose page heading is not chapter-numbered.
+
+    Some manuals print the concrete equipment heading above the drawing and place
+    the genuine document number on the next line, while the rotated drawing title
+    block is only partly available to OCR. This remains high-precision by requiring
+    all three independent source signals on the same page:
+
+    * explicit drawing/dimension context near the top of the page;
+    * a concrete equipment/component heading (not a document-level drawing title);
+    * a nearby standalone engineering code containing at least five digits.
+
+    Equipment tags, dimensions, DN sizes, legend rows and drawing callouts cannot
+    qualify because they are neither a concrete heading paired with an independently
+    valid standalone document code nor accepted by ``_valid_drawing_heading_code``.
+    """
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for page_number, raw_text in extracted_pages:
+        lines = [clean_text(line) for line in str(raw_text or "").splitlines() if clean_text(line)]
+        if not lines:
+            continue
+
+        header_lines = lines[:18]
+        context = " ".join(header_lines).upper()
+        if not any(
+            token in context
+            for token in (
+                "DRAWING", "DRAWINGS", "DIMENSION", "SCHEMATIC",
+                "GENERAL ARRANGEMENT", "ASSEMBLY DRAWING", "PARTS DRAWING",
+            )
+        ):
+            continue
+
+        for index, line in enumerate(header_lines):
+            # Numbered headings are handled by the established detector above.
+            if _DRAWING_SECTION_HEADING_RE.match(line):
+                continue
+            if _DRAWING_CODE_PREFIX_RE.fullmatch(line) and _valid_drawing_heading_code(line):
+                continue
+
+            title = _clean_drawing_component_title(line)
+            if not _is_equipment_component_title(title):
+                continue
+
+            code = ""
+            # The printed document number normally follows the heading. Keep the
+            # window deliberately narrow so a footer Book No. or unrelated drawing
+            # reference elsewhere on the page cannot be borrowed as the parent code.
+            for following in header_lines[index + 1:index + 6]:
+                candidate_line = re.split(
+                    r"BOOK\s+NO\.?", following, maxsplit=1, flags=re.IGNORECASE
+                )[0].strip()
+                if not candidate_line or _DRAWING_SECTION_HEADING_RE.match(candidate_line):
+                    continue
+                if not _DRAWING_CODE_PREFIX_RE.fullmatch(candidate_line):
+                    continue
+                candidate = _valid_drawing_heading_code(candidate_line)
+                if candidate:
+                    code = candidate
+                    break
+            if not code:
+                continue
+
+            key = (normalize_key(code), normalize_key(title))
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(
+                {
+                    "code": code,
+                    "aliases": [code],
+                    "name": title,
+                    "maker": "",
+                    "model": "",
+                    "pages": {int(page_number)},
+                    "source": "unnumbered equipment drawing heading",
+                    "confidence": 0.93,
+                }
+            )
+    return results
+
+
 def _looks_like_spare_table_page(markdown: str) -> bool:
     text = clean_text(markdown).lower()
     has_description = any(
@@ -7307,7 +7393,9 @@ def _clean_equipment_drawing_title(value: Any) -> str:
     optional-scope parentheticals are not part of the machinery name. Short equipment
     acronyms/tags remain when they are genuinely part of the title.
     """
-    text = clean_text(value).strip(" -:;|,.")
+    text = clean_text(value).translate(
+        str.maketrans({"\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2212": "-"})
+    ).strip(" -:;|,.")
     if not text:
         return ""
     text = re.sub(
@@ -7334,6 +7422,8 @@ def _is_equipment_component_title(value: Any) -> bool:
         return False
     normalized = re.sub(r"[^A-Z0-9 ]+", " ", title.upper())
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized.startswith(("NOTE ", "IF ", "WHEN ", "WHERE ")):
+        return False
     if normalized in _DRAWING_ONLY_EXCLUDED_TITLES:
         return False
     if any(
@@ -7342,6 +7432,7 @@ def _is_equipment_component_title(value: Any) -> bool:
             "GENERAL ARRANGEMENT", "FLOW DIAGRAM", "FLOW SCHEME", "PIPING DIAGRAM",
             "CONNECTION LIST", "CABLE LIST", "SYSTEM SCHEMATIC", "SYSTEM LAYOUT",
             "INSTALLATION PRINCIPLE", "CIRCUIT DIAGRAM", "WIRING DIAGRAM",
+            "FLOW CHART",
         )
     ):
         return False
@@ -7412,6 +7503,7 @@ def build_component_drawing_candidates(
         item = dict(section)
         item.setdefault("confidence", 0.92)
         discoveries.append(item)
+    discoveries.extend(_unnumbered_equipment_drawing_sections(extracted_pages))
     if not discoveries:
         return empty_submachinery_review_dataframe()
 
@@ -8197,6 +8289,12 @@ def build_benefit_workbook(
             else:
                 cell.value = excel_safe_text(value)
                 cell.number_format = "@"
+
+    # The source template may arrive with sheet protection enabled. Review/import
+    # workbooks must remain freely editable after export, including the Instructions
+    # sheet and zero-spare exports that contain machinery rows only.
+    for worksheet in workbook.worksheets:
+        worksheet.protection.sheet = False
 
     workbook.active = workbook.sheetnames.index(SPARE_PARTS_SHEET)
     output = io.BytesIO()
