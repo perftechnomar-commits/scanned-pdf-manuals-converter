@@ -90,9 +90,27 @@ except ImportError:
         ]
 
 
+try:
+    from tools import (
+        apply_authoritative_explicit_spare_rows,
+        merge_component_candidates_with_native_priority,
+    )
+except ImportError:
+    # A Streamlit deployment can briefly serve app.py before tools.py finishes
+    # refreshing. Keep the app loadable; its version gate will request the matching
+    # parser instead of crashing on import.
+    def apply_authoritative_explicit_spare_rows(rows, authoritative_rows):
+        return list(rows), 0, 0
+
+    def merge_component_candidates_with_native_priority(
+        ocr_candidates, native_candidates
+    ):
+        return merge_submachinery_candidates(ocr_candidates, native_candidates)
+
+
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.1"
+APP_VERSION = "4.18.2"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -653,6 +671,8 @@ def initialize_state() -> None:
         "input_type": "PDF",
         "manual_mistral_api_key": "",
         "extracted_pages": [],
+        "ocr_extracted_pages": [],
+        "native_context_pages": [],
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
         "document_profile": {},
@@ -718,6 +738,8 @@ def initialize_state() -> None:
 
 JOB_STATE_FIELDS = [
     "extracted_pages",
+    "ocr_extracted_pages",
+    "native_context_pages",
     "page_classification",
     "extraction_log",
     "document_profile",
@@ -771,6 +793,8 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "pdf_path": pdf_path,
         "size_bytes": int(size_bytes),
         "extracted_pages": [],
+        "ocr_extracted_pages": [],
+        "native_context_pages": [],
         "page_classification": pd.DataFrame(),
         "extraction_log": [],
         "document_profile": {},
@@ -832,6 +856,10 @@ def load_document_job(job_id: str) -> None:
             # Older in-memory jobs predate adaptive analysis. Never leak the
             # previously active document's profile into another manual.
             st.session_state.document_profile = {}
+        elif field in {"ocr_extracted_pages", "native_context_pages"}:
+            # Older in-memory jobs did not persist the separated evidence layers.
+            # Never inherit them from the previously active document.
+            st.session_state[field] = []
     st.session_state.loaded_job_id = job_id
     st.session_state.active_document_id = job_id
 
@@ -2034,6 +2062,8 @@ with st.expander("⚙️ Processing & export settings", expanded=False):
             key=f"reset_document_{reset_key_suffix}",
         ):
             st.session_state.extracted_pages = []
+            st.session_state.ocr_extracted_pages = []
+            st.session_state.native_context_pages = []
             st.session_state.page_classification = pd.DataFrame()
             st.session_state.extraction_log = []
             st.session_state.document_profile = {}
@@ -2761,20 +2791,51 @@ if active_workflow_step == "3. Sub-machineries":
         # document jobs whose confidence was calculated by an older parser build.
         if st.session_state.extracted_pages:
             source_name = active_job.get("file_name", "") if active_job else ""
-            component_candidates = build_component_drawing_candidates(
-                st.session_state.extracted_pages,
+            ocr_context_pages = list(
+                st.session_state.get("ocr_extracted_pages", [])
+                or st.session_state.extracted_pages
+            )
+            native_context_pages = list(
+                st.session_state.get("native_context_pages", [])
+            )
+            if not native_context_pages and active_job:
+                pdf_path = Path(str(active_job.get("pdf_path", "")))
+                try:
+                    native_context_pages = _extract_native_pdf_context_pages(
+                        pdf_path.read_bytes() if pdf_path.is_file() else b""
+                    )
+                except OSError:
+                    native_context_pages = []
+                st.session_state.native_context_pages = list(native_context_pages)
+
+            ocr_component_candidates = build_component_drawing_candidates(
+                ocr_context_pages,
                 current_main_row(),
                 source_document_name=source_name,
             )
+            native_component_candidates = build_component_drawing_candidates(
+                native_context_pages,
+                current_main_row(),
+                source_document_name=source_name,
+            )
+            component_candidates = merge_component_candidates_with_native_priority(
+                ocr_component_candidates,
+                native_component_candidates,
+            )
+            previous_submachineries = st.session_state.submachinery_review.copy()
             refreshed_submachineries = refresh_submachinery_derived_fields(
-                st.session_state.submachinery_review,
+                previous_submachineries,
                 st.session_state.spare_review,
                 current_main_row(),
                 source_document_name=source_name,
                 component_candidates=component_candidates,
             )
-            if not refreshed_submachineries.equals(st.session_state.submachinery_review):
+            if not refreshed_submachineries.equals(previous_submachineries):
                 st.session_state.submachinery_review = refreshed_submachineries
+                _apply_submachinery_changes_to_spares(
+                    previous_submachineries,
+                    refreshed_submachineries,
+                )
                 save_loaded_job_state()
 
         if st.session_state.submachinery_review.empty:
@@ -3430,22 +3491,32 @@ if active_workflow_step == "2. OCR":
                             source_file.getvalue(),
                             page_indexes=selected_pages,
                         )
+                    ocr_context_pages = list(extracted_pages)
+                    if append_results:
+                        previous_ocr = list(
+                            st.session_state.get("ocr_extracted_pages", [])
+                        )
+                        previous_native = list(
+                            st.session_state.get("native_context_pages", [])
+                        )
+                        ocr_lookup = {
+                            int(page): text for page, text in previous_ocr
+                        }
+                        ocr_lookup.update(
+                            {int(page): text for page, text in ocr_context_pages}
+                        )
+                        native_lookup = {
+                            int(page): text for page, text in previous_native
+                        }
+                        native_lookup.update(
+                            {int(page): text for page, text in native_context_pages}
+                        )
+                        ocr_context_pages = sorted(ocr_lookup.items())
+                        native_context_pages = sorted(native_lookup.items())
                     catalog_context_pages = _merge_pdf_context_pages(
-                        list(extracted_pages),
+                        ocr_context_pages,
                         native_context_pages,
                     )
-                    if append_results and st.session_state.extracted_pages:
-                        context_lookup = {
-                            int(page): markdown
-                            for page, markdown in st.session_state.extracted_pages
-                        }
-                        context_lookup.update({
-                            int(page): markdown
-                            for page, markdown in catalog_context_pages
-                        })
-                        catalog_context_pages = sorted(
-                            context_lookup.items(), key=lambda value: value[0]
-                        )
                     rows, automation_messages = prepare_benefit_rows(
                         ai_rows=ai_rows,
                         extracted_pages=catalog_context_pages,
@@ -3491,6 +3562,20 @@ if active_workflow_step == "2. OCR":
                         )
                         extraction_messages.extend(english_messages)
 
+                    if explicit_pdf_rows:
+                        rows, replaced_explicit, restored_explicit = (
+                            apply_authoritative_explicit_spare_rows(
+                                rows,
+                                explicit_pdf_rows,
+                            )
+                        )
+                        extraction_messages.append(
+                            "Locked PDF text-layer evidence for "
+                            f"{len(explicit_pdf_rows)} explicit spare row(s); "
+                            f"replaced {replaced_explicit} OCR/AI occurrence(s) and "
+                            f"restored {restored_explicit} omitted row(s)."
+                        )
+
                     new_review = rows_to_review_dataframe(
                         rows,
                         default_machinery=st.session_state.main_name,
@@ -3517,17 +3602,9 @@ if active_workflow_step == "2. OCR":
                             )
 
                     if append_results:
-                        merged_pages = {
-                            int(page): text
-                            for page, text in st.session_state.extracted_pages
-                        }
-                        merged_pages.update(
-                            {int(page): text for page, text in catalog_context_pages}
-                        )
-                        st.session_state.extracted_pages = sorted(
-                            merged_pages.items(),
-                            key=lambda value: value[0],
-                        )
+                        st.session_state.extracted_pages = list(catalog_context_pages)
+                        st.session_state.ocr_extracted_pages = list(ocr_context_pages)
+                        st.session_state.native_context_pages = list(native_context_pages)
 
                         previous_classification = st.session_state.page_classification
                         if previous_classification is None or previous_classification.empty:
@@ -3556,6 +3633,8 @@ if active_workflow_step == "2. OCR":
                         previous_candidates = st.session_state.submachinery_review
                     else:
                         st.session_state.extracted_pages = list(catalog_context_pages)
+                        st.session_state.ocr_extracted_pages = list(ocr_context_pages)
+                        st.session_state.native_context_pages = list(native_context_pages)
                         st.session_state.page_classification = classification_frame
                         st.session_state.extraction_log = extraction_messages
                         combined_review = new_review
@@ -3566,7 +3645,7 @@ if active_workflow_step == "2. OCR":
                     st.session_state.document_profile = document_profile
 
                     ocr_component_candidates = build_component_drawing_candidates(
-                        extracted_pages,
+                        ocr_context_pages,
                         current_main_row(),
                         source_document_name=source_document_name,
                     )
@@ -3577,22 +3656,16 @@ if active_workflow_step == "2. OCR":
                     )
                     # Native searchable text is authoritative for drawing headings
                     # and document numbers; OCR candidates still recover scans.
-                    component_candidates = merge_submachinery_candidates(
+                    component_candidates = merge_component_candidates_with_native_priority(
                         ocr_component_candidates,
                         native_component_candidates,
                     )
-                    spare_candidates = build_submachinery_candidates(
+                    merged_candidates = refresh_submachinery_derived_fields(
+                        previous_candidates,
                         combined_review,
                         current_main_row(),
                         source_document_name=source_document_name,
-                    )
-                    detected_candidates = merge_submachinery_candidates(
-                        spare_candidates,
-                        component_candidates,
-                    )
-                    merged_candidates = merge_submachinery_candidates(
-                        previous_candidates,
-                        detected_candidates,
+                        component_candidates=component_candidates,
                     )
                     merged_candidates = _apply_printed_section_names(
                         merged_candidates,
