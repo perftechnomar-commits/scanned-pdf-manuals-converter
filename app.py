@@ -93,7 +93,9 @@ except ImportError:
 try:
     from tools import (
         apply_authoritative_explicit_spare_rows,
+        linked_machinery_rows_for_export,
         merge_component_candidates_with_native_priority,
+        validate_spare_machinery_hierarchy,
     )
 except ImportError:
     # A Streamlit deployment can briefly serve app.py before tools.py finishes
@@ -107,10 +109,16 @@ except ImportError:
     ):
         return merge_submachinery_candidates(ocr_candidates, native_candidates)
 
+    def linked_machinery_rows_for_export(machinery_frame, review_frame, **kwargs):
+        return machinery_frame.copy()
+
+    def validate_spare_machinery_hierarchy(machinery_frame, review_frame):
+        return []
+
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.2"
+APP_VERSION = "4.18.3"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1025,14 +1033,27 @@ def _job_main_row(job: dict) -> dict[str, str]:
 
 def _job_machinery_frame(job: dict) -> pd.DataFrame:
     sub_frame = included_submachinery_rows(job.get("submachinery_review", empty_submachinery_review_dataframe()))
-    return machinery_rows_from_main_and_additional(_job_main_row(job), sub_frame)
+    full_frame = machinery_rows_from_main_and_additional(_job_main_row(job), sub_frame)
+    return linked_machinery_rows_for_export(
+        full_frame,
+        job.get("spare_review", empty_review_dataframe()),
+    )
 
 
 def _job_status(job: dict) -> tuple[str, int, int]:
     review = job.get("spare_review", empty_review_dataframe())
     rows = len(review) if isinstance(review, pd.DataFrame) else 0
-    sub_frame = job.get("submachinery_review", empty_submachinery_review_dataframe())
-    sub_count = len(sub_frame) if isinstance(sub_frame, pd.DataFrame) else 0
+    export_machinery = _job_machinery_frame(job)
+    sub_count = (
+        int(
+            export_machinery["MCH_TP(M/S/U)"]
+            .astype(str)
+            .eq("SubMachinery")
+            .sum()
+        )
+        if not export_machinery.empty
+        else 0
+    )
     if job.get("output"):
         return "Export created", rows, sub_count
     if rows:
@@ -1801,7 +1822,12 @@ and continuation rules. The saved profile guides every extraction batch. It is
 advisory only: printed source evidence, unique-code enforcement, and review checks
 remain authoritative, and processing safely continues if the analysis call fails.
 
-The app discovers machinery independently from spare rows. A genuine equipment drawing with a labelled Document/Drawing No. and concrete equipment Title can create a sub-machinery even when that drawing contains zero spare rows. Spare rows are then linked to the same source-backed machinery when evidence exists. Codes found only inside spare-part rows, descriptions, or cross-references are ignored for section assignment.
+The app discovers equipment/drawing candidates independently from spare rows so
+source hierarchy is not lost. The import workbook remains strict, however: only a
+candidate that owns at least one included spare-part row is exported as a
+sub-machinery. Zero-part drawing candidates remain in Step 3 and the audit workbook.
+Codes found only inside spare-part rows, descriptions, or cross-references are
+ignored for section assignment.
 
 For older German/English/French catalogues, the app also recognizes simple numbered
 section headings printed inside the table (for example **3. Servo drive for oil
@@ -1822,7 +1848,8 @@ the source text layer. Repeated references are reconciled instead of exported tw
 - The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
 - A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
-- **PARTS FOUND:** number of spare-part rows linked to the proposal. A genuine drawing-only machinery can correctly show 0.
+- **PARTS FOUND:** number of spare-part rows linked to the proposal. A value of 0
+  means audit/review evidence only; that proposal is not written to the import workbook.
 - **CONFIDENCE:** hierarchy confidence based on source-code/name agreement and supporting spare rows, not merely raw OCR quality.
 - **VARIANTS:** different spellings found in the manual.
 - Maker/model printed in the section override the manually entered main-machinery defaults.
@@ -2196,6 +2223,23 @@ def current_machinery_frame() -> pd.DataFrame:
     )
 
 
+def current_valid_submachinery_names() -> list[str]:
+    return [
+        str(name).strip()
+        for name in current_submachinery_rows().get("NAME", pd.Series(dtype=str)).tolist()
+        if str(name).strip()
+    ]
+
+
+def current_export_machinery_frame(
+    review_frame: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    return linked_machinery_rows_for_export(
+        current_machinery_frame(),
+        st.session_state.spare_review if review_frame is None else review_frame,
+    )
+
+
 def _apply_submachinery_changes_to_spares(
     previous_frame: pd.DataFrame,
     saved_frame: pd.DataFrame,
@@ -2315,7 +2359,7 @@ def _apply_submachinery_changes_to_spares(
         overwrite_auto_assignments=False,
     )
 
-    valid_names = [main_name] + [
+    valid_names = [
         str(value).strip()
         for value in included_submachinery_rows(saved)["NAME"].tolist()
         if str(value).strip()
@@ -2453,11 +2497,7 @@ def _autosave_spare_review_page(editor_key: str, target_indexes: list[object]) -
         return
 
     st.session_state.verified_review_rows = sorted(verified)
-    valid_machinery_names = [
-        str(name).strip()
-        for name in current_machinery_frame()["NAME"].tolist()
-        if str(name).strip()
-    ]
+    valid_machinery_names = current_valid_submachinery_names()
     st.session_state.spare_review = recalculate_review_with_verification(
         updated_full,
         valid_machinery_names=valid_machinery_names,
@@ -2541,19 +2581,6 @@ workflow_machinery_ready = main_machinery_is_ready()
 workflow_ocr_ready = bool(st.session_state.extracted_pages)
 workflow_submachinery = st.session_state.submachinery_review
 workflow_sub_columns = {"INCLUDE", "CODE", "NAME", "MAKER", "MODEL"}
-workflow_missing_sub_details = (
-    int(
-        workflow_submachinery.loc[workflow_submachinery["INCLUDE"].astype(bool),
-                                  ["CODE", "NAME", "MAKER", "MODEL"]]
-        .astype(str)
-        .apply(lambda column: column.str.strip().eq(""))
-        .any(axis=1)
-        .sum()
-    )
-    if not workflow_submachinery.empty
-    and workflow_sub_columns.issubset(workflow_submachinery.columns)
-    else 0
-)
 workflow_rows_detected = not workflow_included.empty
 workflow_sub_rows_included = (
     workflow_submachinery[workflow_submachinery["INCLUDE"].astype(bool)]
@@ -2561,9 +2588,38 @@ workflow_sub_rows_included = (
     else workflow_submachinery
 )
 workflow_component_detected = not workflow_sub_rows_included.empty
+workflow_spare_parent_keys = {
+    normalize_key(value)
+    for value in workflow_included.get("MACHINERY", pd.Series(dtype=str)).tolist()
+    if str(value).strip()
+}
+workflow_linked_sub_rows = (
+    workflow_sub_rows_included[
+        workflow_sub_rows_included["NAME"].map(normalize_key).isin(
+            workflow_spare_parent_keys
+        )
+    ]
+    if not workflow_sub_rows_included.empty
+    and "NAME" in workflow_sub_rows_included.columns
+    else workflow_sub_rows_included
+)
+workflow_linked_sub_count = len(workflow_linked_sub_rows)
+workflow_missing_sub_details = (
+    int(
+        workflow_linked_sub_rows[["CODE", "NAME", "MAKER", "MODEL"]]
+        .astype(str)
+        .apply(lambda column: column.str.strip().eq(""))
+        .any(axis=1)
+        .sum()
+    )
+    if not workflow_linked_sub_rows.empty
+    and workflow_sub_columns.issubset(workflow_linked_sub_rows.columns)
+    else 0
+)
 workflow_sub_ready = (
     workflow_ocr_ready
-    and workflow_component_detected
+    and workflow_rows_detected
+    and workflow_linked_sub_count > 0
     and workflow_missing_sub_details == 0
 )
 workflow_review_ready = (
@@ -2583,7 +2639,11 @@ workflow_labels = {
             else (
                 "! 3. Sub-machineries (none detected)"
                 if not workflow_component_detected
-                else f"! 3. Sub-machineries ({workflow_missing_sub_details})"
+                else (
+                    "! 3. Sub-machineries (no linked parents)"
+                    if workflow_linked_sub_count == 0
+                    else f"! 3. Sub-machineries ({workflow_missing_sub_details})"
+                )
             )
         )
         if workflow_ocr_ready
@@ -2593,9 +2653,9 @@ workflow_labels = {
         "✓ 4. Review"
         if workflow_review_ready
         else (
-            "✓ 4. Review (no spare rows)"
-            if workflow_ocr_ready and workflow_sub_ready and not workflow_rows_detected
-            else (f"! 4. Review ({workflow_blocked_count})" if workflow_ocr_ready else "○ 4. Review")
+            f"! 4. Review ({workflow_blocked_count})"
+            if workflow_ocr_ready and workflow_rows_detected
+            else ("! 4. Review (no spare rows)" if workflow_ocr_ready else "○ 4. Review")
         )
     ),
     "5. Export": (
@@ -2851,10 +2911,27 @@ if active_workflow_step == "3. Sub-machineries":
                 )
         else:
             candidate_frame = st.session_state.submachinery_review.copy()
+            current_included_spares = (
+                st.session_state.spare_review[
+                    st.session_state.spare_review["INCLUDE"].astype(bool)
+                ]
+                if not st.session_state.spare_review.empty
+                else st.session_state.spare_review
+            )
+            linked_parent_keys = {
+                normalize_key(value)
+                for value in current_included_spares.get(
+                    "MACHINERY", pd.Series(dtype=str)
+                ).tolist()
+                if str(value).strip()
+            }
+            export_linked_mask = candidate_frame["INCLUDE"].astype(bool) & (
+                candidate_frame["NAME"].map(normalize_key).isin(linked_parent_keys)
+            )
             candidate_metrics = st.columns(4)
             candidate_metrics[0].metric("Detected", len(candidate_frame))
             candidate_metrics[1].metric(
-                "Included", int(candidate_frame["INCLUDE"].astype(bool).sum())
+                "Export-linked", int(export_linked_mask.sum())
             )
             candidate_metrics[2].metric(
                 "Linked spare parts",
@@ -2869,6 +2946,11 @@ if active_workflow_step == "3. Sub-machineries":
                     .any(axis=1)
                     .sum()
                 ),
+            )
+            st.caption(
+                "Only Export-linked sub-machineries are written to the import workbook. "
+                "Included drawing candidates with zero linked spare parts remain available "
+                "in this review table and the audit workbook."
             )
 
             quick_actions = st.columns([1.15, 1.45, 1.3, 1.1])
@@ -3685,7 +3767,7 @@ if active_workflow_step == "2. OCR":
                     ]
                     assigned_review = recalculate_review_with_verification(
                         assigned_review,
-                        valid_machinery_names=[st.session_state.main_name] + valid_auto_names,
+                        valid_machinery_names=valid_auto_names,
                         verified_rows=st.session_state.verified_review_rows,
                         confidence_threshold=float(st.session_state.review_confidence_threshold),
                     )
@@ -3926,18 +4008,15 @@ if active_workflow_step == "4. Review spare parts":
         if st.session_state.spare_review.empty:
             if workflow_ocr_ready:
                 st.warning(
-                    "No spare-part rows were extracted for this document/range. Source-backed machinery "
-                    "can still be exported when Step 3 is complete; no spare rows will be written to sheet 2."
+                    "No spare-part rows were extracted for this document/range. "
+                    "Drawing candidates remain in the audit workbook, but import export "
+                    "requires at least one spare linked to a sub-machinery."
                 )
             else:
                 st.info("Run OCR first. Candidate spare-parts rows will appear here.")
         else:
             machinery_frame = current_machinery_frame()
-            valid_machinery_names = [
-                str(name).strip()
-                for name in machinery_frame["NAME"].tolist()
-                if str(name).strip()
-            ]
+            valid_machinery_names = current_valid_submachinery_names()
             threshold = float(st.session_state.review_confidence_threshold)
             full_status = recalculate_review_with_verification(
                 st.session_state.spare_review,
@@ -4518,9 +4597,14 @@ def build_multi_document_package(
     with zipfile.ZipFile(package, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         for position, (job_id, job) in enumerate(st.session_state.document_jobs.items(), start=1):
             vessels = _job_vessels(job)
-            machinery_frame = _job_machinery_frame(job)
-            machinery_errors = validate_machinery_dataframe(machinery_frame)
-            valid_names = machinery_frame["NAME"].tolist() if not machinery_frame.empty else []
+            included_subs = included_submachinery_rows(
+                job.get("submachinery_review", empty_submachinery_review_dataframe())
+            )
+            full_machinery_frame = machinery_rows_from_main_and_additional(
+                _job_main_row(job),
+                included_subs,
+            )
+            valid_names = included_subs["NAME"].tolist() if not included_subs.empty else []
             review = recalculate_review_with_verification(
                 job.get("spare_review", empty_review_dataframe()),
                 valid_machinery_names=valid_names,
@@ -4529,17 +4613,22 @@ def build_multi_document_package(
             )
             included = review[review["INCLUDE"].astype(bool)] if not review.empty else review
             blocked = included[~included["READY"].astype(bool)] if not included.empty else included
+            machinery_frame = linked_machinery_rows_for_export(
+                full_machinery_frame,
+                review,
+            )
+            machinery_errors = validate_machinery_dataframe(machinery_frame)
+            hierarchy_errors = validate_spare_machinery_hierarchy(
+                machinery_frame,
+                review,
+            )
 
             reasons = []
             if not vessels:
                 reasons.append("no vessels assigned")
             reasons.extend(machinery_errors)
-            included_subs = included_submachinery_rows(
-                job.get("submachinery_review", empty_submachinery_review_dataframe())
-            )
-            if included.empty and included_subs.empty:
-                reasons.append("no included spare-part rows or source-backed sub-machinery rows")
-            elif not blocked.empty:
+            reasons.extend(hierarchy_errors)
+            if not blocked.empty:
                 reasons.append(f"{len(blocked)} row(s) still need correction")
 
             if reasons:
@@ -4660,7 +4749,8 @@ if active_workflow_step == "5. Export":
 
         st.markdown(
             "The app writes the reviewed data into the existing template as follows:\n\n"
-            "- **1.Machineries|Sub|Units**, starting at row 5: CODE, NAME, MAKER, MODEL, "
+            "- **1.Machineries|Sub|Units**, starting at row 5: the main machinery and only "
+            "sub-machineries linked to included spare rows; CODE, NAME, MAKER, MODEL, "
             "TYPE, INSTR.BOOK, SPECIFICATIONS, MCH_TP(M/S/U).\n"
             "- **2.Spare Parts**, starting at row 4: MACHINERY (exact sub-machinery NAME), PART NO, DESCRIPTION, CODE, "
             "ITEM NO, UNIT, QNT. Ident/Code is copied to both PART NO and CODE; drawing position goes to ITEM NO.\n\n"
@@ -4676,9 +4766,8 @@ if active_workflow_step == "5. Export":
                 "adding to records already stored in a replacement template."
             ),
         )
-        machinery_frame = current_machinery_frame()
-        machinery_errors = validate_machinery_dataframe(machinery_frame)
-        valid_machinery_names = machinery_frame["NAME"].tolist()
+        review_machinery_frame = current_machinery_frame()
+        valid_machinery_names = current_valid_submachinery_names()
         export_review = recalculate_review_with_verification(
             st.session_state.spare_review,
             valid_machinery_names=valid_machinery_names,
@@ -4689,14 +4778,40 @@ if active_workflow_step == "5. Export":
 
         included = export_review[export_review["INCLUDE"].astype(bool)]
         blocked = included[~included["READY"].astype(bool)]
+        machinery_frame = linked_machinery_rows_for_export(
+            review_machinery_frame,
+            export_review,
+        )
+        machinery_errors = validate_machinery_dataframe(machinery_frame)
+        hierarchy_errors = validate_spare_machinery_hierarchy(
+            machinery_frame,
+            export_review,
+        )
+        export_sub_count = int(
+            machinery_frame["MCH_TP(M/S/U)"].astype(str).eq("SubMachinery").sum()
+        ) if not machinery_frame.empty else 0
+        review_sub_count = len(current_submachinery_rows())
+
+        st.info(
+            f"Hierarchy check: {export_sub_count} linked sub-machinery row(s) will be "
+            f"exported for {len(included)} included spare-part row(s). "
+            f"{max(0, review_sub_count - export_sub_count)} unlinked drawing candidate(s) "
+            "remain in the audit workbook only."
+        )
 
         if machinery_errors:
             for error in machinery_errors:
                 st.error(error)
+        if hierarchy_errors:
+            for error in hierarchy_errors:
+                st.error(error)
         if blocked.empty and not included.empty:
             st.success(f"{len(included)} included spare-part row(s) are ready.")
         elif included.empty:
-            st.info("No spare-part rows are included. The workbook can still export the validated machinery/sub-machinery rows; sheet 2 will remain empty.")
+            st.error(
+                "Include at least one spare-part row. Unlinked machinery/drawing "
+                "candidates remain in the audit workbook and are not exported."
+            )
         else:
             st.error(f"Correct {len(blocked)} included row(s) before export.")
             blocked_display = blocked[
@@ -4725,6 +4840,7 @@ if active_workflow_step == "5. Export":
             template_bytes is not None
             and bool(vessels)
             and not machinery_errors
+            and not hierarchy_errors
             and workflow_sub_ready
             and blocked.empty
         )
