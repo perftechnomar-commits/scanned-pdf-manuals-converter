@@ -1778,7 +1778,7 @@ save_loaded_job_state()
 st.title("📄 Spare Parts OCR Import Builder")
 VERSION_MISMATCH = str(TOOLS_VERSION).strip() != APP_VERSION
 st.caption(
-    f"Build {APP_VERSION} · Parser {TOOLS_VERSION} · "
+    f"Version {APP_VERSION}"
 )
 if VERSION_MISMATCH:
     st.error(
