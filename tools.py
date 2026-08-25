@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.0"
+TOOLS_VERSION = "4.18.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -3561,7 +3561,10 @@ def _credible_section_model(value: Any) -> str:
         return ""
     if any(
         phrase in text
-        for phrase in ("SIGNAL FROM", "BOOK NO", "PAGE ", "ALARM ID", "DESCRIPTION")
+        for phrase in (
+            "SIGNAL FROM", "BOOK NO", "PAGE ", "ALARM ID", "DESCRIPTION",
+            "TOO COLD", "TOO HOT",
+        )
     ):
         return ""
     return text
@@ -4740,6 +4743,16 @@ def _valid_drawing_heading_code(value: Any) -> str:
     section numbers, item tags, words and OCR fragments from becoming machinery codes.
     """
     text = clean_text(value).upper().strip(" .,:;|")
+    # Native PDF text occasionally splits a seven-digit drawing number after its
+    # fifth digit (``90121 03``). Conversely, a six-or-more digit drawing number
+    # followed by one isolated digit is normally the revision printed beside it.
+    split_code = re.fullmatch(r"(\d{5})\s+(\d{2})", text)
+    if split_code:
+        text = "".join(split_code.groups())
+    else:
+        code_with_revision = re.fullmatch(r"(\d{6,10})\s+(\d)", text)
+        if code_with_revision:
+            text = code_with_revision.group(1)
     if not text or _is_date_like_section_code(text):
         return ""
     compact = normalize_key(text)
@@ -4803,8 +4816,16 @@ def _drawing_heading_sections(
             # A local drawing-page heading does not.
             if re.search(r"\s\d{1,4}\s*$", raw_title):
                 continue
-            # Wrapped headings with an unfinished parenthesis are intentionally left
-            # unresolved rather than assigning a code to a truncated component name.
+            # Native PDF text often wraps the final qualifier in a drawing heading.
+            # Join only the immediately following lines until parentheses balance;
+            # an unresolved heading remains rejected rather than being truncated.
+            title_end = index
+            while (
+                raw_title.count("(") > raw_title.count(")")
+                and title_end + 1 < min(len(lines), index + 3)
+            ):
+                title_end += 1
+                raw_title = clean_text(f"{raw_title} {lines[title_end]}")
             if raw_title.count("(") != raw_title.count(")"):
                 continue
             title = _clean_drawing_component_title(raw_title)
@@ -4821,7 +4842,7 @@ def _drawing_heading_sections(
                 continue
 
             code = ""
-            for following in lines[index + 1:index + 5]:
+            for following in lines[title_end + 1:title_end + 5]:
                 # PDF text extraction can concatenate the drawing number directly
                 # with "Book No." (e.g. 9024508Book No.9028195...). Strip it even
                 # when there is no word boundary before BOOK.
@@ -5123,6 +5144,10 @@ _EXPLICIT_SPARE_LABEL_RE = re.compile(
     r"\b(?:spare\s*part|sparepart|replacement\s+part)\s*(?:number|no\.?|nr\.?|code)\b\s*[:#-]?",
     flags=re.IGNORECASE,
 )
+_PROCUREMENT_PART_LABEL_RE = re.compile(
+    r"\bpart\s*(?:number|no\.?)\b\s*[:#-]?",
+    flags=re.IGNORECASE,
+)
 _EXPLICIT_SPARE_IDENTIFIER_RE = re.compile(
     r"(?<![A-Z0-9])([A-Z0-9][A-Z0-9./_-]{3,}(?:[ \t]+[A-Z0-9][A-Z0-9./_-]{0,5})?)(?![A-Z0-9])",
     flags=re.IGNORECASE,
@@ -5178,6 +5203,8 @@ def _looks_like_explicit_parent_heading(value: Any) -> bool:
     upper = text.upper()
     if any(upper.startswith(prefix) for prefix in _EXPLICIT_DESCRIPTION_SKIP_PREFIXES):
         return False
+    if re.search(r"\b(?:HAS|HAVE|BEEN|WHEN|WHICHEVER|MUST|SHOULD)\b", upper):
+        return False
     if _EXPLICIT_SPARE_LABEL_RE.search(text):
         return False
     if re.search(r"\b(?:CONTENT|QUANTITY|QTY|ARTICLE|PART\s+NO|ITEM\s+NO)\b", upper):
@@ -5228,6 +5255,15 @@ def _looks_like_explicit_spare_number_page(markdown: Any) -> bool:
     lines = [clean_text(line) for line in str(markdown or "").splitlines()]
     for index, line in enumerate(lines):
         label = _EXPLICIT_SPARE_LABEL_RE.search(line)
+        if not label:
+            bare_label = _PROCUREMENT_PART_LABEL_RE.search(line)
+            context = clean_text(" ".join(lines[max(0, index - 6):index + 1]))
+            if bare_label and re.search(
+                r"\b(?:RECOMMEND(?:ATION|ED)?\s+TO\s+ORDER|ORDER\s+\d+|REPLACEMENT|REPLACE|RENEW)\b",
+                context,
+                flags=re.IGNORECASE,
+            ):
+                label = bare_label
         if not label:
             continue
         identifier = _explicit_spare_identifier_from_text(line[label.end():])
@@ -5376,6 +5412,19 @@ def extract_explicit_spare_number_rows(
             if not line:
                 continue
             label = _EXPLICIT_SPARE_LABEL_RE.search(line)
+            procurement_label = False
+            if not label:
+                bare_label = _PROCUREMENT_PART_LABEL_RE.search(line)
+                procurement_context = clean_text(
+                    " ".join(lines[max(0, index - 8):index + 1])
+                )
+                if bare_label and re.search(
+                    r"\b(?:RECOMMEND(?:ATION|ED)?\s+TO\s+ORDER|ORDER\s+\d+|REPLACEMENT|REPLACE|RENEW)\b",
+                    procurement_context,
+                    flags=re.IGNORECASE,
+                ):
+                    label = bare_label
+                    procurement_label = True
             if label:
                 identifier = _explicit_spare_identifier_from_text(line[label.end():])
                 identifier_line_index = index
@@ -5389,7 +5438,7 @@ def extract_explicit_spare_number_rows(
                     item_fragments = []
                     continue
 
-                row_parent = current_parent if page_recommended else ""
+                row_parent = current_parent
 
                 prefix = _clean_explicit_spare_description(line[:label.start()])
                 fragments = list(item_fragments)
@@ -5398,6 +5447,68 @@ def extract_explicit_spare_number_rows(
                 description = _explicit_description_from_fragments(fragments)
                 if not description:
                     description = "SPARE PART"
+
+                quantity = 1 if page_recommended else None
+                if procurement_label:
+                    # In maintenance schedules the order recommendation is commonly
+                    # printed before ``Part number`` and the actual consumable name on
+                    # the following line. Prefer that short post-label description to
+                    # fragments of the recommendation sentence.
+                    following_description = next(
+                        (
+                            candidate
+                            for candidate in (
+                                _clean_explicit_spare_description(value)
+                                for value in lines[
+                                    identifier_line_index + 1:identifier_line_index + 4
+                                ]
+                            )
+                            if candidate
+                            and not _looks_like_explicit_parent_heading(candidate)
+                            and not _explicit_spare_identifier_from_text(candidate)
+                        ),
+                        "",
+                    )
+                    if following_description:
+                        description = following_description
+                    action_description = next(
+                        (
+                            _clean_explicit_spare_description(fragment)
+                            for fragment in reversed([*item_fragments[-8:], line[:label.start()]])
+                            if re.search(
+                                r"\b(?:REPLACEMENT\s+OF|REPLACE|RENEW)\b",
+                                clean_text(fragment),
+                                flags=re.IGNORECASE,
+                            )
+                        ),
+                        "",
+                    )
+                    if action_description and not following_description:
+                        description = action_description
+                    quantity_match = re.search(
+                        r"\bORDER\s+(\d+)\s+(?:CANS?|PCS|PIECES?|SETS?)\b",
+                        procurement_context,
+                        flags=re.IGNORECASE,
+                    )
+                    if quantity_match:
+                        quantity = int(quantity_match.group(1))
+
+                    # A maintenance action can name a consumable while nearby prose
+                    # identifies its owning module/unit. Preserve that hierarchy.
+                    consumable_match = re.search(
+                        r"\b([A-Z][A-Z0-9-]{1,15})\s+(?:LIQUID|FLUID|OIL)\b",
+                        description.upper(),
+                    )
+                    if consumable_match:
+                        owner_match = re.search(
+                            rf"\b{re.escape(consumable_match.group(1))}\s+(MODULE|UNIT|SYSTEM)\b",
+                            raw_text,
+                            flags=re.IGNORECASE,
+                        )
+                        if owner_match:
+                            row_parent = (
+                                f"{consumable_match.group(1)} {owner_match.group(1)}"
+                            )
 
                 confidence = 0.92 if page_recommended else 0.86
                 source_priority = 3 if page_recommended else 2
@@ -5421,8 +5532,12 @@ def extract_explicit_spare_number_rows(
                         "item_no": "",
                         "description_english": description.upper(),
                         "description": description.upper(),
-                        "unit": "PCS",
-                        "quantity": None,
+                        "unit": (
+                            "SET"
+                            if re.search(r"\b(?:SET|KIT)\b", description, flags=re.IGNORECASE)
+                            else "PCS"
+                        ),
+                        "quantity": quantity,
                         "source_page": page_number,
                         "confidence": confidence,
                         "source_pattern": "explicit spare-number list",
@@ -7195,6 +7310,7 @@ _GENERIC_MACHINERY_NAMES = {
     "CONTINUED", "LIST OF SPARE PARTS",
     "DIMENSION DRAWINGS INCLUDING TECHNICAL DATA",
     "DRAWINGS", "GENERAL DRAWINGS", "RECOMMENDED SPARE PARTS ON BOARD",
+    "DETAILED PAGE DESCRIPTIONS",
 }
 
 
@@ -7597,12 +7713,11 @@ def build_component_drawing_candidates(
     for group in grouped.values():
         if not group:
             continue
-        def priority(item: dict[str, Any]) -> tuple[int, float, int]:
+        def priority(item: dict[str, Any]) -> tuple[int, float]:
             source = clean_text(item.get("source", "")).lower()
             return (
                 3 if "title block" in source else 2,
                 clamp_confidence(item.get("confidence", 0.90)),
-                len(clean_text(item.get("name", ""))),
             )
 
         best = max(group, key=priority)
@@ -7733,8 +7848,8 @@ def build_submachinery_candidates(
             for observation in group_observations
         ):
             continue
-        if not _valid_automatic_section_code(code):
-            continue
+        if code and not _valid_automatic_section_code(code):
+            code = ""
         maker = max(set(maker_values), key=maker_values.count) if maker_values else clean_text(main_row.get("MAKER", "")).upper()
         model = max(set(model_values), key=model_values.count) if model_values else clean_text(main_row.get("MODEL", "")).upper()
         pages = [obs["source_page"] for obs in group_observations if obs["source_page"] is not None]
@@ -7758,12 +7873,23 @@ def build_submachinery_candidates(
         )
 
     records: list[dict[str, Any]] = []
+    used_codes = {
+        normalize_key(item["code"])
+        for item in preliminary
+        if clean_text(item["code"])
+    }
     for item in preliminary:
         benefit_name = _clean_catalog_section_name(item["name"], item["code"])
+        benefit_code = clean_text(item["code"]).upper()
+        if not benefit_code:
+            benefit_code = _generated_submachinery_code(
+                len(records) + 1,
+                used_codes,
+            )
         records.append(
             {
                 "INCLUDE": True,
-                "CODE": item["code"],
+                "CODE": benefit_code,
                 "NAME": benefit_name,
                 "MAKER": item["maker"],
                 "MODEL": item["model"],
@@ -7812,7 +7938,9 @@ def refresh_submachinery_derived_fields(
         if review_frame is not None and not review_frame.empty
         else empty_submachinery_review_dataframe()
     )
-    detected = merge_submachinery_candidates(component_candidates, spare_detected)
+    # Spare-table headings establish semantic parents, while a corroborating
+    # equipment drawing supplies the authoritative printed code/name.
+    detected = merge_submachinery_candidates(spare_detected, component_candidates)
     if existing is None or existing.empty:
         return detected
     if detected is None or detected.empty:
