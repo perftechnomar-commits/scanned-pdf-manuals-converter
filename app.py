@@ -1658,7 +1658,6 @@ st.title("📄 Spare Parts OCR Import Builder")
 VERSION_MISMATCH = str(TOOLS_VERSION).strip() != APP_VERSION
 st.caption(
     f"Build {APP_VERSION} · Parser {TOOLS_VERSION} · "
-    "Convert scanned spare-parts manuals into reviewed, import-ready Excel workbooks."
 )
 if VERSION_MISMATCH:
     st.error(
