@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.15.1"
+TOOLS_VERSION = "4.16.0"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -3524,7 +3524,10 @@ def _valid_automatic_section_code(value: Any) -> str:
     return text
 
 
-def _engineering_title_block_metadata(markdown: str) -> dict[str, str]:
+def _engineering_title_block_metadata(
+    markdown: str,
+    require_article_table: bool = True,
+) -> dict[str, str]:
     """Extract labelled hierarchy metadata from an engineering drawing title block.
 
     The logic is manufacturer-neutral and deliberately label-aware. Explicit
@@ -3533,7 +3536,7 @@ def _engineering_title_block_metadata(markdown: str) -> dict[str, str]:
     reading-order noise. Unlabelled standalone numbers are never accepted as a
     title-block code.
     """
-    if not _is_engineering_article_table(markdown):
+    if require_article_table and not _is_engineering_article_table(markdown):
         return {}
 
     raw = str(markdown or "")
@@ -7286,6 +7289,216 @@ def _submachinery_name_from_source_consensus(
     return current
 
 
+
+_DRAWING_ONLY_EXCLUDED_TITLES = {
+    "GENERAL ARRANGEMENT", "GENERAL DRAWING", "GENERAL DRAWINGS",
+    "DIMENSION DRAWING", "DIMENSION DRAWINGS", "TECHNICAL DATA",
+    "ELECTRICAL DRAWING", "ELECTRICAL DRAWINGS", "FLOW DIAGRAM",
+    "FLOW SCHEME", "PIPING DIAGRAM", "CONNECTION LIST", "CABLE LIST",
+    "INSTALLATION PRINCIPLE", "SYSTEM SCHEMATIC", "SYSTEM LAYOUT",
+    "CIRCUIT DIAGRAM", "WIRING DIAGRAM", "DRAWING", "DRAWINGS",
+}
+
+
+def _clean_equipment_drawing_title(value: Any) -> str:
+    """Return a compact equipment name from a drawing-title field.
+
+    Drawing metadata such as ``dim. drw.``, ``dimension drawing`` and pagination /
+    optional-scope parentheticals are not part of the machinery name. Short equipment
+    acronyms/tags remain when they are genuinely part of the title.
+    """
+    text = clean_text(value).strip(" -:;|,.")
+    if not text:
+        return ""
+    text = re.sub(
+        r"\s*\((?:[^)]*\b(?:PAGES?|PREVIOUSLY|OPTIONAL|INCLUDING|INCL\.?)\b[^)]*)\)\s*",
+        " ", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:[,;:\-]\s*)?(?:DIM(?:ENSION)?\.?\s*)?(?:DRW\.?|DRAWING)(?:\s+INCLUDING\s+TECHNICAL\s+DATA)?\s*$",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+", " ", text).strip(" -:;|,.")
+    return _clean_machinery_name(text)
+
+
+def _is_equipment_component_title(value: Any) -> bool:
+    """High-precision gate for machinery-defining drawing titles.
+
+    A source Document/Drawing No. is not enough by itself: the title must describe a
+    concrete component/equipment item. General arrangements, schematics, cable lists,
+    flow diagrams and other document-level drawings are intentionally rejected.
+    """
+    title = _clean_equipment_drawing_title(value)
+    if not title or _is_generic_machinery_name(title):
+        return False
+    normalized = re.sub(r"[^A-Z0-9 ]+", " ", title.upper())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in _DRAWING_ONLY_EXCLUDED_TITLES:
+        return False
+    if any(
+        phrase in normalized
+        for phrase in (
+            "GENERAL ARRANGEMENT", "FLOW DIAGRAM", "FLOW SCHEME", "PIPING DIAGRAM",
+            "CONNECTION LIST", "CABLE LIST", "SYSTEM SCHEMATIC", "SYSTEM LAYOUT",
+            "INSTALLATION PRINCIPLE", "CIRCUIT DIAGRAM", "WIRING DIAGRAM",
+        )
+    ):
+        return False
+    title_tokens = set(re.findall(r"[A-Z]+", normalized))
+    return bool(title_tokens & _DRAWING_COMPONENT_NOUNS)
+
+
+def _drawing_title_block_sections(
+    extracted_pages: Sequence[tuple[int, str]],
+) -> list[dict[str, Any]]:
+    """Discover equipment drawings from labelled title blocks, with or without spares."""
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    for page_number, markdown in extracted_pages:
+        metadata = _engineering_title_block_metadata(
+            markdown,
+            require_article_table=False,
+        )
+        if not metadata:
+            continue
+        code = _valid_automatic_section_code(metadata.get("section_code", ""))
+        title = _clean_equipment_drawing_title(
+            metadata.get("section_name_english", metadata.get("section_name_raw", ""))
+        )
+        if not code or not _is_equipment_component_title(title):
+            continue
+        key = (normalize_key(code), int(page_number))
+        if key in seen:
+            continue
+        seen.add(key)
+        article_table = _is_engineering_article_table(markdown)
+        results.append(
+            {
+                "code": code,
+                "aliases": [code],
+                "name": title,
+                "maker": "",
+                "model": "",
+                "pages": {int(page_number)},
+                "source": (
+                    "engineering drawing title block"
+                    if article_table
+                    else "equipment drawing title block"
+                ),
+                "confidence": 0.97 if article_table else 0.95,
+            }
+        )
+    return results
+
+
+def build_component_drawing_candidates(
+    extracted_pages: Sequence[tuple[int, str]],
+    main_row: dict[str, Any],
+    source_document_name: str = "",
+) -> pd.DataFrame:
+    """Build machinery candidates independently from spare-row discovery.
+
+    A genuine equipment drawing can therefore create a Step-3 sub-machinery with
+    ``PARTS FOUND = 0``. Only source-backed title blocks or the existing conservative
+    numbered component-drawing detector qualify; generic document drawings are ignored.
+    """
+    if not extracted_pages:
+        return empty_submachinery_review_dataframe()
+
+    discoveries: list[dict[str, Any]] = []
+    discoveries.extend(_drawing_title_block_sections(extracted_pages))
+    for section in _drawing_heading_sections(extracted_pages):
+        item = dict(section)
+        item.setdefault("confidence", 0.92)
+        discoveries.append(item)
+    if not discoveries:
+        return empty_submachinery_review_dataframe()
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in discoveries:
+        source = clean_text(item.get("source", "")).lower()
+        code = (
+            _valid_automatic_section_code(item.get("code", ""))
+            if "title block" in source
+            else _valid_drawing_heading_code(item.get("code", ""))
+        )
+        name = _clean_equipment_drawing_title(item.get("name", ""))
+        if not code or not _is_equipment_component_title(name):
+            continue
+        grouped.setdefault(normalize_key(code), []).append({**item, "code": code, "name": name})
+
+    records: list[dict[str, Any]] = []
+    main_maker = clean_text(main_row.get("MAKER", "")).upper()
+    main_model = clean_text(main_row.get("MODEL", "")).upper()
+    source_file = clean_text(source_document_name)
+
+    for group in grouped.values():
+        if not group:
+            continue
+        def priority(item: dict[str, Any]) -> tuple[int, float, int]:
+            source = clean_text(item.get("source", "")).lower()
+            return (
+                3 if "title block" in source else 2,
+                clamp_confidence(item.get("confidence", 0.90)),
+                len(clean_text(item.get("name", ""))),
+            )
+
+        best = max(group, key=priority)
+        code = clean_text(best.get("code", "")).upper()
+        name = _clean_equipment_drawing_title(best.get("name", "")).upper()
+        names = [_clean_equipment_drawing_title(item.get("name", "")).upper() for item in group]
+        names = [value for value in names if value]
+        pages = sorted({
+            int(page)
+            for item in group
+            for page in item.get("pages", set())
+            if page is not None
+        })
+        first_page = pages[0] if pages else None
+        last_page = pages[-1] if pages else first_page
+        confidence = max(clamp_confidence(item.get("confidence", 0.90)) for item in group)
+        detection_keys = {normalize_key(code), normalize_key(name)}
+        detection_keys.update(normalize_key(value) for value in names if value)
+        aliases = [clean_text(alias) for item in group for alias in item.get("aliases", [])]
+        detection_keys.update(normalize_key(value) for value in aliases if value)
+        origins = {clean_text(item.get("source", "")) for item in group if clean_text(item.get("source", ""))}
+
+        records.append(
+            {
+                "INCLUDE": True,
+                "CODE": code,
+                "NAME": name,
+                "MAKER": main_maker,
+                "MODEL": main_model,
+                "TYPE": "",
+                "INSTR.BOOK": f"PDF PAGE.{first_page}" if first_page is not None else "",
+                "SPECIFICATIONS": f"PDF FILE: {source_file}" if source_file else "",
+                "MCH_TP(M/S/U)": "SubMachinery",
+                "FIRST PAGE": first_page,
+                "LAST PAGE": last_page,
+                "PARTS FOUND": 0,
+                "CONFIDENCE": confidence,
+                "VARIANTS": " | ".join(dict.fromkeys(names)),
+                "DETECTION KEYS": "|".join(sorted(key for key in detection_keys if key)),
+                "ORIGIN": (
+                    "Auto-detected equipment drawing"
+                    if any("equipment drawing title block" in origin.lower() for origin in origins)
+                    else "Auto-detected drawing/component"
+                ),
+            }
+        )
+
+    if not records:
+        return empty_submachinery_review_dataframe()
+    frame = pd.DataFrame(records, columns=SUBMACHINERY_REVIEW_COLUMNS)
+    frame["INCLUDE"] = frame["INCLUDE"].astype(bool)
+    frame["FIRST PAGE"] = pd.to_numeric(frame["FIRST PAGE"], errors="coerce").astype("Int64")
+    frame["LAST PAGE"] = pd.to_numeric(frame["LAST PAGE"], errors="coerce").astype("Int64")
+    frame["PARTS FOUND"] = pd.to_numeric(frame["PARTS FOUND"], errors="coerce").fillna(0).astype(int)
+    frame["CONFIDENCE"] = pd.to_numeric(frame["CONFIDENCE"], errors="coerce").fillna(0.90)
+    return frame.sort_values(["FIRST PAGE", "NAME"], na_position="last").reset_index(drop=True)
+
 def build_submachinery_candidates(
     review_frame: pd.DataFrame,
     main_row: dict[str, Any],
@@ -7413,64 +7626,36 @@ def refresh_submachinery_derived_fields(
     review_frame: pd.DataFrame | None,
     main_row: dict[str, Any],
     source_document_name: str = "",
+    component_candidates: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Recalculate read-only proposal evidence from the current spare review.
+    """Refresh Step-3 evidence from both spare rows and component drawings.
 
-    Document jobs persist their Step-3 proposal dataframe in session/job state. After a
-    parser upgrade, that stored dataframe can therefore retain an old confidence value
-    even though the underlying spare rows now contain enough evidence for the newer
-    hierarchy-confidence logic. This helper self-heals only derived/read-only fields;
-    user-editable machinery values are left untouched. No OCR or AI call is made.
+    A genuine equipment drawing may have zero spare rows, so Step 3 cannot be
+    reconstructed solely from ``review_frame``. Manual edits remain authoritative
+    because ``merge_submachinery_candidates`` preserves manually overridden values.
     """
-    if review_frame is None or review_frame.empty:
-        return existing.copy() if existing is not None else empty_submachinery_review_dataframe()
-
-    detected = build_submachinery_candidates(
-        review_frame,
-        main_row,
-        source_document_name=source_document_name,
+    spare_detected = (
+        build_submachinery_candidates(
+            review_frame,
+            main_row,
+            source_document_name=source_document_name,
+        )
+        if review_frame is not None and not review_frame.empty
+        else empty_submachinery_review_dataframe()
     )
+    detected = merge_submachinery_candidates(component_candidates, spare_detected)
     if existing is None or existing.empty:
         return detected
-    if detected.empty:
+    if detected is None or detected.empty:
         return existing.copy()
 
-    result = existing.copy()
-    for column in SUBMACHINERY_REVIEW_COLUMNS:
-        if column not in result.columns:
-            result[column] = False if column == "INCLUDE" else ""
-    result = result[SUBMACHINERY_REVIEW_COLUMNS]
-
-    for index, old_row in result.iterrows():
-        old_code = normalize_key(old_row.get("CODE", ""))
-        old_keys = _split_detection_keys(old_row.get("DETECTION KEYS", ""))
-        matched = None
-        for _, new_row in detected.iterrows():
-            new_code = normalize_key(new_row.get("CODE", ""))
-            new_keys = _split_detection_keys(new_row.get("DETECTION KEYS", ""))
-            if (old_code and new_code == old_code) or bool(old_keys & new_keys):
-                matched = new_row
-                break
-        if matched is None:
-            continue
-        for column in ("FIRST PAGE", "LAST PAGE", "PARTS FOUND", "CONFIDENCE"):
-            result.at[index, column] = matched.get(column, result.at[index, column])
-
+    result = merge_submachinery_candidates(existing, detected)
     result["MCH_TP(M/S/U)"] = "SubMachinery"
-    result["CONFIDENCE"] = pd.to_numeric(
-        result["CONFIDENCE"], errors="coerce"
-    ).fillna(0.70)
-    result["PARTS FOUND"] = pd.to_numeric(
-        result["PARTS FOUND"], errors="coerce"
-    ).fillna(0).astype(int)
-    result["FIRST PAGE"] = pd.to_numeric(
-        result["FIRST PAGE"], errors="coerce"
-    ).astype("Int64")
-    result["LAST PAGE"] = pd.to_numeric(
-        result["LAST PAGE"], errors="coerce"
-    ).astype("Int64")
-    return result.reset_index(drop=True)
-
+    result["CONFIDENCE"] = pd.to_numeric(result["CONFIDENCE"], errors="coerce").fillna(0.70)
+    result["PARTS FOUND"] = pd.to_numeric(result["PARTS FOUND"], errors="coerce").fillna(0).astype(int)
+    result["FIRST PAGE"] = pd.to_numeric(result["FIRST PAGE"], errors="coerce").astype("Int64")
+    result["LAST PAGE"] = pd.to_numeric(result["LAST PAGE"], errors="coerce").astype("Int64")
+    return result[SUBMACHINERY_REVIEW_COLUMNS].reset_index(drop=True)
 
 def merge_submachinery_candidates(
     existing: pd.DataFrame | None,
