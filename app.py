@@ -93,6 +93,7 @@ except ImportError:
 try:
     from tools import (
         apply_authoritative_explicit_spare_rows,
+        ensure_component_assembly_spare_rows,
         linked_machinery_rows_for_export,
         merge_component_candidates_with_native_priority,
         validate_spare_machinery_hierarchy,
@@ -103,6 +104,11 @@ except ImportError:
     # parser instead of crashing on import.
     def apply_authoritative_explicit_spare_rows(rows, authoritative_rows):
         return list(rows), 0, 0
+
+    def ensure_component_assembly_spare_rows(
+        review_frame, component_candidates, default_unit="PCS"
+    ):
+        return review_frame.copy(), 0, 0
 
     def merge_component_candidates_with_native_priority(
         ocr_candidates, native_candidates
@@ -118,7 +124,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.3"
+APP_VERSION = "4.18.4"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1778,7 +1784,7 @@ save_loaded_job_state()
 st.title("📄 Spare Parts OCR Import Builder")
 VERSION_MISMATCH = str(TOOLS_VERSION).strip() != APP_VERSION
 st.caption(
-    f"Version {APP_VERSION}"
+    f"Build {APP_VERSION} · Parser {TOOLS_VERSION} · "
 )
 if VERSION_MISMATCH:
     st.error(
@@ -1822,12 +1828,13 @@ and continuation rules. The saved profile guides every extraction batch. It is
 advisory only: printed source evidence, unique-code enforcement, and review checks
 remain authoritative, and processing safely continues if the analysis call fails.
 
-The app discovers equipment/drawing candidates independently from spare rows so
-source hierarchy is not lost. The import workbook remains strict, however: only a
-candidate that owns at least one included spare-part row is exported as a
-sub-machinery. Zero-part drawing candidates remain in Step 3 and the audit workbook.
-Codes found only inside spare-part rows, descriptions, or cross-references are
-ignored for section assignment.
+The app discovers equipment drawings independently from ordinary spare tables so
+source hierarchy is not lost. An explicit drawing title block is authoritative:
+**Document No.** becomes the sub-machinery CODE and the compact **Title** becomes its
+NAME, even when the page/chapter heading is broader. Each valid equipment drawing
+also creates one linked whole-assembly spare row, after which additional parts and
+recommended spares remain children of the same sub-machinery. Codes found only
+inside descriptions or cross-references are ignored for section assignment.
 
 For older German/English/French catalogues, the app also recognizes simple numbered
 section headings printed inside the table (for example **3. Servo drive for oil
@@ -1848,8 +1855,8 @@ the source text layer. Repeated references are reconciled instead of exported tw
 - The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
 - A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
-- **PARTS FOUND:** number of spare-part rows linked to the proposal. A value of 0
-  means audit/review evidence only; that proposal is not written to the import workbook.
+- **PARTS FOUND:** number of spare-part rows linked to the proposal, including the
+  source-backed whole-assembly row created from a valid equipment drawing.
 - **CONFIDENCE:** hierarchy confidence based on source-code/name agreement and supporting spare rows, not merely raw OCR quality.
 - **VARIANTS:** different spellings found in the manual.
 - Maker/model printed in the section override the manually entered main-machinery defaults.
@@ -2882,6 +2889,29 @@ if active_workflow_step == "3. Sub-machineries":
                 ocr_component_candidates,
                 native_component_candidates,
             )
+            previous_review = st.session_state.spare_review.copy()
+            upgraded_review, drawing_spares_added, drawing_spares_reconciled = (
+                ensure_component_assembly_spare_rows(
+                    previous_review,
+                    component_candidates,
+                    default_unit=str(
+                        st.session_state.get("default_unit", "PCS") or "PCS"
+                    ),
+                )
+            )
+            review_upgraded = not upgraded_review.equals(previous_review)
+            if review_upgraded:
+                st.session_state.spare_review = upgraded_review
+                upgrade_message = (
+                    "Upgraded drawing hierarchy: added "
+                    f"{drawing_spares_added} assembly spare row(s) and reconciled "
+                    f"{drawing_spares_reconciled} existing row(s)."
+                )
+                st.session_state.extraction_log = list(
+                    dict.fromkeys(
+                        list(st.session_state.extraction_log) + [upgrade_message]
+                    )
+                )
             previous_submachineries = st.session_state.submachinery_review.copy()
             refreshed_submachineries = refresh_submachinery_derived_fields(
                 previous_submachineries,
@@ -2896,6 +2926,18 @@ if active_workflow_step == "3. Sub-machineries":
                     previous_submachineries,
                     refreshed_submachineries,
                 )
+                save_loaded_job_state()
+            elif review_upgraded:
+                st.session_state.spare_review = recalculate_review_with_verification(
+                    st.session_state.spare_review,
+                    valid_machinery_names=current_valid_submachinery_names(),
+                    verified_rows=st.session_state.verified_review_rows,
+                    confidence_threshold=float(
+                        st.session_state.review_confidence_threshold
+                    ),
+                )
+                st.session_state.editor_version += 1
+                st.session_state.output = None
                 save_loaded_job_state()
 
         if st.session_state.submachinery_review.empty:
@@ -2949,8 +2991,8 @@ if active_workflow_step == "3. Sub-machineries":
             )
             st.caption(
                 "Only Export-linked sub-machineries are written to the import workbook. "
-                "Included drawing candidates with zero linked spare parts remain available "
-                "in this review table and the audit workbook."
+                "A valid equipment drawing receives a linked whole-assembly spare; any "
+                "remaining zero-part candidate stays in this review table and the audit workbook."
             )
 
             quick_actions = st.columns([1.15, 1.45, 1.3, 1.1])
@@ -3742,6 +3784,26 @@ if active_workflow_step == "2. OCR":
                         ocr_component_candidates,
                         native_component_candidates,
                     )
+                    combined_review, drawing_spares_added, drawing_spares_reconciled = (
+                        ensure_component_assembly_spare_rows(
+                            combined_review,
+                            component_candidates,
+                            default_unit=default_unit,
+                        )
+                    )
+                    if drawing_spares_added or drawing_spares_reconciled:
+                        drawing_message = (
+                            "Represented source-backed equipment drawings as linked "
+                            f"assembly spare rows: added {drawing_spares_added}, "
+                            f"reconciled {drawing_spares_reconciled}."
+                        )
+                        extraction_messages.append(drawing_message)
+                        st.session_state.extraction_log = list(
+                            dict.fromkeys(
+                                list(st.session_state.extraction_log)
+                                + [drawing_message]
+                            )
+                        )
                     merged_candidates = refresh_submachinery_derived_fields(
                         previous_candidates,
                         combined_review,
