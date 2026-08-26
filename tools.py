@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.3"
+TOOLS_VERSION = "4.18.4"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -7855,12 +7855,14 @@ def merge_component_candidates_with_native_priority(
     ocr_candidates: pd.DataFrame | None,
     native_candidates: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    """Use native drawing evidence as the sole automatic result for its pages.
+    """Combine native chapter evidence with exact-code OCR title-block evidence.
 
-    OCR remains the fallback for scanned/image-only pages. When the PDF text layer
-    proves a component on a page, every OCR-only proposal beginning on that same
-    page is suppressed before merging. This prevents a damaged OCR code/name from
-    surviving beside the correct native candidate as a false duplicate.
+    Native searchable text remains authoritative for the drawing/document number
+    and suppresses conflicting OCR proposals from that page. When OCR independently
+    finds the *same* code on the same page with stronger title-block confidence, its
+    compact Title value replaces the broader chapter/section heading. This preserves
+    code reliability while correctly preferring ``Title: Cable`` over a heading such
+    as ``UV reactor and LDC / Lamp power cable``.
     """
     ocr = (
         ocr_candidates.copy()
@@ -7877,13 +7879,201 @@ def merge_component_candidates_with_native_priority(
     if ocr.empty:
         return native
 
+    reconciled_native = native.copy()
+    ocr_pages = pd.to_numeric(ocr["FIRST PAGE"], errors="coerce")
+    ocr_codes = ocr["CODE"].map(normalize_key)
+    for native_index, native_row in reconciled_native.iterrows():
+        native_page = pd.to_numeric(
+            pd.Series([native_row.get("FIRST PAGE")]), errors="coerce"
+        ).iloc[0]
+        native_code = normalize_key(native_row.get("CODE", ""))
+        if pd.isna(native_page) or not native_code:
+            continue
+        exact_matches = ocr.loc[
+            ocr_pages.eq(int(native_page)) & ocr_codes.eq(native_code)
+        ]
+        if exact_matches.empty:
+            continue
+        native_confidence = clamp_confidence(native_row.get("CONFIDENCE", 0.90))
+        best_index = max(
+            exact_matches.index,
+            key=lambda index: clamp_confidence(
+                exact_matches.at[index, "CONFIDENCE"]
+            ),
+        )
+        best_ocr = exact_matches.loc[best_index]
+        ocr_confidence = clamp_confidence(best_ocr.get("CONFIDENCE", 0.90))
+        ocr_name = _clean_equipment_drawing_title(best_ocr.get("NAME", ""))
+        if (
+            ocr_name
+            and _is_equipment_component_title(ocr_name)
+            and ocr_confidence > native_confidence
+        ):
+            native_name = _clean_equipment_drawing_title(
+                native_row.get("NAME", "")
+            )
+            variants = [
+                value
+                for value in (
+                    ocr_name.upper(),
+                    native_name.upper(),
+                    clean_text(best_ocr.get("VARIANTS", "")),
+                    clean_text(native_row.get("VARIANTS", "")),
+                )
+                if value
+            ]
+            detection_keys = {
+                key
+                for key in (
+                    normalize_key(native_code),
+                    normalize_key(ocr_name),
+                    normalize_key(native_name),
+                    *_split_detection_keys(best_ocr.get("DETECTION KEYS", "")),
+                    *_split_detection_keys(native_row.get("DETECTION KEYS", "")),
+                )
+                if key
+            }
+            reconciled_native.at[native_index, "NAME"] = ocr_name.upper()
+            reconciled_native.at[native_index, "CONFIDENCE"] = ocr_confidence
+            reconciled_native.at[native_index, "VARIANTS"] = " | ".join(
+                dict.fromkeys(variants)
+            )
+            reconciled_native.at[native_index, "DETECTION KEYS"] = "|".join(
+                sorted(detection_keys)
+            )
+            reconciled_native.at[native_index, "ORIGIN"] = (
+                "Auto-detected title-block name with native code confirmation"
+            )
+
     native_pages = {
         int(value)
-        for value in pd.to_numeric(native["FIRST PAGE"], errors="coerce").dropna()
+        for value in pd.to_numeric(
+            reconciled_native["FIRST PAGE"], errors="coerce"
+        ).dropna()
     }
-    ocr_pages = pd.to_numeric(ocr["FIRST PAGE"], errors="coerce")
     ocr = ocr.loc[~ocr_pages.isin(native_pages)].copy()
-    return merge_submachinery_candidates(ocr, native)
+    return merge_submachinery_candidates(ocr, reconciled_native)
+
+
+def ensure_component_assembly_spare_rows(
+    review_frame: pd.DataFrame | None,
+    component_candidates: pd.DataFrame | None,
+    default_unit: str = "PCS",
+) -> tuple[pd.DataFrame, int, int]:
+    """Represent every valid equipment drawing as a linked assembly spare.
+
+    A drawing title block defines both the sub-machinery parent (Document No. +
+    Title) and an orderable/identifiable whole-assembly row. Existing exact-code
+    rows are reconciled instead of duplicated. The strict export hierarchy can then
+    retain drawing-defined machinery without inventing an unrelated child code.
+
+    Returns ``(review, added_count, reconciled_count)``.
+    """
+    review = (
+        review_frame.copy()
+        if review_frame is not None
+        else empty_review_dataframe()
+    )
+    for column in REVIEW_COLUMNS:
+        if column not in review.columns:
+            review[column] = False if column in {"INCLUDE", "READY"} else ""
+    if component_candidates is None or component_candidates.empty:
+        return review[REVIEW_COLUMNS].reset_index(drop=True), 0, 0
+
+    unit = clean_text(default_unit).upper()
+    if unit not in UNIT_OPTIONS or not unit:
+        unit = "PCS"
+    existing_by_code: dict[str, list[Any]] = {}
+    for index, row in review.iterrows():
+        for value in (row.get("CODE", ""), row.get("PART NO", "")):
+            key = normalize_key(value)
+            if key:
+                existing_by_code.setdefault(key, []).append(index)
+
+    added_rows: list[dict[str, Any]] = []
+    added = 0
+    reconciled = 0
+    for _, candidate in component_candidates.iterrows():
+        if "INCLUDE" in component_candidates.columns and not bool(
+            candidate.get("INCLUDE", False)
+        ):
+            continue
+        code = _valid_drawing_heading_code(candidate.get("CODE", ""))
+        name = _clean_equipment_drawing_title(candidate.get("NAME", "")).upper()
+        if not code or not _is_equipment_component_title(name):
+            continue
+        code_key = normalize_key(code)
+        page_value = pd.to_numeric(
+            pd.Series([candidate.get("FIRST PAGE")]), errors="coerce"
+        ).iloc[0]
+        source_page = None if pd.isna(page_value) else int(page_value)
+        confidence = max(
+            0.95,
+            clamp_confidence(candidate.get("CONFIDENCE", 0.95)),
+        )
+
+        matching_indexes = list(dict.fromkeys(existing_by_code.get(code_key, [])))
+        if matching_indexes:
+            for index in matching_indexes:
+                assignment_source = clean_text(
+                    review.at[index, "ASSIGNMENT SOURCE"]
+                ).lower()
+                if "manual" not in assignment_source:
+                    review.at[index, "MACHINERY"] = name
+                    review.at[index, "DETECTED MACHINERY"] = name
+                    review.at[index, "SECTION CODE"] = code
+                    review.at[index, "ASSIGNMENT SOURCE"] = (
+                        "Equipment drawing title block"
+                    )
+                    if not clean_text(review.at[index, "DESCRIPTION"]):
+                        review.at[index, "DESCRIPTION"] = name
+                    if not clean_text(review.at[index, "TABLE TITLE"]):
+                        review.at[index, "TABLE TITLE"] = "Equipment drawing"
+                    if not clean_text(review.at[index, "SOURCE PAGE"]):
+                        review.at[index, "SOURCE PAGE"] = source_page
+                    if not clean_text(review.at[index, "SECTION START PAGE"]):
+                        review.at[index, "SECTION START PAGE"] = source_page
+                    review.at[index, "CONFIDENCE"] = max(
+                        confidence,
+                        clamp_confidence(review.at[index, "CONFIDENCE"]),
+                    )
+            reconciled += 1
+            continue
+
+        row = {column: "" for column in REVIEW_COLUMNS}
+        row.update(
+            {
+                "INCLUDE": True,
+                "READY": False,
+                "MACHINERY": name,
+                "PART NO": code,
+                "DESCRIPTION": name,
+                "CODE": code,
+                "ITEM NO": "",
+                "UNIT": unit,
+                "QNT": 1,
+                "SOURCE PAGE": source_page,
+                "SECTION START PAGE": source_page,
+                "TABLE TITLE": "Equipment drawing",
+                "SECTION CODE": code,
+                "SECTION MAKER": clean_text(candidate.get("MAKER", "")),
+                "SECTION MODEL": clean_text(candidate.get("MODEL", "")),
+                "CONFIDENCE": confidence,
+                "DETECTED MACHINERY": name,
+                "ASSIGNMENT SOURCE": "Equipment drawing title block",
+                "WARNING": "Source: equipment drawing title block assembly",
+            }
+        )
+        added_rows.append(row)
+        existing_by_code.setdefault(code_key, []).append(len(review) + len(added_rows) - 1)
+        added += 1
+
+    if added_rows:
+        review = pd.concat(
+            [review, pd.DataFrame(added_rows, columns=REVIEW_COLUMNS)],
+            ignore_index=True,
+        )
+    return review[REVIEW_COLUMNS].reset_index(drop=True), added, reconciled
 
 def build_submachinery_candidates(
     review_frame: pd.DataFrame,
