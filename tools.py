@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.4"
+TOOLS_VERSION = "4.18.5"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -8286,6 +8286,30 @@ def refresh_submachinery_derived_fields(
     if result.empty:
         return empty_submachinery_review_dataframe()
 
+    # INCLUDE is a review decision, not derived OCR evidence. Preserve it for a
+    # candidate that still exists even when an older saved session did not mark
+    # the row as a manual override. Stale automatic candidates are still omitted
+    # because only rows present in the freshly rebuilt result are considered.
+    if existing is not None and not existing.empty:
+        decision_source = existing.copy()
+        for column in SUBMACHINERY_REVIEW_COLUMNS:
+            if column not in decision_source.columns:
+                decision_source[column] = False if column == "INCLUDE" else ""
+        for result_index, result_row in result.iterrows():
+            result_code = normalize_key(result_row.get("CODE", ""))
+            result_keys = _split_detection_keys(result_row.get("DETECTION KEYS", ""))
+            matching_index: Any = None
+            for old_index, old_row in decision_source.iterrows():
+                old_code = normalize_key(old_row.get("CODE", ""))
+                old_keys = _split_detection_keys(old_row.get("DETECTION KEYS", ""))
+                if (result_code and old_code == result_code) or bool(result_keys & old_keys):
+                    matching_index = old_index
+                    break
+            if matching_index is not None:
+                result.at[result_index, "INCLUDE"] = bool(
+                    decision_source.at[matching_index, "INCLUDE"]
+                )
+
     result["MCH_TP(M/S/U)"] = "SubMachinery"
     result["CONFIDENCE"] = pd.to_numeric(result["CONFIDENCE"], errors="coerce").fillna(0.70)
     result["PARTS FOUND"] = pd.to_numeric(result["PARTS FOUND"], errors="coerce").fillna(0).astype(int)
@@ -8330,7 +8354,7 @@ def merge_submachinery_candidates(
         )
         if old_origin.startswith("Auto"):
             refresh_columns = (
-                "CODE", "NAME", "MAKER", "MODEL", "TYPE", "INSTR.BOOK", "SPECIFICATIONS",
+                "INCLUDE", "CODE", "NAME", "MAKER", "MODEL", "TYPE", "INSTR.BOOK", "SPECIFICATIONS",
                 "FIRST PAGE", "LAST PAGE", "PARTS FOUND", "CONFIDENCE", "VARIANTS", "DETECTION KEYS", "ORIGIN",
             )
         for column in refresh_columns:
