@@ -1,10 +1,20 @@
-# Spare Parts OCR Import Builder — title-box hierarchy correction 4.18.6
+# Spare Parts OCR Import Builder — durable Step-3 review decisions 4.18.7
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.18.7 durable Step-3 review decisions
+
+- Saves the complete submitted sub-machinery table instead of reading Streamlit's
+  internal `edited_rows` callback delta, eliminating a form-submit race that could
+  discard a checkbox change.
+- Persists excluded proposal identities in a per-document decision ledger and
+  reapplies them after every automatic title/code/evidence refresh.
+- Lets an explicit re-selection or **Verify all sub-machineries** clear the saved
+  exclusion, while a fresh non-append OCR run intentionally starts a new review.
 
 ### 4.18.6 title-box hierarchy correction
 
