@@ -1,10 +1,68 @@
-# Spare Parts OCR Import Builder — native-PDF hierarchy recovery 4.18.1
+# Spare Parts OCR Import Builder — persistent sub-machinery exclusions 4.18.5
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.18.5 persistent sub-machinery exclusions
+
+- Keeps an unchecked Step 3 `INCLUDE` decision after **Save sub-machinery
+  changes**, subsequent Streamlit reruns, and automatic source-evidence refreshes.
+- Treats inclusion/exclusion as a user review decision while continuing to refresh
+  OCR-derived names, codes, pages, confidence, and linked-part counts.
+- Continues to remove stale automatic candidates and preserve manual rows; an
+  excluded candidate is not recreated as selected merely because it is detected
+  again in the source PDF.
+
+### 4.18.4 drawing title-block names and assembly spares
+
+- Reconciles the native PDF chapter heading with OCR title-block evidence by exact
+  page and document number. The compact labelled drawing **Title** wins when OCR
+  confirms the same code with stronger evidence; for MSC ROMA document `9007280`,
+  the sub-machinery NAME is therefore `CABLE`, not the broader chapter heading.
+- Converts every valid equipment drawing into one linked whole-assembly spare row
+  using its Document No. as PART NO/CODE and its title-block Title as DESCRIPTION.
+  Drawings such as page 333 `9024508 / FILTER` are consequently represented on both
+  import sheets rather than becoming an orphan candidate.
+- Reconciles an already extracted exact-code assembly row instead of creating a
+  duplicate, preserving the strict unique-code rule.
+- Upgrades saved OCR sessions locally when Step 3 opens; no additional AI call is
+  needed to add the drawing-assembly rows or apply the title-block name.
+- Extends the MSC ROMA regression to require `CABLE`, all 22 drawing parents, all 22
+  assembly spares, and the previously recovered maintenance/cable parts.
+
+### 4.18.3 strict Main → Sub-machinery → Spare hierarchy
+
+- Exports a sub-machinery only when at least one included spare-part row uses its
+  exact approved name. Unlinked equipment/drawing candidates remain visible in
+  Step 3 and in the audit workbook.
+- Requires every included spare row to belong to an included sub-machinery; a
+  main-machinery fallback can no longer pass final review or export validation.
+- Blocks empty-spare exports, missing parent links, orphan sub-machineries, and any
+  result where the exported sub-machinery count exceeds the spare-part count.
+- Shows **Export-linked** rather than the broader included-candidate count in Step 3
+  and displays the final hierarchy counts before Create Excel.
+- Adds a regression for MSC ROMA: 22 detected drawing candidates remain auditable,
+  while exactly 5 linked sub-machineries and 16 spare rows reach the import workbook.
+
+### 4.18.2 authoritative source refresh and spare ownership
+
+- Keeps OCR and native searchable-PDF evidence in separate layers. A native title
+  block now replaces conflicting OCR machinery candidates from the same page
+  instead of allowing both versions to survive.
+- Rebuilds automatic sub-machinery proposals from current evidence on every OCR
+  run and migration pass. Stale automatic rows are removed, while user-created and
+  manually edited rows remain preserved.
+- Rejects warning sentences, generic page labels, page-suffixed descriptions, and
+  other prose fragments as automatic sub-machinery names.
+- Treats explicit and recommended spare-number tables as authoritative source rows:
+  damaged OCR duplicates are replaced, omitted source rows are restored, and the
+  printed module ownership, quantity, and unit take precedence.
+- Adds an MSC ROMA regression covering all 22 drawing sub-machineries and all 16
+  source-backed maintenance/cable spare rows, including CIP MODULE and FILTER
+  ownership.
 
 ### 4.18.1 BWTS hierarchy and maintenance-spares correction
 
