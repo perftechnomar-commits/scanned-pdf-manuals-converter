@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.6"
+TOOLS_VERSION = "4.18.7"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -8464,6 +8464,50 @@ def included_submachinery_rows(frame: pd.DataFrame | None) -> pd.DataFrame:
             working[column] = ""
     working["MCH_TP(M/S/U)"] = "SubMachinery"
     return working[MACHINERY_COLUMNS].reset_index(drop=True)
+
+
+def submachinery_identity_keys(row: Any) -> set[str]:
+    """Return stable, type-prefixed keys for one Step-3 proposal.
+
+    CODE is preferred, while full detection aliases allow an exclusion to survive
+    a corrected OCR code/name. Prefixes prevent a code from accidentally matching
+    an unrelated textual alias.
+    """
+    getter = getattr(row, "get", lambda *_: "")
+    code_key = normalize_key(getter("CODE", ""))
+    name_key = normalize_key(getter("NAME", ""))
+    detection_keys = _split_detection_keys(getter("DETECTION KEYS", ""))
+    keys = {f"C:{code_key}"} if code_key else set()
+    keys.update(f"D:{key}" for key in detection_keys if key)
+    if not keys and name_key:
+        keys.add(f"N:{name_key}")
+    return keys
+
+
+def apply_submachinery_exclusion_registry(
+    frame: pd.DataFrame | None,
+    excluded_keys: Sequence[Any] | set[Any] | None,
+) -> pd.DataFrame:
+    """Reapply explicit user exclusions after any automatic candidate rebuild."""
+    result = (
+        frame.copy()
+        if frame is not None
+        else empty_submachinery_review_dataframe()
+    )
+    if result.empty:
+        return result
+    registry = {
+        clean_text(value).strip().upper()
+        for value in (excluded_keys or [])
+        if clean_text(value).strip()
+    }
+    if not registry:
+        return result
+    for index, row in result.iterrows():
+        if submachinery_identity_keys(row) & registry:
+            result.at[index, "INCLUDE"] = False
+    result["INCLUDE"] = result["INCLUDE"].fillna(False).astype(bool)
+    return result
 
 
 def apply_submachinery_assignments(
