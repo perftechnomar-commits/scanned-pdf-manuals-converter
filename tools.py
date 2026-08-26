@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.5"
+TOOLS_VERSION = "4.18.6"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -3517,6 +3517,11 @@ def _valid_automatic_section_code(value: Any) -> str:
     if not text or _is_date_like_section_code(text):
         return ""
     normalized = normalize_key(text)
+    # OCR frequently joins a drawing number to a printed pagination marker, for
+    # example ``9025986_Page_5`` -> ``9025986PAPER5``. This identifies a page of a
+    # multi-page document, not a new machinery code.
+    if re.search(r"(?:PAGE|PAPER|SHEET)\d+(?:OF\d+)?$", normalized, flags=re.I):
+        return ""
     if normalized in {
         "DATE", "REV", "REVISION", "REVISIONNO", "SHEET", "SHEETNO",
         "NOOFSHEETS", "PAGE", "PAGENO", "TITLE", "DOCUMENTNO",
@@ -7670,6 +7675,21 @@ def _clean_equipment_drawing_title(value: Any) -> str:
         "", text, flags=re.IGNORECASE,
     )
     text = re.sub(r"\s+", " ", text).strip(" -:;|,.")
+    # A chapter heading can describe the systems traversed by a drawing rather
+    # than the item named in its title box (for example ``UV reactor and LDC /
+    # Lamp power cable`` while the labelled Title is simply ``Cable``). Use the
+    # terminal concrete component noun only for this narrow navigation pattern;
+    # ordinary compound names such as ``Air filter / Filter regulator`` remain
+    # intact.
+    if "/" in text:
+        parent_context, trailing_context = text.rsplit("/", maxsplit=1)
+        trailing_tokens = re.findall(r"[A-Za-z]+", trailing_context.upper())
+        if (
+            " AND " in f" {parent_context.upper()} "
+            and 2 <= len(trailing_tokens) <= 4
+            and trailing_tokens[-1] in _DRAWING_COMPONENT_NOUNS
+        ):
+            text = trailing_tokens[-1]
     return _clean_machinery_name(text)
 
 
@@ -7833,8 +7853,8 @@ def build_component_drawing_candidates(
                 "VARIANTS": " | ".join(dict.fromkeys(names)),
                 "DETECTION KEYS": "|".join(sorted(key for key in detection_keys if key)),
                 "ORIGIN": (
-                    "Auto-detected equipment drawing"
-                    if any("equipment drawing title block" in origin.lower() for origin in origins)
+                    "Auto-detected title-block drawing"
+                    if any("title block" in origin.lower() for origin in origins)
                     else "Auto-detected drawing/component"
                 ),
             }
@@ -7883,6 +7903,13 @@ def merge_component_candidates_with_native_priority(
     ocr_pages = pd.to_numeric(ocr["FIRST PAGE"], errors="coerce")
     ocr_codes = ocr["CODE"].map(normalize_key)
     for native_index, native_row in reconciled_native.iterrows():
+        native_name = _clean_equipment_drawing_title(
+            native_row.get("NAME", "")
+        )
+        if native_name and normalize_key(native_name) != normalize_key(
+            native_row.get("NAME", "")
+        ):
+            reconciled_native.at[native_index, "NAME"] = native_name.upper()
         native_page = pd.to_numeric(
             pd.Series([native_row.get("FIRST PAGE")]), errors="coerce"
         ).iloc[0]
@@ -7904,14 +7931,22 @@ def merge_component_candidates_with_native_priority(
         best_ocr = exact_matches.loc[best_index]
         ocr_confidence = clamp_confidence(best_ocr.get("CONFIDENCE", 0.90))
         ocr_name = _clean_equipment_drawing_title(best_ocr.get("NAME", ""))
+        ocr_origin = clean_text(best_ocr.get("ORIGIN", "")).lower()
+        labelled_compact_match = bool(
+            "title-block" in ocr_origin
+            and native_name
+            and len(ocr_name) < len(native_name)
+            and re.search(
+                rf"(?<![A-Z0-9]){re.escape(ocr_name)}(?![A-Z0-9])$",
+                native_name,
+                flags=re.I,
+            )
+        )
         if (
             ocr_name
             and _is_equipment_component_title(ocr_name)
-            and ocr_confidence > native_confidence
+            and (ocr_confidence > native_confidence or labelled_compact_match)
         ):
-            native_name = _clean_equipment_drawing_title(
-                native_row.get("NAME", "")
-            )
             variants = [
                 value
                 for value in (
@@ -8272,9 +8307,29 @@ def refresh_submachinery_derived_fields(
             if column not in working_existing.columns:
                 working_existing[column] = False if column == "INCLUDE" else ""
         origin = working_existing["ORIGIN"].fillna("").astype(str)
+        included = working_existing["INCLUDE"].fillna(False).astype(bool)
+        parts_found = pd.to_numeric(
+            working_existing["PARTS FOUND"], errors="coerce"
+        ).fillna(0)
+        page_marker_artifact = working_existing["CODE"].map(
+            lambda value: bool(
+                re.search(
+                    r"(?:PAGE|PAPER|SHEET)\d+(?:OF\d+)?$",
+                    normalize_key(value),
+                    flags=re.I,
+                )
+            )
+        )
+        historical_false_override = (
+            origin.eq("Manual override")
+            & ~included
+            & parts_found.eq(0)
+            & page_marker_artifact
+        )
         manual_existing = working_existing.loc[
-            ~origin.str.startswith("Auto")
-        , SUBMACHINERY_REVIEW_COLUMNS].copy()
+            ~origin.str.startswith("Auto") & ~historical_false_override,
+            SUBMACHINERY_REVIEW_COLUMNS,
+        ].copy()
 
     result = (
         detected.copy()
