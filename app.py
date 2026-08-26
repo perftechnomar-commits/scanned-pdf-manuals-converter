@@ -34,6 +34,7 @@ from tools import (
     UNIT_OPTIONS,
     add_manual_submachinery_candidate,
     analyze_document_profile_with_ai,
+    apply_submachinery_exclusion_registry,
     apply_submachinery_assignments,
     build_audit_workbook,
     build_component_drawing_candidates,
@@ -68,6 +69,7 @@ from tools import (
     select_explicit_spare_number_pages,
     select_spare_source_pages,
     safe_filename,
+    submachinery_identity_keys,
     validate_machinery_dataframe,
 )
 
@@ -124,7 +126,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.6"
+APP_VERSION = "4.18.7"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -693,6 +695,7 @@ def initialize_state() -> None:
         "model_run_status": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
+        "excluded_submachinery_keys": [],
         "selected_vessels": [],
         "additional_vessels_text": "",
         "output": None,
@@ -760,6 +763,7 @@ JOB_STATE_FIELDS = [
     "model_run_status",
     "spare_review",
     "submachinery_review",
+    "excluded_submachinery_keys",
     "selected_vessels",
     "additional_vessels_text",
     "output",
@@ -815,6 +819,7 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "model_run_status": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
+        "excluded_submachinery_keys": [],
         "selected_vessels": [],
         "additional_vessels_text": "",
         "output": None,
@@ -874,6 +879,10 @@ def load_document_job(job_id: str) -> None:
             # Older in-memory jobs did not persist the separated evidence layers.
             # Never inherit them from the previously active document.
             st.session_state[field] = []
+        elif field == "excluded_submachinery_keys":
+            # Do not leak review decisions from a different document into an older
+            # job created before the exclusion ledger existed.
+            st.session_state.excluded_submachinery_keys = []
     st.session_state.loaded_job_id = job_id
     st.session_state.active_document_id = job_id
 
@@ -2104,6 +2113,7 @@ with st.expander("⚙️ Processing & export settings", expanded=False):
             st.session_state.model_run_status = {}
             st.session_state.spare_review = empty_review_dataframe()
             st.session_state.submachinery_review = empty_submachinery_review_dataframe()
+            st.session_state.excluded_submachinery_keys = []
             st.session_state.output = None
             st.session_state.multi_package_output = None
             st.session_state.prepared_email_subject = ""
@@ -2408,30 +2418,60 @@ def _editor_updates(editor_key: str) -> dict[int, dict[str, object]]:
     return updates
 
 
-def _autosave_submachinery_page(editor_key: str, page_indexes: list[object]) -> None:
-    """Persist committed proposal edits before the user can navigate away."""
-    updates = _editor_updates(editor_key)
-    if not updates:
-        return
+def _save_submachinery_page(
+    submitted_page: pd.DataFrame,
+    page_indexes: list[object],
+) -> None:
+    """Persist the complete submitted Step-3 page and its review decisions.
 
+    Reading Streamlit's internal ``edited_rows`` delta from a form callback can
+    race the form submission. The data editor's returned dataframe is the public,
+    complete submitted value and is therefore authoritative here.
+    """
     previous_frame = st.session_state.submachinery_review.copy()
     saved_frame = previous_frame.copy()
-    editable_columns = {
+    editable_columns = (
         "INCLUDE", "CODE", "NAME", "MAKER", "MODEL", "TYPE",
         "INSTR.BOOK", "SPECIFICATIONS",
+    )
+    registry = {
+        str(value).strip().upper()
+        for value in st.session_state.get("excluded_submachinery_keys", [])
+        if str(value).strip()
     }
     changed_rows = 0
-    for row_position, changes in updates.items():
-        if row_position < 0 or row_position >= len(page_indexes):
-            continue
+    for row_position, target_index in enumerate(page_indexes):
+        if row_position >= len(submitted_page):
+            break
+        submitted_row = submitted_page.iloc[row_position]
+        old_row = previous_frame.loc[target_index].copy()
         target_index = page_indexes[row_position]
         row_changed = False
         values_changed = False
-        for column, value in changes.items():
-            if column not in editable_columns:
+        for column in editable_columns:
+            if column not in submitted_page.columns:
                 continue
-            if column in {"CODE", "NAME", "MAKER", "MODEL"}:
-                value = "" if pd.isna(value) else str(value).strip().upper()
+            value = submitted_row.get(column, saved_frame.at[target_index, column])
+            if column == "INCLUDE":
+                value = False if pd.isna(value) else bool(value)
+            else:
+                value = "" if pd.isna(value) else str(value).strip()
+                if column in {"CODE", "NAME", "MAKER", "MODEL"}:
+                    value = value.upper()
+            previous_value = saved_frame.at[target_index, column]
+            if column == "INCLUDE":
+                comparable_previous = (
+                    False if pd.isna(previous_value) else bool(previous_value)
+                )
+            else:
+                comparable_previous = (
+                    "" if pd.isna(previous_value) else str(previous_value).strip()
+                )
+                if column in {"CODE", "NAME", "MAKER", "MODEL"}:
+                    comparable_previous = comparable_previous.upper()
+            same_value = comparable_previous == value
+            if same_value:
+                continue
             saved_frame.at[target_index, column] = value
             row_changed = True
             values_changed = values_changed or column != "INCLUDE"
@@ -2442,6 +2482,13 @@ def _autosave_submachinery_page(editor_key: str, page_indexes: list[object]) -> 
             if values_changed:
                 saved_frame.at[target_index, "ORIGIN"] = "Manual override"
             saved_frame.at[target_index, "MCH_TP(M/S/U)"] = "SubMachinery"
+            decision_keys = submachinery_identity_keys(old_row) | submachinery_identity_keys(
+                saved_frame.loc[target_index]
+            )
+            if bool(saved_frame.at[target_index, "INCLUDE"]):
+                registry.difference_update(decision_keys)
+            else:
+                registry.update(decision_keys)
             changed_rows += 1
 
     if not changed_rows:
@@ -2449,6 +2496,7 @@ def _autosave_submachinery_page(editor_key: str, page_indexes: list[object]) -> 
 
     saved_frame = saved_frame[SUBMACHINERY_REVIEW_COLUMNS].copy()
     st.session_state.submachinery_review = saved_frame
+    st.session_state.excluded_submachinery_keys = sorted(registry)
     assigned_count, reset_count = _apply_submachinery_changes_to_spares(
         previous_frame,
         saved_frame,
@@ -2456,7 +2504,7 @@ def _autosave_submachinery_page(editor_key: str, page_indexes: list[object]) -> 
     st.session_state.submachinery_editor_version += 1
     save_loaded_job_state()
     st.session_state.submachinery_flash = (
-        f"Autosaved {changed_rows} edited proposal(s). Updated {assigned_count} linked "
+        f"Saved {changed_rows} edited proposal(s). Updated {assigned_count} linked "
         f"spare-part assignment(s); reset {reset_count} previous assignment(s)."
     )
 
@@ -2926,6 +2974,10 @@ if active_workflow_step == "3. Sub-machineries":
                 source_document_name=source_name,
                 component_candidates=component_candidates,
             )
+            refreshed_submachineries = apply_submachinery_exclusion_registry(
+                refreshed_submachineries,
+                st.session_state.get("excluded_submachinery_keys", []),
+            )
             if not refreshed_submachineries.equals(previous_submachineries):
                 st.session_state.submachinery_review = refreshed_submachineries
                 _apply_submachinery_changes_to_spares(
@@ -3039,6 +3091,7 @@ if active_workflow_step == "3. Sub-machineries":
                     verified_submachineries["INCLUDE"] = True
                     verified_submachineries["MCH_TP(M/S/U)"] = "SubMachinery"
                     st.session_state.submachinery_review = verified_submachineries
+                    st.session_state.excluded_submachinery_keys = []
                     changed, reset = _apply_submachinery_changes_to_spares(
                         previous, verified_submachineries
                     )
@@ -3082,8 +3135,16 @@ if active_workflow_step == "3. Sub-machineries":
                         disabled=not confirm_clear,
                     ):
                         previous = st.session_state.submachinery_review.copy()
+                        exclusion_registry = {
+                            key
+                            for _, proposal in previous.iterrows()
+                            for key in submachinery_identity_keys(proposal)
+                        }
                         empty = empty_submachinery_review_dataframe()
                         st.session_state.submachinery_review = empty
+                        st.session_state.excluded_submachinery_keys = sorted(
+                            exclusion_registry
+                        )
                         _apply_submachinery_changes_to_spares(previous, empty)
                         st.session_state.submachinery_editor_version += 1
                         save_loaded_job_state()
@@ -3167,7 +3228,7 @@ if active_workflow_step == "3. Sub-machineries":
                 end_row = min(start_row + page_size, total_submachineries)
                 st.info(
                     f"Showing rows {start_row + 1}-{end_row} of {total_submachineries} "
-                    f"· page {current_page}/{total_pages}. Changes save automatically."
+                    f"· page {current_page}/{total_pages}. Select Save below to commit edits."
                 )
 
             page_indexes = candidate_frame.index[start_row:end_row].tolist()
@@ -3185,7 +3246,7 @@ if active_workflow_step == "3. Sub-machineries":
                 "Column widths automatically refit to the saved values."
             )
             editor_form = st.form(key=f"{editor_key}_form", border=False)
-            editor_form.data_editor(
+            submitted_page_frame = editor_form.data_editor(
                 page_frame,
                 key=editor_key,
                 num_rows="fixed",
@@ -3260,13 +3321,14 @@ if active_workflow_step == "3. Sub-machineries":
                     ),
                 },
             )
-            editor_form.form_submit_button(
+            save_submachinery_page = editor_form.form_submit_button(
                 "Save sub-machinery changes",
                 type="primary",
                 use_container_width=True,
-                on_click=_autosave_submachinery_page,
-                args=(editor_key, page_indexes),
             )
+            if save_submachinery_page:
+                _save_submachinery_page(submitted_page_frame, page_indexes)
+                st.rerun()
 
             st.caption(
                 "Use the page controls above to review every proposal. Then continue to "
@@ -3769,6 +3831,7 @@ if active_workflow_step == "2. OCR":
                         st.session_state.extraction_log = extraction_messages
                         combined_review = new_review
                         previous_candidates = empty_submachinery_review_dataframe()
+                        st.session_state.excluded_submachinery_keys = []
                         st.session_state.verified_review_rows = []
                         st.session_state.review_page_number = 1
 
@@ -3820,6 +3883,10 @@ if active_workflow_step == "2. OCR":
                     merged_candidates = _apply_printed_section_names(
                         merged_candidates,
                         printed_section_names,
+                    )
+                    merged_candidates = apply_submachinery_exclusion_registry(
+                        merged_candidates,
+                        st.session_state.get("excluded_submachinery_keys", []),
                     )
                     assigned_review = apply_submachinery_assignments(
                         combined_review,
