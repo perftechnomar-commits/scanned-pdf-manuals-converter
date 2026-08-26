@@ -124,7 +124,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.5"
+APP_VERSION = "4.18.6"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2426,6 +2426,7 @@ def _autosave_submachinery_page(editor_key: str, page_indexes: list[object]) -> 
             continue
         target_index = page_indexes[row_position]
         row_changed = False
+        values_changed = False
         for column, value in changes.items():
             if column not in editable_columns:
                 continue
@@ -2433,8 +2434,13 @@ def _autosave_submachinery_page(editor_key: str, page_indexes: list[object]) -> 
                 value = "" if pd.isna(value) else str(value).strip().upper()
             saved_frame.at[target_index, column] = value
             row_changed = True
+            values_changed = values_changed or column != "INCLUDE"
         if row_changed:
-            saved_frame.at[target_index, "ORIGIN"] = "Manual override"
+            # Inclusion is a review decision, not a change to the OCR-derived
+            # identity. Keeping the automatic origin allows a rejected stale
+            # detection to disappear when refreshed evidence no longer supports it.
+            if values_changed:
+                saved_frame.at[target_index, "ORIGIN"] = "Manual override"
             saved_frame.at[target_index, "MCH_TP(M/S/U)"] = "SubMachinery"
             changed_rows += 1
 
