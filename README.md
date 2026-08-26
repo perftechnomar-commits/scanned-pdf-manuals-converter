@@ -1,10 +1,22 @@
-# Spare Parts OCR Import Builder — persistent sub-machinery exclusions 4.18.5
+# Spare Parts OCR Import Builder — title-box hierarchy correction 4.18.6
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.18.6 title-box hierarchy correction
+
+- Prefers a compact labelled drawing-title value over the broader page/chapter
+  heading when both refer to the same source page and exact document code. For MSC
+  ROMA page 358, code `9007280` is therefore named `CABLE`, not `UV REACTOR AND
+  LDC / LAMP POWER CABLE`.
+- Rejects OCR codes contaminated by pagination markers such as
+  `9025986_Page_5` / `9025986PAPER5`; connection-list labels such as `AIR (TOTAL
+  SYSTEM CONSUMPTION)` can no longer become sub-machineries.
+- Removes historical excluded zero-part page-marker artifacts from saved review
+  sessions and keeps future INCLUDE-only decisions separate from identity edits.
 
 ### 4.18.5 persistent sub-machinery exclusions
 
