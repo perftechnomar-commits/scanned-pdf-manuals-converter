@@ -1,10 +1,27 @@
-# Spare Parts OCR Import Builder — durable Step-3 review decisions 4.18.7
+# Spare Parts OCR Import Builder — drawing legends and embedded article tables 4.18.8
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.18.8 drawing legends and embedded article tables
+
+- Retries every source-confirmed equipment drawing at the useful alternate
+  orientation, rather than limiting rescue to pages whose first OCR pass already
+  exposed a spare-table header.
+- Recovers every orderable `Article No. / Name-Designation` row embedded within a
+  drawing and links it to that page's exact title-block sub-machinery.
+- For a drawing parent that otherwise has no detailed spares, reads a labelled
+  `Legend / Legenda / Key` wherever it appears on the page. The printed legend code
+  becomes PART NO/CODE and the short English legend label becomes DESCRIPTION;
+  dimensional, pressure, connection and voltage specifications are excluded.
+- Gives embedded Article-No. tables priority over legend callouts on the same page
+  and skips repeated codes globally, preserving the strict unique-code rule.
+- Reapplies the deterministic drawing-detail pass when an existing saved job opens;
+  a full rerun is needed only when the prior session never captured the rotated
+  legend/table OCR evidence.
 
 ### 4.18.7 durable Step-3 review decisions
 
