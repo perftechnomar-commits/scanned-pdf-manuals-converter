@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.7"
+TOOLS_VERSION = "4.18.8"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -564,6 +564,9 @@ def _engineering_drawing_rotation_candidate(markdown: Any, source_text: Any = ""
         and "designation" in combined
         and re.search(r"\bpos\.?\b", combined)
     )
+    legend_hint = bool(
+        re.search(r"\b(?:legend|legenda|key)\s*:?\b", combined, flags=re.I)
+    )
     title_block_hint = any(
         token in compact
         for token in (
@@ -573,7 +576,15 @@ def _engineering_drawing_rotation_candidate(markdown: Any, source_text: Any = ""
         )
     )
     document_number = bool(re.search(r"(?<!\d)\d{6,10}(?!\d)", combined))
-    return bool(document_number and (title_block_hint or drawing_context) and (construction_table or title_block_hint))
+    # A searchable PDF often exposes only the chapter heading and drawing number;
+    # the embedded drawing, legend and article table remain rotated image/vector
+    # content. Treat that combination as sufficient rescue evidence so drawings
+    # without an already recognized table are not permanently assembly-only.
+    return bool(
+        document_number
+        and drawing_context
+        and (construction_table or title_block_hint or legend_hint or not _is_engineering_article_table(markdown))
+    )
 
 
 def _orientation_table_evidence(markdown: Any) -> int:
@@ -599,6 +610,9 @@ def _orientation_table_evidence(markdown: Any) -> int:
     score += min(12, len(re.findall(r"(?m)^\s*\d{6,10}(?:\s+[A-Z0-9]{1,4})?\b", str(markdown or ""))))
     if _is_engineering_article_table(markdown):
         score += 20
+    legend_entries = _engineering_legend_entries(markdown)
+    if legend_entries:
+        score += 12 + min(12, len(legend_entries) * 2)
     return score
 
 
@@ -658,13 +672,17 @@ def _focused_engineering_region_ocr(
     """
     combined = clean_markdown(base_markdown)
     messages: list[str] = []
-    if not combined or not _is_engineering_article_table(combined):
+    article_table = _is_engineering_article_table(combined)
+    legend_page = _is_engineering_legend_page(combined)
+    if not combined or not (article_table or legend_page):
         return combined, messages
 
-    metadata = _engineering_title_block_metadata(combined)
+    metadata = _engineering_title_block_metadata(combined, require_article_table=False)
     section_code = clean_text(metadata.get("section_code", ""))
-    identifier_count = len(
-        _engineering_article_identifier_evidence(combined, section_code)
+    identifier_count = (
+        len(_engineering_article_identifier_evidence(combined, section_code))
+        if article_table
+        else len(_engineering_legend_entries(combined))
     )
     # If the full-page pass already exposed several identifiers, region OCR would
     # add cost without useful recovery value.
@@ -710,12 +728,17 @@ def _focused_engineering_region_ocr(
                 + f"\n\n===== FOCUSED REGION OCR {label} =====\n"
                 + region_markdown
             ).strip()
-            candidate_metadata = _engineering_title_block_metadata(candidate)
+            candidate_article_table = _is_engineering_article_table(candidate)
+            candidate_metadata = _engineering_title_block_metadata(
+                candidate, require_article_table=False
+            )
             candidate_code = clean_text(
                 candidate_metadata.get("section_code", section_code)
             )
-            candidate_count = len(
-                _engineering_article_identifier_evidence(candidate, candidate_code)
+            candidate_count = (
+                len(_engineering_article_identifier_evidence(candidate, candidate_code))
+                if candidate_article_table
+                else len(_engineering_legend_entries(candidate))
             )
             candidate_score = _orientation_table_evidence(candidate)
             if candidate_count > identifier_count or candidate_score > best_score + 2:
@@ -736,13 +759,13 @@ def _focused_engineering_region_ocr(
         messages.insert(
             0,
             f"PDF page {page_number}: focused region OCR added {used_regions} higher-resolution "
-            f"drawing region(s) and recovered {identifier_count} source Article-No. candidate(s).",
+            f"drawing region(s) and recovered {identifier_count} source drawing-detail candidate(s).",
         )
     elif identifier_count < 2:
         messages.insert(
             0,
-            f"PDF page {page_number}: the full-page OCR recognized an orderable table, but "
-            "focused region OCR still could not read enough source identifiers.",
+            f"PDF page {page_number}: the full-page OCR recognized a drawing-detail source, but "
+            "focused region OCR still could not read enough coded entries.",
         )
     return combined, messages
 
@@ -816,11 +839,17 @@ def recover_rotated_engineering_drawing_pages(
                 score = _orientation_table_evidence(rescue_markdown)
                 if score > best_score:
                     best_markdown, best_rotation, best_score = rescue_markdown, rotation, score
-                if rescue_markdown and _is_engineering_article_table(rescue_markdown):
+                if rescue_markdown and (
+                    _is_engineering_article_table(rescue_markdown)
+                    or _is_engineering_legend_page(rescue_markdown)
+                ):
                     best_markdown, best_rotation, best_score = rescue_markdown, rotation, score
                     break
 
-            if best_markdown and _is_engineering_article_table(best_markdown) and best_score > original_score:
+            if best_markdown and (
+                _is_engineering_article_table(best_markdown)
+                or _is_engineering_legend_page(best_markdown)
+            ) and best_score > original_score:
                 # Full-page OCR can recognize a table header while its actual article
                 # numbers remain too small. Before downstream extraction, selectively
                 # re-OCR overlapping half-page regions at the winning orientation.
@@ -839,12 +868,12 @@ def recover_rotated_engineering_drawing_pages(
                 ).strip()
                 rescued_pages.append(page_number)
                 messages.append(
-                    f"PDF page {page_number}: orientation OCR recovered an orderable Article No./Name-Designation table at {best_rotation} degrees."
+                    f"PDF page {page_number}: orientation OCR recovered a coded drawing legend or orderable Article-No. table at {best_rotation} degrees."
                 )
                 messages.extend(focused_messages)
             else:
                 messages.append(
-                    f"PDF page {page_number}: alternate-orientation OCR was attempted but did not reveal a stronger orderable-parts table, so the original OCR was kept."
+                    f"PDF page {page_number}: alternate-orientation OCR was attempted but did not reveal stronger coded drawing details, so the original OCR was kept."
                 )
         except Exception as exc:
             messages.append(
@@ -1109,6 +1138,133 @@ def _is_engineering_article_table(markdown: Any) -> bool:
     return bool(article_signal and name_signal and drawing_signal)
 
 
+_ENGINEERING_LEGEND_HEADER_RE = re.compile(
+    r"^\s*(?:legend|legenda|key)\s*:?\s*$",
+    flags=re.IGNORECASE,
+)
+_ENGINEERING_LEGEND_CODE_RE = re.compile(
+    r"^(?:\d{1,4}|[A-Z]{1,5}\d{1,4}(?:[-/.][A-Z0-9]{1,6})*)$",
+    flags=re.IGNORECASE,
+)
+_ENGINEERING_LEGEND_STOP_RE = re.compile(
+    r"^(?:title|document\s*(?:no\.?|number)|drawing\s*(?:no\.?|number)|"
+    r"sheet\s*(?:no\.?|number)|revision|responsible\s+department|creator|"
+    r"approved|first\s+angle|book\s+no\.?|flanges?\b)",
+    flags=re.IGNORECASE,
+)
+_ENGINEERING_LEGEND_SPEC_RE = re.compile(
+    r"\s+(?=(?:DN\s*[/A-Z0-9]|PN\s*\d|ISO[- ]?G|INLET\b|OUTLET\b|"
+    r"CONNECTING\b|CONE\b|AL\s*[-:]|\d{2,4}\s*[-–]\s*\d{2,4}\s*V\b|"
+    r"M\d+(?:\s*[X×]\s*\d+)?\b|[Ø⌀]\s*\d))",
+    flags=re.IGNORECASE,
+)
+
+
+def _valid_engineering_legend_code(value: Any) -> str:
+    text = clean_text(value).upper().strip(" .,:;|#")
+    if not text or not _ENGINEERING_LEGEND_CODE_RE.fullmatch(text):
+        return ""
+    if _is_date_like_section_code(text):
+        return ""
+    return text
+
+
+def _clean_engineering_legend_description(value: Any) -> str:
+    text = clean_text(value).strip(" |:;-–—")
+    if not text:
+        return ""
+    # Keep the coded component/service name and discard the dimensional or
+    # installation specification that follows it. Markdown tables already keep
+    # these in separate cells; flattened OCR normally retains one of these markers.
+    text = _ENGINEERING_LEGEND_SPEC_RE.split(text, maxsplit=1)[0]
+    text = re.sub(r"\s+", " ", text).strip(" |:;-–—")
+    if not text or len(text) > 80 or not re.search(r"[A-Za-z]", text):
+        return ""
+    if _ENGINEERING_LEGEND_STOP_RE.match(text):
+        return ""
+    return text.upper()
+
+
+def _engineering_legend_entries(markdown: Any) -> list[tuple[str, str]]:
+    """Return source-coded entries from a labelled engineering drawing legend.
+
+    The parser is deliberately restricted to a visible Legend/Legenda/Key block.
+    It supports Markdown table cells and flattened aligned OCR, stops at the title
+    block, and never turns nearby dimensions or specifications into identifiers.
+    """
+    raw_lines = str(markdown or "").splitlines()
+    active = False
+    remaining = 0
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    for raw_line in raw_lines:
+        cleaned_line = clean_text(raw_line).strip()
+        header_candidate = re.sub(r"^[#>*+\-\s]+", "", cleaned_line)
+        header_candidate = header_candidate.strip(" |:;-–—")
+        header_cells = [
+            clean_text(cell).strip(" |:;-–—")
+            for cell in re.split(r"\s*\|\s*", cleaned_line)
+            if clean_text(cell).strip(" |:;-–—")
+        ]
+        if _ENGINEERING_LEGEND_HEADER_RE.fullmatch(header_candidate) or any(
+            _ENGINEERING_LEGEND_HEADER_RE.fullmatch(cell)
+            for cell in header_cells
+        ):
+            active = True
+            remaining = 28
+            continue
+        if not active:
+            continue
+        if remaining <= 0:
+            active = False
+            continue
+        remaining -= 1
+        if not cleaned_line:
+            continue
+
+        plain = re.sub(r"^[#>*+\-\s]+", "", cleaned_line).strip()
+        plain = plain.strip(" |")
+        if _ENGINEERING_LEGEND_STOP_RE.match(plain):
+            active = False
+            continue
+
+        cells = [
+            clean_text(cell).strip(" |:;-–—")
+            for cell in re.split(r"\s*\|\s*|\t+|\s{2,}", plain)
+            if clean_text(cell).strip(" |:;-–—")
+        ]
+        code = ""
+        description = ""
+        if len(cells) >= 2:
+            code = _valid_engineering_legend_code(cells[0])
+            description = _clean_engineering_legend_description(cells[1])
+        if not code:
+            match = re.match(
+                r"^\s*(?P<code>\d{1,4}|[A-Z]{1,5}\d{1,4}(?:[-/.][A-Z0-9]{1,6})*)"
+                r"\s+(?P<description>.+?)\s*$",
+                plain,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                code = _valid_engineering_legend_code(match.group("code"))
+                description = _clean_engineering_legend_description(
+                    match.group("description")
+                )
+        key = normalize_key(code)
+        if code and description and key not in seen:
+            seen.add(key)
+            entries.append((code, description))
+
+    # One isolated short token is too easy to confuse with a callout. A labelled
+    # legend containing at least two coherent entries is strong page-level evidence.
+    return entries if len(entries) >= 2 else []
+
+
+def _is_engineering_legend_page(markdown: Any) -> bool:
+    return bool(_engineering_legend_entries(markdown))
+
+
 # Backward-compatible internal alias. New logic is intentionally manufacturer-neutral.
 def _is_alfa_laval_article_drawing(markdown: Any) -> bool:
     return _is_engineering_article_table(markdown)
@@ -1149,6 +1305,13 @@ AUTOMATIC LAYOUT PROFILE - ENGINEERING DRAWING TITLE BLOCK + ARTICLE TABLE:
 - Reject a separate Pos. / Designation / Composition construction table as a spare
   table. CONDUCTOR, FILLER, WRAPPING, EMC SCREEN and SHEATH are not spare rows unless
   that logical row also has a genuine Article No.
+- A labelled drawing Legend/Legenda/Key can contain coded component entries even
+  when no Article-No. table is present. For a drawing parent that otherwise has no
+  detailed spare rows, preserve each printed legend code as ident_no and the short
+  English legend name as description_english. Ignore the dimensional/specification
+  continuation after that name. If the same page also has a genuine Article-No. /
+  Name-Designation table, extract the Article-No. table and do not duplicate its
+  legend callouts.
 - Never use chapter headings such as Dimension drawings including technical data,
   dates, sheet numbers, or revision numbers as the sub-machinery code/name.
 """.strip()
@@ -1252,6 +1415,14 @@ Benefit mapping rules:
     Repeated mentions of the same labelled spare number are evidence for one spare,
     not separate orderable rows unless they clearly belong to different parent
     components.
+6f. On an equipment drawing, a block explicitly headed Legend, Legenda, or Key may
+    define coded component/service entries. Use the exact printed legend code as
+    ident_no and only the short English legend name as description_english; exclude
+    dimensions, pressure ratings, connection details, voltage/frequency, inlet/outlet
+    text, and installation notes. Apply legend recovery only when that drawing parent
+    has no stronger detailed spare rows. When the page also contains an Article No. /
+    Name-Designation table, the Article-No. rows take priority and legend callouts are
+    supporting evidence rather than additional duplicate spares.
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
@@ -7988,6 +8159,198 @@ def merge_component_candidates_with_native_priority(
     }
     ocr = ocr.loc[~ocr_pages.isin(native_pages)].copy()
     return merge_submachinery_candidates(ocr, reconciled_native)
+
+
+def ensure_component_drawing_detail_spare_rows(
+    review_frame: pd.DataFrame | None,
+    extracted_pages: Sequence[tuple[int, str]],
+    component_candidates: pd.DataFrame | None,
+    default_unit: str = "PCS",
+) -> tuple[pd.DataFrame, int, int, int]:
+    """Add source-backed drawing-table rows and zero-detail legend rows.
+
+    Article-No./Name-Designation tables are always stronger than legends. A
+    labelled legend is used only when the exact drawing parent otherwise has no
+    detailed spare row. Existing CODE/PART NO values are never duplicated, which
+    preserves the application's global unique-code rule.
+
+    Returns ``(review, article_rows_added, legend_rows_added, duplicates_skipped)``.
+    """
+    review = (
+        review_frame.copy()
+        if review_frame is not None
+        else empty_review_dataframe()
+    )
+    for column in REVIEW_COLUMNS:
+        if column not in review.columns:
+            review[column] = False if column in {"INCLUDE", "READY"} else ""
+    if (
+        component_candidates is None
+        or component_candidates.empty
+        or not extracted_pages
+    ):
+        return review[REVIEW_COLUMNS].reset_index(drop=True), 0, 0, 0
+
+    unit = clean_text(default_unit).upper()
+    if unit not in UNIT_OPTIONS or not unit:
+        unit = "PCS"
+
+    page_text = {int(page): str(text or "") for page, text in extracted_pages}
+    direct_by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in _direct_table_rows(extracted_pages):
+        page_value = quantity_to_number(row.get("source_page"))
+        if page_value is not None:
+            direct_by_page.setdefault(int(page_value), []).append(dict(row))
+
+    existing_keys: set[str] = set()
+    for _, row in review.iterrows():
+        for value in (row.get("CODE", ""), row.get("PART NO", "")):
+            key = normalize_key(value)
+            if key:
+                existing_keys.add(key)
+
+    def parent_has_detail(code: str, name: str) -> bool:
+        code_key = normalize_key(code)
+        name_key = normalize_key(name)
+        for _, row in review.iterrows():
+            if not bool(row.get("INCLUDE", False)):
+                continue
+            row_identifier = normalize_key(
+                row.get("CODE", row.get("PART NO", ""))
+            )
+            if not row_identifier or row_identifier == code_key:
+                # The whole-drawing assembly row is a fallback, not a detailed spare.
+                continue
+            row_section = normalize_key(row.get("SECTION CODE", ""))
+            row_names = {
+                normalize_key(row.get("MACHINERY", "")),
+                normalize_key(row.get("DETECTED MACHINERY", "")),
+            }
+            if (code_key and row_section == code_key) or (name_key and name_key in row_names):
+                return True
+        return False
+
+    added_rows: list[dict[str, Any]] = []
+    article_added = 0
+    legend_added = 0
+    duplicates_skipped = 0
+
+    candidates = component_candidates.sort_values(
+        ["FIRST PAGE", "NAME"], na_position="last"
+    )
+    for _, candidate in candidates.iterrows():
+        if "INCLUDE" in component_candidates.columns and not bool(
+            candidate.get("INCLUDE", False)
+        ):
+            continue
+        code = _valid_drawing_heading_code(candidate.get("CODE", ""))
+        name = _clean_equipment_drawing_title(candidate.get("NAME", "")).upper()
+        page_value = quantity_to_number(candidate.get("FIRST PAGE"))
+        if not code or not name or page_value is None:
+            continue
+        page_number = int(page_value)
+        markdown = page_text.get(page_number, "")
+        if not markdown:
+            continue
+
+        def append_detail(
+            identifier: Any,
+            description: Any,
+            *,
+            item_no: Any = "",
+            quantity: Any = None,
+            source_kind: str,
+            confidence: float,
+        ) -> bool:
+            nonlocal duplicates_skipped
+            ident = clean_text(identifier).upper()
+            desc = clean_text(description).upper()
+            ident_key = normalize_key(ident)
+            if (
+                not ident
+                or not desc
+                or not ident_key
+                or ident_key == normalize_key(code)
+            ):
+                return False
+            if ident_key in existing_keys:
+                duplicates_skipped += 1
+                return False
+            existing_keys.add(ident_key)
+            row = {column: "" for column in REVIEW_COLUMNS}
+            row.update(
+                {
+                    "INCLUDE": True,
+                    "READY": False,
+                    "MACHINERY": name,
+                    "PART NO": ident,
+                    "DESCRIPTION": desc,
+                    "CODE": ident,
+                    "ITEM NO": clean_text(item_no).upper(),
+                    "UNIT": unit,
+                    "QNT": quantity_to_number(quantity),
+                    "SOURCE PAGE": page_number,
+                    "SECTION START PAGE": page_number,
+                    "TABLE TITLE": name,
+                    "SECTION CODE": code,
+                    "SECTION MAKER": clean_text(candidate.get("MAKER", "")).upper(),
+                    "SECTION MODEL": clean_text(candidate.get("MODEL", "")).upper(),
+                    "CONFIDENCE": confidence,
+                    "DETECTED MACHINERY": name,
+                    "ASSIGNMENT SOURCE": source_kind,
+                    "WARNING": f"Source: {source_kind.lower()}",
+                }
+            )
+            added_rows.append(row)
+            return True
+
+        page_direct_rows = direct_by_page.get(page_number, [])
+        if page_direct_rows:
+            for direct in page_direct_rows:
+                description = clean_text(
+                    direct.get(
+                        "description_raw",
+                        direct.get("description_english", direct.get("description", "")),
+                    )
+                )
+                if append_detail(
+                    direct.get("ident_no", direct.get("code", "")),
+                    description,
+                    item_no=direct.get("item_no", ""),
+                    quantity=direct.get("quantity"),
+                    source_kind="Embedded drawing Article-No. table",
+                    confidence=max(
+                        0.90,
+                        clamp_confidence(direct.get("confidence", 0.90)),
+                    ),
+                ):
+                    article_added += 1
+            # A genuine Article-No. table is the orderable source for this page;
+            # legend callouts are not duplicated as separate rows.
+            continue
+
+        if parent_has_detail(code, name):
+            continue
+        for legend_code, legend_name in _engineering_legend_entries(markdown):
+            if append_detail(
+                legend_code,
+                legend_name,
+                source_kind="Equipment drawing legend",
+                confidence=0.88,
+            ):
+                legend_added += 1
+
+    if added_rows:
+        review = pd.concat(
+            [review, pd.DataFrame(added_rows, columns=REVIEW_COLUMNS)],
+            ignore_index=True,
+        )
+    return (
+        review[REVIEW_COLUMNS].reset_index(drop=True),
+        article_added,
+        legend_added,
+        duplicates_skipped,
+    )
 
 
 def ensure_component_assembly_spare_rows(
