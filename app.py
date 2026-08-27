@@ -95,6 +95,7 @@ except ImportError:
 try:
     from tools import (
         apply_authoritative_explicit_spare_rows,
+        ensure_component_drawing_detail_spare_rows,
         ensure_component_assembly_spare_rows,
         linked_machinery_rows_for_export,
         merge_component_candidates_with_native_priority,
@@ -112,6 +113,11 @@ except ImportError:
     ):
         return review_frame.copy(), 0, 0
 
+    def ensure_component_drawing_detail_spare_rows(
+        review_frame, extracted_pages, component_candidates, default_unit="PCS"
+    ):
+        return review_frame.copy(), 0, 0, 0
+
     def merge_component_candidates_with_native_priority(
         ocr_candidates, native_candidates
     ):
@@ -126,7 +132,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.7"
+APP_VERSION = "4.18.8"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2944,9 +2950,26 @@ if active_workflow_step == "3. Sub-machineries":
                 native_component_candidates,
             )
             previous_review = st.session_state.spare_review.copy()
+            detail_context_pages = _merge_pdf_context_pages(
+                ocr_context_pages,
+                native_context_pages,
+            )
+            (
+                detailed_review,
+                drawing_article_rows_added,
+                drawing_legend_rows_added,
+                drawing_detail_duplicates_skipped,
+            ) = ensure_component_drawing_detail_spare_rows(
+                previous_review,
+                detail_context_pages,
+                component_candidates,
+                default_unit=str(
+                    st.session_state.get("default_unit", "PCS") or "PCS"
+                ),
+            )
             upgraded_review, drawing_spares_added, drawing_spares_reconciled = (
                 ensure_component_assembly_spare_rows(
-                    previous_review,
+                    detailed_review,
                     component_candidates,
                     default_unit=str(
                         st.session_state.get("default_unit", "PCS") or "PCS"
@@ -2958,8 +2981,11 @@ if active_workflow_step == "3. Sub-machineries":
                 st.session_state.spare_review = upgraded_review
                 upgrade_message = (
                     "Upgraded drawing hierarchy: added "
+                    f"{drawing_article_rows_added} embedded Article-No. row(s), "
+                    f"{drawing_legend_rows_added} coded legend row(s), "
                     f"{drawing_spares_added} assembly spare row(s) and reconciled "
-                    f"{drawing_spares_reconciled} existing row(s)."
+                    f"{drawing_spares_reconciled} existing row(s); skipped "
+                    f"{drawing_detail_duplicates_skipped} repeated drawing-detail code(s)."
                 )
                 st.session_state.extraction_log = list(
                     dict.fromkeys(
@@ -3468,13 +3494,39 @@ if active_workflow_step == "2. OCR":
                             extracted_pages,
                             fallback_pages=pre_candidate_pages,
                         )
+                        # Searchable PDF text often proves a drawing title/code even
+                        # when the embedded legend or Article-No. table is sideways
+                        # and absent from the first OCR pass. Include those exact
+                        # drawing pages in orientation rescue instead of limiting the
+                        # retry to pages that already looked like spare tables.
+                        pre_native_context_pages = _extract_native_pdf_context_pages(
+                            pdf_bytes,
+                            page_indexes=selected_pages,
+                        )
+                        pre_native_components = build_component_drawing_candidates(
+                            pre_native_context_pages,
+                            current_main_row(),
+                            source_document_name=source_file.name,
+                        )
+                        rescue_page_numbers = {
+                            int(page) for page, _ in pre_structure_pages
+                        }
+                        if not pre_native_components.empty:
+                            rescue_page_numbers.update(
+                                int(value)
+                                for value in pd.to_numeric(
+                                    pre_native_components["FIRST PAGE"],
+                                    errors="coerce",
+                                ).dropna()
+                            )
                         extracted_pages, rotated_rescue_messages, rotated_rescued_pages = (
                             recover_rotated_engineering_drawing_pages(
                                 api_key=api_key,
                                 pdf_bytes=pdf_bytes,
                                 extracted_pages=extracted_pages,
-                                candidate_page_numbers=[page for page, _ in pre_structure_pages],
+                                candidate_page_numbers=sorted(rescue_page_numbers),
                                 progress=show_progress,
+                                max_pages=max(12, min(40, len(rescue_page_numbers))),
                             )
                         )
 
@@ -3515,10 +3567,10 @@ if active_workflow_step == "2. OCR":
                         "Drawing orientation OCR rescue": {
                             "provider": "Mistral",
                             "model": "mistral-ocr-latest",
-                            "status": "Completed" if rotated_rescued_pages else ("Attempted - no Article table found" if rotated_rescue_messages else "Not needed"),
+                            "status": "Completed" if rotated_rescued_pages else ("Attempted - no coded drawing detail found" if rotated_rescue_messages else "Not needed"),
                             "detail": (
                                 (
-                                    f"Recovered orderable Article No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}. "
+                                    f"Recovered coded drawing legends or Article-No. tables on PDF page(s): {', '.join(map(str, rotated_rescued_pages))}. "
                                     + " ".join(
                                         message for message in rotated_rescue_messages
                                         if "focused region OCR" in message
@@ -3853,6 +3905,35 @@ if active_workflow_step == "2. OCR":
                         ocr_component_candidates,
                         native_component_candidates,
                     )
+                    (
+                        combined_review,
+                        drawing_article_rows_added,
+                        drawing_legend_rows_added,
+                        drawing_detail_duplicates_skipped,
+                    ) = ensure_component_drawing_detail_spare_rows(
+                        combined_review,
+                        catalog_context_pages,
+                        component_candidates,
+                        default_unit=default_unit,
+                    )
+                    if (
+                        drawing_article_rows_added
+                        or drawing_legend_rows_added
+                        or drawing_detail_duplicates_skipped
+                    ):
+                        drawing_detail_message = (
+                            "Recovered source-backed drawing details: added "
+                            f"{drawing_article_rows_added} embedded Article-No. row(s) "
+                            f"and {drawing_legend_rows_added} coded legend row(s); "
+                            f"skipped {drawing_detail_duplicates_skipped} repeated code(s)."
+                        )
+                        extraction_messages.append(drawing_detail_message)
+                        st.session_state.extraction_log = list(
+                            dict.fromkeys(
+                                list(st.session_state.extraction_log)
+                                + [drawing_detail_message]
+                            )
+                        )
                     combined_review, drawing_spares_added, drawing_spares_reconciled = (
                         ensure_component_assembly_spare_rows(
                             combined_review,
