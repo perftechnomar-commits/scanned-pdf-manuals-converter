@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.10"
+TOOLS_VERSION = "4.18.12"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -664,6 +664,7 @@ def _focused_engineering_region_ocr(
     rotation: int,
     base_markdown: str,
     max_regions: int = 4,
+    force: bool = False,
 ) -> tuple[str, list[str]]:
     """Recover tiny orderable tables that full-page OCR can detect but not read.
 
@@ -678,7 +679,11 @@ def _focused_engineering_region_ocr(
     article_table = _is_engineering_article_table(combined)
     legend_page = _is_engineering_legend_page(combined)
     variant_rows = _headerless_engineering_variant_rows(0, combined, {})
-    if not combined or not (article_table or legend_page or variant_rows):
+    # ``force`` is used only after native PDF evidence has already proved that the
+    # page is an equipment drawing. It breaks the previous circular dependency in
+    # which a tiny table had to be recognized by full-page OCR before it was allowed
+    # to receive the higher-resolution OCR needed to recognize that same table.
+    if not force and (not combined or not (article_table or legend_page or variant_rows)):
         return combined, messages
 
     metadata = _engineering_title_block_metadata(combined, require_article_table=False)
@@ -696,7 +701,7 @@ def _focused_engineering_region_ocr(
     # prove the pattern but do not prove coverage, so keep focused OCR active until
     # a more representative set has been read. Ordinary article/legend pages retain
     # the lower threshold used by the prior build.
-    sufficient_identifier_count = 8 if variant_rows else 2
+    sufficient_identifier_count = 20 if (article_table or variant_rows) else 2
     if identifier_count >= sufficient_identifier_count:
         return combined, messages
 
@@ -760,15 +765,25 @@ def _focused_engineering_region_ocr(
                 )
             )
             candidate_score = _orientation_table_evidence(candidate)
-            if candidate_count > identifier_count or candidate_score > best_score + 2:
+            candidate_has_details = bool(
+                candidate_article_table
+                or candidate_legend_page
+                or candidate_variant_rows
+            )
+            if candidate_has_details and (
+                candidate_count > identifier_count or candidate_score > best_score + 2
+            ):
                 combined = candidate
                 identifier_count = candidate_count
                 best_score = candidate_score
                 section_code = candidate_code
                 used_regions += 1
             sufficient_identifier_count = (
-                8
-                if _is_headerless_engineering_variant_table(combined)
+                20
+                if (
+                    _is_engineering_article_table(combined)
+                    or _is_headerless_engineering_variant_table(combined)
+                )
                 else 3
             )
             if identifier_count >= sufficient_identifier_count:
@@ -871,31 +886,71 @@ def recover_rotated_engineering_drawing_pages(
                     best_markdown, best_rotation, best_score = rescue_markdown, rotation, score
                     break
 
-            if best_markdown and (
+            # A first OCR pass may already see the Article-No. header but only a
+            # fraction of a dense table. Keep the original orientation eligible for
+            # focused region OCR even when no rotated pass scores higher.
+            if not best_markdown and (
+                _is_engineering_article_table(original_lookup[page_number])
+                or _is_engineering_legend_page(original_lookup[page_number])
+                or _is_headerless_engineering_variant_table(
+                    original_lookup[page_number]
+                )
+            ):
+                best_markdown = original_lookup[page_number]
+                best_rotation = 0
+                best_score = original_score
+
+            # Native/source-text gating already proved this is a likely equipment
+            # drawing. If every full-page orientation missed its tiny orderable
+            # matrix, keep the original pass as the base and let focused crops find
+            # the Article-No. / Name-Designation rows directly.
+            if not best_markdown:
+                best_markdown = original_lookup[page_number]
+                best_rotation = 0
+                best_score = original_score
+
+            best_has_details = bool(
                 _is_engineering_article_table(best_markdown)
                 or _is_engineering_legend_page(best_markdown)
                 or _is_headerless_engineering_variant_table(best_markdown)
-            ) and best_score > original_score:
-                # Full-page OCR can recognize a table header while its actual article
-                # numbers remain too small. Before downstream extraction, selectively
-                # re-OCR overlapping half-page regions at the winning orientation.
-                focused_markdown, focused_messages = _focused_engineering_region_ocr(
-                    api_key=api_key,
-                    pdf_bytes=pdf_bytes,
-                    page_number=page_number,
-                    rotation=best_rotation,
-                    base_markdown=best_markdown,
-                )
+            )
+            focused_messages: list[str] = []
+            focused_markdown = best_markdown
+            focused_markdown, focused_messages = _focused_engineering_region_ocr(
+                api_key=api_key,
+                pdf_bytes=pdf_bytes,
+                page_number=page_number,
+                rotation=best_rotation,
+                base_markdown=best_markdown,
+                force=not best_has_details,
+            )
+            focused_has_details = bool(
+                _is_engineering_article_table(focused_markdown)
+                or _is_engineering_legend_page(focused_markdown)
+                or _is_headerless_engineering_variant_table(focused_markdown)
+            )
+
+            if focused_has_details and (
+                best_score > original_score
+                or best_rotation == 0
+                or focused_markdown != best_markdown
+            ):
                 best_markdown = focused_markdown or best_markdown
-                updated[page_number] = (
-                    original_lookup[page_number]
-                    + f"\n\n===== ORIENTATION OCR RESCUE {best_rotation} DEG =====\n"
-                    + best_markdown
-                ).strip()
+                if best_rotation == 0:
+                    updated[page_number] = best_markdown
+                    messages.append(
+                        f"PDF page {page_number}: focused OCR expanded the orderable drawing table in its original orientation."
+                    )
+                else:
+                    updated[page_number] = (
+                        original_lookup[page_number]
+                        + f"\n\n===== ORIENTATION OCR RESCUE {best_rotation} DEG =====\n"
+                        + best_markdown
+                    ).strip()
+                    messages.append(
+                        f"PDF page {page_number}: orientation OCR recovered a coded drawing legend or orderable spare table at {best_rotation} degrees."
+                    )
                 rescued_pages.append(page_number)
-                messages.append(
-                    f"PDF page {page_number}: orientation OCR recovered a coded drawing legend or orderable spare table at {best_rotation} degrees."
-                )
                 messages.extend(focused_messages)
             else:
                 messages.append(
@@ -5080,6 +5135,18 @@ def _valid_drawing_heading_code(value: Any) -> str:
     real engineering document identifier. Requiring at least five digits prevents TOC
     section numbers, item tags, words and OCR fragments from becoming machinery codes.
     """
+    raw_text = ("" if value is None else str(value)).upper().strip(" .,:;|")
+    # A native searchable-text layer may expose the internal page label rather
+    # than the title-block Document No. (for example ``9004714_p1``). Do not accept
+    # that compound token as a genuine machinery code. The drawing-heading parser
+    # below may recover the base only when the same heading explicitly confirms a
+    # multi-page drawing.
+    if re.fullmatch(
+        r"[A-Z0-9][A-Z0-9./-]{4,24}(?:_|\s+)P(?:AGE)?(?:_|\s*)\d{1,3}",
+        raw_text,
+        flags=re.I,
+    ):
+        return ""
     text = clean_text(value).upper().strip(" .,:;|")
     # Native PDF text occasionally splits a seven-digit drawing number after its
     # fifth digit (``90121 03``). Conversely, a six-or-more digit drawing number
@@ -5117,6 +5184,29 @@ def _valid_drawing_heading_code(value: Any) -> str:
     return candidate
 
 
+def _drawing_heading_document_code(value: Any, heading_context: Any = "") -> str:
+    """Return the source Document No. while excluding native page labels.
+
+    ``<document>_p1`` is reduced to ``<document>`` only when the nearby component
+    heading explicitly says that the drawing has multiple pages. A compact code
+    such as ``9004714P1`` remains valid because it may genuinely be printed in a
+    title block; there is no separator proving that ``P1`` is pagination.
+    """
+    text = ("" if value is None else str(value)).upper().strip(" .,:;|")
+    page_label = re.fullmatch(
+        r"(?P<base>[A-Z0-9][A-Z0-9./-]{4,24})(?:_|\s+)"
+        r"P(?:AGE)?(?:_|\s*)?(?P<page>\d{1,3})",
+        text,
+        flags=re.I,
+    )
+    if not page_label:
+        return _valid_drawing_heading_code(text)
+    heading = clean_text(heading_context)
+    if not re.search(r"\(\s*\d+\s+PAGES?\s*\)", heading, flags=re.I):
+        return ""
+    return _valid_drawing_heading_code(page_label.group("base"))
+
+
 def _drawing_heading_sections(
     extracted_pages: Sequence[tuple[int, str]],
 ) -> list[dict[str, Any]]:
@@ -5132,6 +5222,15 @@ def _drawing_heading_sections(
     seen: set[tuple[str, str]] = set()
     for page_number, raw_text in extracted_pages:
         text = str(raw_text or "")
+        # Preserve the separator that proves ``_p1`` is a page label before the
+        # general Markdown cleaner removes underscores. A genuine compact ``P1``
+        # suffix is deliberately unchanged.
+        text = re.sub(
+            r"(?i)(?<![A-Z0-9])([A-Z0-9./-]*\d[A-Z0-9./-]*)_"
+            r"P(?:AGE)?_?(\d{1,3})(?![A-Z0-9])",
+            r"\1 P\2",
+            text,
+        )
         lines = [clean_text(line) for line in text.splitlines() if clean_text(line)]
         if not lines:
             continue
@@ -5194,7 +5293,9 @@ def _drawing_heading_sections(
                     continue
                 if not _DRAWING_CODE_PREFIX_RE.fullmatch(candidate_line):
                     continue
-                candidate = _valid_drawing_heading_code(candidate_line)
+                candidate = _drawing_heading_document_code(
+                    candidate_line, raw_title
+                )
                 if not candidate:
                     continue
                 code = candidate
@@ -5242,7 +5343,17 @@ def _unnumbered_equipment_drawing_sections(
     seen: set[tuple[str, str]] = set()
 
     for page_number, raw_text in extracted_pages:
-        lines = [clean_text(line) for line in str(raw_text or "").splitlines() if clean_text(line)]
+        source_text = re.sub(
+            r"(?i)(?<![A-Z0-9])([A-Z0-9./-]*\d[A-Z0-9./-]*)_"
+            r"P(?:AGE)?_?(\d{1,3})(?![A-Z0-9])",
+            r"\1 P\2",
+            str(raw_text or ""),
+        )
+        lines = [
+            clean_text(line)
+            for line in source_text.splitlines()
+            if clean_text(line)
+        ]
         if not lines:
             continue
 
@@ -5280,7 +5391,9 @@ def _unnumbered_equipment_drawing_sections(
                     continue
                 if not _DRAWING_CODE_PREFIX_RE.fullmatch(candidate_line):
                     continue
-                candidate = _valid_drawing_heading_code(candidate_line)
+                candidate = _drawing_heading_document_code(
+                    candidate_line, line
+                )
                 if candidate:
                     code = candidate
                     break
@@ -8400,6 +8513,47 @@ def ensure_component_drawing_detail_spare_rows(
     candidates = component_candidates.sort_values(
         ["FIRST PAGE", "NAME"], na_position="last"
     )
+    # A component drawing can continue on one or two pages without repeating the
+    # numbered section heading. Link only continuation pages that independently
+    # expose orderable table/legend evidence and stop before the next component.
+    # This recovers, for example, a second V212-31 drawing page without creating a
+    # new sub-machinery from its document reference.
+    candidate_rows = [row.copy() for _, row in candidates.iterrows()]
+    expanded_candidate_rows: list[pd.Series] = []
+    for position, candidate in enumerate(candidate_rows):
+        expanded_candidate_rows.append(candidate)
+        first_value = quantity_to_number(candidate.get("FIRST PAGE"))
+        if first_value is None:
+            continue
+        first_page = int(first_value)
+        next_page = None
+        for following in candidate_rows[position + 1:]:
+            following_value = quantity_to_number(following.get("FIRST PAGE"))
+            if following_value is not None and int(following_value) > first_page:
+                next_page = int(following_value)
+                break
+        continuation_end = first_page + 2
+        if next_page is not None:
+            continuation_end = min(continuation_end, next_page - 1)
+        for continuation_page in range(first_page + 1, continuation_end + 1):
+            continuation_markdown = page_text.get(continuation_page, "")
+            if not continuation_markdown:
+                continue
+            has_source_details = bool(
+                direct_by_page.get(continuation_page)
+                or _headerless_engineering_variant_rows(
+                    continuation_page, continuation_markdown, {}
+                )
+                or _engineering_legend_entries(continuation_markdown)
+            )
+            if not has_source_details:
+                continue
+            continuation_candidate = candidate.copy()
+            continuation_candidate["FIRST PAGE"] = continuation_page
+            continuation_candidate["LAST PAGE"] = continuation_page
+            expanded_candidate_rows.append(continuation_candidate)
+    if expanded_candidate_rows:
+        candidates = pd.DataFrame(expanded_candidate_rows)
     for _, candidate in candidates.iterrows():
         if "INCLUDE" in component_candidates.columns and not bool(
             candidate.get("INCLUDE", False)
@@ -8535,19 +8689,16 @@ def ensure_component_drawing_detail_spare_rows(
     )
 
 
-def ensure_component_assembly_spare_rows(
+def remove_component_assembly_spare_rows(
     review_frame: pd.DataFrame | None,
     component_candidates: pd.DataFrame | None,
-    default_unit: str = "PCS",
-) -> tuple[pd.DataFrame, int, int]:
-    """Represent every valid equipment drawing as a linked assembly spare.
+) -> tuple[pd.DataFrame, int]:
+    """Remove rows that repeat a drawing parent as one of its own spare parts.
 
-    A drawing title block defines both the sub-machinery parent (Document No. +
-    Title) and an orderable/identifiable whole-assembly row. Existing exact-code
-    rows are reconciled instead of duplicated. The strict export hierarchy can then
-    retain drawing-defined machinery without inventing an unrelated child code.
-
-    Returns ``(review, added_count, reconciled_count)``.
+    A title-block Document No./Title defines hierarchy only. Genuine children must
+    come from Article-No., orderable table, explicit spare-number, or legend evidence.
+    Therefore a row whose spare CODE/PART NO equals its own component drawing code is
+    removed, including assembly fallbacks stored by builds 4.18.4-4.18.11.
     """
     review = (
         review_frame.copy()
@@ -8557,103 +8708,70 @@ def ensure_component_assembly_spare_rows(
     for column in REVIEW_COLUMNS:
         if column not in review.columns:
             review[column] = False if column in {"INCLUDE", "READY"} else ""
-    if component_candidates is None or component_candidates.empty:
-        return review[REVIEW_COLUMNS].reset_index(drop=True), 0, 0
+    if review.empty or component_candidates is None or component_candidates.empty:
+        return review[REVIEW_COLUMNS].reset_index(drop=True), 0
 
-    unit = clean_text(default_unit).upper()
-    if unit not in UNIT_OPTIONS or not unit:
-        unit = "PCS"
-    existing_by_code: dict[str, list[Any]] = {}
-    for index, row in review.iterrows():
-        for value in (row.get("CODE", ""), row.get("PART NO", "")):
-            key = normalize_key(value)
-            if key:
-                existing_by_code.setdefault(key, []).append(index)
-
-    added_rows: list[dict[str, Any]] = []
-    added = 0
-    reconciled = 0
+    component_names: dict[str, set[str]] = {}
     for _, candidate in component_candidates.iterrows():
-        if "INCLUDE" in component_candidates.columns and not bool(
-            candidate.get("INCLUDE", False)
-        ):
-            continue
         code = _valid_drawing_heading_code(candidate.get("CODE", ""))
         name = _clean_equipment_drawing_title(candidate.get("NAME", "")).upper()
-        if not code or not _is_equipment_component_title(name):
-            continue
         code_key = normalize_key(code)
-        page_value = pd.to_numeric(
-            pd.Series([candidate.get("FIRST PAGE")]), errors="coerce"
-        ).iloc[0]
-        source_page = None if pd.isna(page_value) else int(page_value)
-        confidence = max(
-            0.95,
-            clamp_confidence(candidate.get("CONFIDENCE", 0.95)),
-        )
+        if not code_key or not _is_equipment_component_title(name):
+            continue
+        component_names.setdefault(code_key, set()).add(normalize_key(name))
 
-        matching_indexes = list(dict.fromkeys(existing_by_code.get(code_key, [])))
-        if matching_indexes:
-            for index in matching_indexes:
-                assignment_source = clean_text(
-                    review.at[index, "ASSIGNMENT SOURCE"]
-                ).lower()
-                if "manual" not in assignment_source:
-                    review.at[index, "MACHINERY"] = name
-                    review.at[index, "DETECTED MACHINERY"] = name
-                    review.at[index, "SECTION CODE"] = code
-                    review.at[index, "ASSIGNMENT SOURCE"] = (
-                        "Equipment drawing title block"
-                    )
-                    if not clean_text(review.at[index, "DESCRIPTION"]):
-                        review.at[index, "DESCRIPTION"] = name
-                    if not clean_text(review.at[index, "TABLE TITLE"]):
-                        review.at[index, "TABLE TITLE"] = "Equipment drawing"
-                    if not clean_text(review.at[index, "SOURCE PAGE"]):
-                        review.at[index, "SOURCE PAGE"] = source_page
-                    if not clean_text(review.at[index, "SECTION START PAGE"]):
-                        review.at[index, "SECTION START PAGE"] = source_page
-                    review.at[index, "CONFIDENCE"] = max(
-                        confidence,
-                        clamp_confidence(review.at[index, "CONFIDENCE"]),
-                    )
-            reconciled += 1
+    known_component_names = {
+        name_key
+        for names in component_names.values()
+        for name_key in names
+        if name_key
+    }
+    remove_indexes: list[Any] = []
+    for index, row in review.iterrows():
+        row_identifiers = {
+            normalize_key(row.get("CODE", "")),
+            normalize_key(row.get("PART NO", "")),
+        }
+        row_identifiers.discard("")
+        # A code belongs to exactly one hierarchy level. Once it has been proven
+        # as a component drawing Document No., it cannot also remain a spare code,
+        # even when a weak AI assignment attached that row to the wrong parent.
+        # The previous same-parent condition allowed precisely that misassignment
+        # to escape cleanup and appear in the Spares step.
+        if row_identifiers.intersection(component_names):
+            remove_indexes.append(index)
             continue
 
-        row = {column: "" for column in REVIEW_COLUMNS}
-        row.update(
-            {
-                "INCLUDE": True,
-                "READY": False,
-                "MACHINERY": name,
-                "PART NO": code,
-                "DESCRIPTION": name,
-                "CODE": code,
-                "ITEM NO": "",
-                "UNIT": unit,
-                "QNT": 1,
-                "SOURCE PAGE": source_page,
-                "SECTION START PAGE": source_page,
-                "TABLE TITLE": "Equipment drawing",
-                "SECTION CODE": code,
-                "SECTION MAKER": clean_text(candidate.get("MAKER", "")),
-                "SECTION MODEL": clean_text(candidate.get("MODEL", "")),
-                "CONFIDENCE": confidence,
-                "DETECTED MACHINERY": name,
-                "ASSIGNMENT SOURCE": "Equipment drawing title block",
-                "WARNING": "Source: equipment drawing title block assembly",
-            }
+        # Builds 4.18.4-4.18.11 also emitted explicit title-block assembly rows.
+        # Remove those by their source provenance when their description is the
+        # component title; this covers an old OCR-suffixed identifier without
+        # risking deletion of a genuine source-table row with a similar name.
+        assignment_source = clean_text(row.get("ASSIGNMENT SOURCE", "")).lower()
+        warning = clean_text(row.get("WARNING", "")).lower()
+        title_block_fallback = bool(
+            "equipment drawing title block" in assignment_source
+            or "title block assembly" in warning
         )
-        added_rows.append(row)
-        existing_by_code.setdefault(code_key, []).append(len(review) + len(added_rows) - 1)
-        added += 1
+        description_key = normalize_key(row.get("DESCRIPTION", ""))
+        if title_block_fallback and description_key in known_component_names:
+            remove_indexes.append(index)
 
-    if added_rows:
-        review = pd.concat(
-            [review, pd.DataFrame(added_rows, columns=REVIEW_COLUMNS)],
-            ignore_index=True,
-        )
-    return review[REVIEW_COLUMNS].reset_index(drop=True), added, reconciled
+    if remove_indexes:
+        review = review.drop(index=remove_indexes)
+    return review[REVIEW_COLUMNS].reset_index(drop=True), len(remove_indexes)
+
+
+def ensure_component_assembly_spare_rows(
+    review_frame: pd.DataFrame | None,
+    component_candidates: pd.DataFrame | None,
+    default_unit: str = "PCS",
+) -> tuple[pd.DataFrame, int, int]:
+    """Deprecated compatibility wrapper; assembly fallbacks are no longer created."""
+    cleaned, removed = remove_component_assembly_spare_rows(
+        review_frame,
+        component_candidates,
+    )
+    return cleaned, 0, removed
 
 def build_submachinery_candidates(
     review_frame: pd.DataFrame,
