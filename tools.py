@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.12"
+TOOLS_VERSION = "4.19.1"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -538,6 +538,310 @@ def ocr_image_url(api_key: str, image_url: str) -> list[tuple[int, str]]:
 def clean_markdown(value: Any) -> str:
     text = "" if value is None else str(value)
     return text.replace("\x00", "").strip()
+
+
+def extract_positioned_pdf_context_pages(
+    pdf_bytes: bytes,
+    page_indexes: Sequence[int] | None = None,
+) -> list[tuple[int, str]]:
+    """Extract searchable PDF text while retaining layout-aware line order.
+
+    PyMuPDF exposes word coordinates that are lost by ordinary flat text
+    extraction.  Rebuilding lines from those coordinates gives the deterministic
+    parsers a useful native-first path for digitally generated manuals, while
+    image-only drawings simply fall through to OCR.  The dependency is optional at
+    runtime so an unavailable local engine never prevents the existing Mistral path.
+    """
+    if not pdf_bytes:
+        return []
+    try:
+        import pymupdf
+    except Exception:
+        return []
+
+    try:
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return []
+    indexes = (
+        list(page_indexes)
+        if page_indexes is not None
+        else list(range(len(document)))
+    )
+    pages: list[tuple[int, str]] = []
+    try:
+        for raw_index in indexes:
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= index < len(document):
+                continue
+            try:
+                words = document[index].get_text("words", sort=False)
+            except Exception:
+                words = []
+            grouped: dict[tuple[int, int], list[tuple[float, int, str]]] = {}
+            for word in words:
+                if len(word) < 8:
+                    continue
+                text = clean_text(word[4])
+                if not text:
+                    continue
+                block_number = int(word[5])
+                line_number = int(word[6])
+                word_number = int(word[7])
+                grouped.setdefault((block_number, line_number), []).append(
+                    (float(word[0]), word_number, text)
+                )
+            lines = [
+                " ".join(
+                    item[2]
+                    for item in sorted(values, key=lambda item: (item[0], item[1]))
+                )
+                for _, values in sorted(grouped.items())
+            ]
+            text = "\n".join(line for line in lines if line.strip()).strip()
+            if text:
+                pages.append((index + 1, text))
+    finally:
+        document.close()
+    return pages
+
+
+_LOCAL_RAPIDOCR_ENGINE: Any | None = None
+
+
+def _local_rapidocr_engine() -> Any:
+    """Create the CPU OCR engine once per worker process."""
+    global _LOCAL_RAPIDOCR_ENGINE
+    if _LOCAL_RAPIDOCR_ENGINE is None:
+        from rapidocr import RapidOCR
+
+        _LOCAL_RAPIDOCR_ENGINE = RapidOCR()
+    return _LOCAL_RAPIDOCR_ENGINE
+
+
+def _rapidocr_layout_markdown(result: Any) -> str:
+    """Convert OCR boxes into stable, pipe-delimited spatial rows."""
+    boxes = getattr(result, "boxes", None)
+    texts = getattr(result, "txts", None)
+    scores = getattr(result, "scores", None)
+    if boxes is None or texts is None:
+        return ""
+    score_values = list(scores or [1.0] * len(texts))
+    items: list[dict[str, Any]] = []
+    for box, raw_text, score in zip(boxes, texts, score_values):
+        text = clean_text(raw_text)
+        try:
+            numeric_score = float(score)
+        except (TypeError, ValueError):
+            numeric_score = 0.0
+        if not text or numeric_score < 0.35:
+            continue
+        try:
+            xs = [float(point[0]) for point in box]
+            ys = [float(point[1]) for point in box]
+        except (TypeError, ValueError, IndexError):
+            continue
+        x0 = min(xs)
+        y0, y1 = min(ys), max(ys)
+        items.append(
+            {
+                "x0": x0,
+                "cy": (y0 + y1) / 2.0,
+                "height": max(1.0, y1 - y0),
+                "text": text,
+            }
+        )
+    if not items:
+        return ""
+
+    items.sort(key=lambda item: (item["cy"], item["x0"]))
+    rows: list[list[dict[str, Any]]] = []
+    for item in items:
+        best_row: list[dict[str, Any]] | None = None
+        best_distance = float("inf")
+        # Items are y-sorted; only the most recent rows can overlap this token.
+        for row in rows[-10:]:
+            centers = sorted(float(value["cy"]) for value in row)
+            heights = sorted(float(value["height"]) for value in row)
+            row_center = centers[len(centers) // 2]
+            row_height = heights[len(heights) // 2]
+            distance = abs(float(item["cy"]) - row_center)
+            if distance <= max(5.0, row_height * 0.55) and distance < best_distance:
+                best_row = row
+                best_distance = distance
+        if best_row is None:
+            rows.append([item])
+        else:
+            best_row.append(item)
+
+    lines: list[str] = []
+    for row in rows:
+        ordered = sorted(row, key=lambda item: item["x0"])
+        # OCR normally returns one box per table cell. Pipe boundaries preserve
+        # those cells for both formal Article-No. and headerless variant parsers.
+        line = " | ".join(clean_text(item["text"]) for item in ordered)
+        if line.strip(" |"):
+            lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _local_drawing_evidence(
+    page_number: int,
+    markdown: str,
+) -> tuple[int, int, int, int]:
+    """Return (score, direct rows, variant rows, legend rows)."""
+    direct_rows = _direct_table_rows([(int(page_number), markdown)])
+    variant_rows = _headerless_engineering_variant_rows(
+        int(page_number), markdown, _page_metadata(int(page_number), markdown)
+    )
+    legend_rows = _engineering_legend_entries(markdown)
+    identifiers = {
+        normalize_key(row.get("ident_no", row.get("code", "")))
+        for row in list(direct_rows) + list(variant_rows)
+        if normalize_key(row.get("ident_no", row.get("code", "")))
+    }
+    score = (
+        len(identifiers) * 12
+        + len(legend_rows) * 5
+        + _orientation_table_evidence(markdown)
+    )
+    return score, len(direct_rows), len(variant_rows), len(legend_rows)
+
+
+def recover_local_engineering_drawing_pages(
+    pdf_bytes: bytes,
+    native_pages: Sequence[tuple[int, str]],
+    candidate_page_numbers: Sequence[int],
+    progress: ProgressCallback | None = None,
+    max_pages: int = 40,
+    dpi: int = 220,
+) -> tuple[list[tuple[int, str]], list[str], list[int]]:
+    """Recover dense drawing tables locally with CPU OCR, failing open.
+
+    Only pages already proven to be equipment drawings by native title/code
+    evidence are rendered.  A page is allowed to replace paid OCR only when the
+    result contains at least three coherent orderable rows, two formal source rows,
+    or a multi-entry coded legend.  Otherwise the page remains eligible for the
+    existing Mistral OCR path.
+    """
+    messages: list[str] = []
+    if not pdf_bytes or not candidate_page_numbers:
+        return [], messages, []
+    try:
+        import io as _io
+        import numpy as np
+        import pymupdf
+        from PIL import Image
+        engine = _local_rapidocr_engine()
+    except Exception as exc:
+        return [], [
+            "Local CPU drawing OCR was unavailable and was bypassed; "
+            f"Mistral OCR remains active ({type(exc).__name__})."
+        ], []
+
+    native_lookup = {int(page): str(text or "") for page, text in native_pages}
+    ordered_pages = list(
+        dict.fromkeys(
+            int(page)
+            for page in candidate_page_numbers
+            if quantity_to_number(page) is not None
+        )
+    )[: max(1, int(max_pages))]
+    try:
+        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as exc:
+        return [], [
+            "Local CPU drawing OCR could not open the PDF and was bypassed "
+            f"({type(exc).__name__})."
+        ], []
+
+    recovered: list[tuple[int, str]] = []
+    confirmed: list[int] = []
+    try:
+        for position, page_number in enumerate(ordered_pages, start=1):
+            if progress:
+                progress(
+                    position - 1,
+                    len(ordered_pages),
+                    f"Local CPU drawing OCR {position}/{len(ordered_pages)}",
+                )
+            if not 1 <= page_number <= len(document):
+                continue
+            try:
+                scale = max(1.5, min(4.2, float(dpi) / 72.0))
+                pixmap = document[page_number - 1].get_pixmap(
+                    matrix=pymupdf.Matrix(scale, scale), alpha=False
+                )
+                image = np.array(
+                    Image.open(_io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+                )
+            except Exception:
+                continue
+
+            best_markdown = ""
+            best_evidence = (0, 0, 0, 0)
+            # Most portrait manual pages contain a clockwise-rotated landscape
+            # drawing, hence 270 degrees is attempted first. Stop immediately once
+            # source-backed row evidence is strong; alternate orientations are only
+            # a conservative fallback for other manual layouts.
+            for rotation in (270, 90, 0, 180):
+                try:
+                    rotated = np.rot90(image, (rotation // 90) % 4).copy()
+                    result = engine(rotated)
+                    local_markdown = _rapidocr_layout_markdown(result)
+                except Exception:
+                    continue
+                native_text = native_lookup.get(page_number, "").strip()
+                combined = (
+                    f"{native_text}\n\n{local_markdown}"
+                    if native_text and local_markdown
+                    else native_text or local_markdown
+                )
+                evidence = _local_drawing_evidence(page_number, combined)
+                if evidence[0] > best_evidence[0]:
+                    best_markdown = combined
+                    best_evidence = evidence
+                _, direct_count, variant_count, legend_count = evidence
+                if variant_count >= 3 or direct_count >= 2 or legend_count >= 2:
+                    break
+
+            _, direct_count, variant_count, legend_count = best_evidence
+            source_confirmed = bool(
+                variant_count >= 3 or direct_count >= 2 or legend_count >= 2
+            )
+            if best_markdown and source_confirmed:
+                recovered.append((page_number, best_markdown))
+                confirmed.append(page_number)
+                messages.append(
+                    "Local CPU OCR recovered PDF page "
+                    f"{page_number}: {direct_count} formal Article-No. row(s), "
+                    f"{variant_count} coherent variant row(s), and "
+                    f"{legend_count} coded legend entry/entries."
+                )
+    finally:
+        document.close()
+
+    if progress:
+        progress(
+            len(ordered_pages),
+            len(ordered_pages),
+            "Local CPU drawing OCR complete",
+        )
+
+    if recovered:
+        messages.append(
+            "Native/local extraction handled "
+            f"{len(recovered)} source-confirmed drawing page(s) before paid OCR."
+        )
+    else:
+        messages.append(
+            "Local CPU OCR found no page with enough source evidence to replace "
+            "the normal Mistral OCR path."
+        )
+    return sorted(recovered), list(dict.fromkeys(messages)), sorted(set(confirmed))
 
 
 def _engineering_drawing_rotation_candidate(markdown: Any, source_text: Any = "") -> bool:
@@ -4396,6 +4700,16 @@ def _headerless_engineering_variant_rows(
             ident,
             flags=re.I,
         )
+        if not match:
+            # Dense equipment tables also print a hyphenated article family, for
+            # example ``9024585-98`` through ``9024585-49``. The final segment is
+            # the orderable variant while the stable prefix proves row coherence.
+            match = re.fullmatch(
+                r"(?P<stem>[A-Z0-9][A-Z0-9._/-]{5,19})-"
+                r"(?P<variant>[A-Z0-9._/]{1,5})",
+                ident,
+                flags=re.I,
+            )
         if not match:
             return
         stem = match.group("stem").upper()
