@@ -132,7 +132,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.8"
+APP_VERSION = "4.18.9"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -450,6 +450,15 @@ def _content_column_width(
     ]
     longest = max((len(value) for value in sample), default=8)
     return max(minimum, min(maximum, 18 + longest * 7))
+
+
+def _paged_editor_height(row_count: int) -> int:
+    """Grow paginated editors with the selected page size.
+
+    The browser page remains the scroll surface. Selecting 25 or 50 rows therefore
+    expands the table instead of trapping those rows inside a fixed 500px editor.
+    """
+    return max(220, min(1800, 48 + 35 * max(0, int(row_count))))
 
 
 def _auto_dataframe_config(
@@ -1823,7 +1832,7 @@ with st.sidebar:
 3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
 4. The app automatically matches each spare to a source-coded sub-machinery and fills its maker, model, first PDF page, and source filename.
 5. Open **3. Sub-machineries** only to inspect or override exceptions.
-6. Open **4. Review spare parts**; normally only genuine exceptions are shown.
+6. Open **4. Spares review**; normally only genuine exceptions are shown.
 7. Open **5. Export** to create the active document workbook or a ZIP package for every ready document.
 
 ### Multiple documents and vessel assignment
@@ -2717,12 +2726,16 @@ workflow_labels = {
         else "○ 3. Sub-machineries"
     ),
     "4. Review spare parts": (
-        "✓ 4. Review"
+        "✓ 4. Spares review"
         if workflow_review_ready
         else (
-            f"! 4. Review ({workflow_blocked_count})"
+            f"! 4. Spares review ({workflow_blocked_count})"
             if workflow_ocr_ready and workflow_rows_detected
-            else ("! 4. Review (no spare rows)" if workflow_ocr_ready else "○ 4. Review")
+            else (
+                "! 4. Spares review (no spare rows)"
+                if workflow_ocr_ready
+                else "○ 4. Spares review"
+            )
         )
     ),
     "5. Export": (
@@ -3278,7 +3291,7 @@ if active_workflow_step == "3. Sub-machineries":
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
-                height=max(220, 48 + 35 * len(page_frame)),
+                height=_paged_editor_height(len(page_frame)),
                 disabled=[
                     "MCH_TP(M/S/U)",
                     "FIRST PAGE",
@@ -4195,7 +4208,7 @@ if active_workflow_step == "4. Review spare parts":
         active_job = active_document_job()
         if active_job:
             st.caption(f"Active document: **{active_job['file_name']}**")
-        st.subheader("Step 4 — Review and correct candidate rows")
+        st.subheader("Step 4 — Spares review and correction")
         st.caption(
             "Low-confidence records remain blocked until you explicitly mark them as "
             "verified. The paginated editor renders only one manageable page at a time."
@@ -4541,7 +4554,7 @@ if active_workflow_step == "4. Review spare parts":
                     num_rows="fixed",
                     use_container_width=True,
                     hide_index=True,
-                    height=min(500, max(180, 42 + 35 * len(editor_source))),
+                    height=_paged_editor_height(len(editor_source)),
                     disabled=[
                         "READY",
                         "SOURCE PAGE",
