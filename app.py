@@ -132,7 +132,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.9"
+APP_VERSION = "4.18.10"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1832,7 +1832,7 @@ with st.sidebar:
 3. Keep **Balanced** processing mode for normal use, then run **2. OCR**.
 4. The app automatically matches each spare to a source-coded sub-machinery and fills its maker, model, first PDF page, and source filename.
 5. Open **3. Sub-machineries** only to inspect or override exceptions.
-6. Open **4. Spares review**; normally only genuine exceptions are shown.
+6. Open **4. Spares**; normally only genuine exceptions are shown.
 7. Open **5. Export** to create the active document workbook or a ZIP package for every ready document.
 
 ### Multiple documents and vessel assignment
@@ -2726,15 +2726,15 @@ workflow_labels = {
         else "○ 3. Sub-machineries"
     ),
     "4. Review spare parts": (
-        "✓ 4. Spares review"
+        "✓ 4. Spares"
         if workflow_review_ready
         else (
-            f"! 4. Spares review ({workflow_blocked_count})"
+            f"! 4. Spares ({workflow_blocked_count})"
             if workflow_ocr_ready and workflow_rows_detected
             else (
-                "! 4. Spares review (no spare rows)"
+                "! 4. Spares (no spare rows)"
                 if workflow_ocr_ready
-                else "○ 4. Spares review"
+                else "○ 4. Spares"
             )
         )
     ),
@@ -4208,7 +4208,7 @@ if active_workflow_step == "4. Review spare parts":
         active_job = active_document_job()
         if active_job:
             st.caption(f"Active document: **{active_job['file_name']}**")
-        st.subheader("Step 4 — Spares review and correction")
+        st.subheader("Step 4 — Spares")
         st.caption(
             "Low-confidence records remain blocked until you explicitly mark them as "
             "verified. The paginated editor renders only one manageable page at a time."
