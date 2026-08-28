@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.18.8"
+TOOLS_VERSION = "4.18.9"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -613,6 +613,9 @@ def _orientation_table_evidence(markdown: Any) -> int:
     legend_entries = _engineering_legend_entries(markdown)
     if legend_entries:
         score += 12 + min(12, len(legend_entries) * 2)
+    variant_rows = _headerless_engineering_variant_rows(0, markdown, {})
+    if variant_rows:
+        score += 14 + min(14, len(variant_rows))
     return score
 
 
@@ -674,7 +677,8 @@ def _focused_engineering_region_ocr(
     messages: list[str] = []
     article_table = _is_engineering_article_table(combined)
     legend_page = _is_engineering_legend_page(combined)
-    if not combined or not (article_table or legend_page):
+    variant_rows = _headerless_engineering_variant_rows(0, combined, {})
+    if not combined or not (article_table or legend_page or variant_rows):
         return combined, messages
 
     metadata = _engineering_title_block_metadata(combined, require_article_table=False)
@@ -682,11 +686,18 @@ def _focused_engineering_region_ocr(
     identifier_count = (
         len(_engineering_article_identifier_evidence(combined, section_code))
         if article_table
-        else len(_engineering_legend_entries(combined))
+        else (
+            len(_engineering_legend_entries(combined))
+            if legend_page
+            else len(variant_rows)
+        )
     )
-    # If the full-page pass already exposed several identifiers, region OCR would
-    # add cost without useful recovery value.
-    if identifier_count >= 2:
+    # Headerless variant matrices commonly contain 10-20 rows. Three visible rows
+    # prove the pattern but do not prove coverage, so keep focused OCR active until
+    # a more representative set has been read. Ordinary article/legend pages retain
+    # the lower threshold used by the prior build.
+    sufficient_identifier_count = 8 if variant_rows else 2
+    if identifier_count >= sufficient_identifier_count:
         return combined, messages
 
     # Overlapping halves preserve the full width/height of wide tables better than
@@ -729,6 +740,10 @@ def _focused_engineering_region_ocr(
                 + region_markdown
             ).strip()
             candidate_article_table = _is_engineering_article_table(candidate)
+            candidate_legend_page = _is_engineering_legend_page(candidate)
+            candidate_variant_rows = _headerless_engineering_variant_rows(
+                0, candidate, {}
+            )
             candidate_metadata = _engineering_title_block_metadata(
                 candidate, require_article_table=False
             )
@@ -738,7 +753,11 @@ def _focused_engineering_region_ocr(
             candidate_count = (
                 len(_engineering_article_identifier_evidence(candidate, candidate_code))
                 if candidate_article_table
-                else len(_engineering_legend_entries(candidate))
+                else (
+                    len(_engineering_legend_entries(candidate))
+                    if candidate_legend_page
+                    else len(candidate_variant_rows)
+                )
             )
             candidate_score = _orientation_table_evidence(candidate)
             if candidate_count > identifier_count or candidate_score > best_score + 2:
@@ -747,7 +766,12 @@ def _focused_engineering_region_ocr(
                 best_score = candidate_score
                 section_code = candidate_code
                 used_regions += 1
-            if identifier_count >= 3:
+            sufficient_identifier_count = (
+                8
+                if _is_headerless_engineering_variant_table(combined)
+                else 3
+            )
+            if identifier_count >= sufficient_identifier_count:
                 break
         except Exception as exc:
             messages.append(
@@ -842,6 +866,7 @@ def recover_rotated_engineering_drawing_pages(
                 if rescue_markdown and (
                     _is_engineering_article_table(rescue_markdown)
                     or _is_engineering_legend_page(rescue_markdown)
+                    or _is_headerless_engineering_variant_table(rescue_markdown)
                 ):
                     best_markdown, best_rotation, best_score = rescue_markdown, rotation, score
                     break
@@ -849,6 +874,7 @@ def recover_rotated_engineering_drawing_pages(
             if best_markdown and (
                 _is_engineering_article_table(best_markdown)
                 or _is_engineering_legend_page(best_markdown)
+                or _is_headerless_engineering_variant_table(best_markdown)
             ) and best_score > original_score:
                 # Full-page OCR can recognize a table header while its actual article
                 # numbers remain too small. Before downstream extraction, selectively
@@ -868,7 +894,7 @@ def recover_rotated_engineering_drawing_pages(
                 ).strip()
                 rescued_pages.append(page_number)
                 messages.append(
-                    f"PDF page {page_number}: orientation OCR recovered a coded drawing legend or orderable Article-No. table at {best_rotation} degrees."
+                    f"PDF page {page_number}: orientation OCR recovered a coded drawing legend or orderable spare table at {best_rotation} degrees."
                 )
                 messages.extend(focused_messages)
             else:
@@ -1277,7 +1303,10 @@ def _document_extraction_profile(
     # compiled system manual, so scan page-by-page instead of sampling only the
     # beginning of the document. This is local string inspection and adds no API cost.
     for _, markdown in extracted_pages:
-        if _is_engineering_article_table(markdown):
+        if (
+            _is_engineering_article_table(markdown)
+            or _is_headerless_engineering_variant_table(markdown)
+        ):
             return ENGINEERING_ARTICLE_DRAWING_PROFILE
     sample = "\n".join(str(markdown or "") for _, markdown in extracted_pages[:20])
     if _is_multilingual_order_catalog(sample):
@@ -1312,6 +1341,11 @@ AUTOMATIC LAYOUT PROFILE - ENGINEERING DRAWING TITLE BLOCK + ARTICLE TABLE:
   continuation after that name. If the same page also has a genuine Article-No. /
   Name-Designation table, extract the Article-No. table and do not duplicate its
   legend callouts.
+- Some drawings contain a headerless two-column orderable-variant table. When at
+  least three rows repeat one long article-number family followed by a variant
+  suffix (for example `9007170 72/92`) and an English name (`Valve DN500 / A500`),
+  preserve the complete printed first cell as ident_no and the second cell as
+  description_english. Do not shorten the identifier to its shared family stem.
 - Never use chapter headings such as Dimension drawings including technical data,
   dates, sheet numbers, or revision numbers as the sub-machinery code/name.
 """.strip()
@@ -1423,6 +1457,12 @@ Benefit mapping rules:
     has no stronger detailed spare rows. When the page also contains an Article No. /
     Name-Designation table, the Article-No. rows take priority and legend callouts are
     supporting evidence rather than additional duplicate spares.
+6g. A source-confirmed equipment drawing may also contain a headerless two-column
+    orderable-variant list. When at least three rows repeat one long article family
+    plus a printed suffix (for example `9007170 72/92`) beside an English name
+    (`Valve DN500 / A500`), return every full first-cell value as ident_no and the
+    second cell as description_english. Preserve spaces, slashes and leading zeroes.
+    The common family number alone is not the spare code.
 7. source_part_no is any separate manufacturer Part No. printed by the source.
    Capture it only for audit context; it is not used automatically in Benefit.
 8. description_english is the individual spare-part name only, in ENGLISH and
@@ -4266,6 +4306,128 @@ def _is_engineering_article_identifier_value(value: Any, section_code: Any = "")
             flags=re.I,
         )
     )
+
+
+def _headerless_engineering_variant_rows(
+    page_number: int,
+    markdown: Any,
+    metadata: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Recover repeated two-column article variants without semantic headers.
+
+    Some equipment drawings print only ``article-family + size/revision`` beside
+    the English designation, for example ``9007170 72/92 | Valve DN500 / A500``.
+    There is no Article-No. header for the normal semantic parser to recognize.
+    To keep this recovery high precision, at least three rows must share the same
+    long source identifier stem; isolated numbers, drawing dimensions and callouts
+    are ignored. The caller still requires a source-confirmed equipment drawing,
+    so these rows inherit that page's exact title-block parent.
+    """
+    raw = str(markdown or "")
+    if not raw.strip():
+        return []
+    active_metadata = dict(metadata or {})
+    candidates: list[tuple[str, str, str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+
+    def add_candidate(identifier: Any, description: Any) -> None:
+        ident = re.sub(r"\s+", " ", clean_text(identifier)).strip(" .;,|:").upper()
+        desc = re.sub(r"\s+", " ", clean_text(description)).strip(" .;,|:")
+        if not _is_engineering_article_identifier_value(ident):
+            return
+        match = re.fullmatch(
+            r"(?P<stem>[A-Z0-9][A-Z0-9._/-]{5,19})\s+"
+            r"(?P<variant>[A-Z0-9._/-]{1,5})",
+            ident,
+            flags=re.I,
+        )
+        if not match:
+            return
+        stem = match.group("stem").upper()
+        if not re.search(r"\d{5}", stem) or _is_date_like_section_code(stem):
+            return
+        if (
+            len(desc) < 3
+            or len(desc) > 100
+            or not re.search(r"[A-Za-z]", desc)
+            or re.match(
+                r"^(?:article|document|drawing|sheet|revision|title|material|note|"
+                r"dimension|weight|approved|creator)\b",
+                desc,
+                flags=re.I,
+            )
+        ):
+            return
+        pair = (normalize_key(ident), normalize_key(desc))
+        if pair in seen_pairs:
+            return
+        seen_pairs.add(pair)
+        candidates.append((stem, ident, desc))
+
+    for raw_line in raw.splitlines():
+        line = re.sub(r"^[#>*+\-\s]+", "", str(raw_line)).strip()
+        if not line or _is_markdown_separator(line):
+            continue
+
+        # Prefer explicit cell boundaries emitted by OCR/Markdown.
+        cells = [
+            clean_text(cell).strip(" |:;-–—")
+            for cell in re.split(r"\s*\|\s*|\t+|\s{2,}", line.strip(" |"))
+            if clean_text(cell).strip(" |:;-–—")
+        ]
+        if len(cells) >= 2:
+            add_candidate(cells[0], cells[1])
+
+        # Aligned OCR occasionally collapses the two cells to single spaces.
+        match = re.match(
+            r"^\s*(?P<identifier>[A-Z0-9][A-Z0-9._/-]{5,19}\s+"
+            r"[A-Z0-9._/-]{1,5})\s+(?P<description>[A-Za-z].+?)\s*$",
+            line,
+            flags=re.I,
+        )
+        if match:
+            add_candidate(match.group("identifier"), match.group("description"))
+
+    grouped: dict[str, list[tuple[str, str]]] = {}
+    for stem, identifier, description in candidates:
+        grouped.setdefault(stem, []).append((identifier, description))
+
+    # Every accepted family must contain enough repeated structure to distinguish
+    # an orderable variant list from incidental drawing labels.
+    accepted_groups = {
+        stem: values
+        for stem, values in grouped.items()
+        if len(values) >= 3
+    }
+    rows: list[dict[str, Any]] = []
+    for stem, values in sorted(accepted_groups.items()):
+        for identifier, description in values:
+            rows.append(
+                {
+                    "source_page": int(page_number),
+                    "section_code": active_metadata.get("section_code", ""),
+                    "section_name_english": active_metadata.get(
+                        "section_name_english", ""
+                    ),
+                    "section_maker": active_metadata.get("maker", ""),
+                    "section_model": active_metadata.get("model", ""),
+                    "table_title": active_metadata.get("section_name_raw", ""),
+                    "ident_no": identifier,
+                    "description_raw": description,
+                    "quantity": None,
+                    "item_no": "",
+                    "confidence": 0.92,
+                    "source_layout": (
+                        "headerless two-column engineering variant table"
+                    ),
+                    "article_family": stem,
+                }
+            )
+    return rows
+
+
+def _is_headerless_engineering_variant_table(markdown: Any) -> bool:
+    return bool(_headerless_engineering_variant_rows(0, markdown, {}))
 
 
 def _engineering_article_identifier_evidence(
@@ -8305,6 +8467,21 @@ def ensure_component_drawing_detail_spare_rows(
             return True
 
         page_direct_rows = direct_by_page.get(page_number, [])
+        if not page_direct_rows:
+            # Headerless engineering variant lists (for example a repeated
+            # 9007170 family with DN/A valve sizes) are still orderable source
+            # rows even though no Article-No. heading is printed.
+            page_direct_rows = _headerless_engineering_variant_rows(
+                page_number,
+                markdown,
+                {
+                    "section_code": code,
+                    "section_name_raw": name,
+                    "section_name_english": name,
+                    "maker": clean_text(candidate.get("MAKER", "")),
+                    "model": clean_text(candidate.get("MODEL", "")),
+                },
+            )
         if page_direct_rows:
             for direct in page_direct_rows:
                 description = clean_text(
@@ -8318,7 +8495,12 @@ def ensure_component_drawing_detail_spare_rows(
                     description,
                     item_no=direct.get("item_no", ""),
                     quantity=direct.get("quantity"),
-                    source_kind="Embedded drawing Article-No. table",
+                    source_kind=(
+                        "Headerless drawing variant table"
+                        if direct.get("source_layout")
+                        == "headerless two-column engineering variant table"
+                        else "Embedded drawing Article-No. table"
+                    ),
                     confidence=max(
                         0.90,
                         clamp_confidence(direct.get("confidence", 0.90)),
