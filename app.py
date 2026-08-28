@@ -96,6 +96,8 @@ try:
     from tools import (
         apply_authoritative_explicit_spare_rows,
         ensure_component_drawing_detail_spare_rows,
+        extract_positioned_pdf_context_pages,
+        recover_local_engineering_drawing_pages,
         remove_component_assembly_spare_rows,
         linked_machinery_rows_for_export,
         merge_component_candidates_with_native_priority,
@@ -118,6 +120,17 @@ except ImportError:
     ):
         return review_frame.copy(), 0, 0, 0
 
+    def extract_positioned_pdf_context_pages(pdf_bytes, page_indexes=None):
+        return []
+
+    def recover_local_engineering_drawing_pages(
+        pdf_bytes, native_pages, candidate_page_numbers, **kwargs
+    ):
+        return [], [
+            "Local CPU drawing OCR helper is not present in the deployed tools.py; "
+            "the normal Mistral OCR path remained active."
+        ], []
+
     def merge_component_candidates_with_native_priority(
         ocr_candidates, native_candidates
     ):
@@ -132,7 +145,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.12"
+APP_VERSION = "4.19.1"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1593,12 +1606,16 @@ def _extract_native_pdf_context_pages(
     """
     if not pdf_bytes:
         return []
+    positioned_pages = _cached_positioned_pdf_context_pages(
+        pdf_bytes,
+        tuple(int(index) for index in page_indexes) if page_indexes is not None else (),
+    )
     try:
         from pypdf import PdfReader
 
         reader = PdfReader(io.BytesIO(pdf_bytes))
     except Exception:
-        return []
+        return list(positioned_pages)
 
     indexes = (
         list(page_indexes)
@@ -1629,7 +1646,72 @@ def _extract_native_pdf_context_pages(
                 text = ""
         if text.strip():
             pages.append((index + 1, text))
-    return pages
+    # pypdf stays first for reliable rotated title-block codes; positioned text is
+    # complementary evidence for native tables and multi-column pages.
+    return _merge_pdf_context_pages(positioned_pages, pages)
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def _cached_positioned_pdf_context_pages(
+    pdf_bytes: bytes,
+    page_indexes: tuple[int, ...],
+) -> list[tuple[int, str]]:
+    """Cache model-independent native layout extraction across UI reruns."""
+    indexes = list(page_indexes) if page_indexes else None
+    return extract_positioned_pdf_context_pages(pdf_bytes, page_indexes=indexes)
+
+
+@st.cache_data(show_spinner=False, max_entries=8, ttl=3600)
+def _cached_local_engineering_drawing_pages(
+    pdf_bytes: bytes,
+    native_pages: tuple[tuple[int, str], ...],
+    candidate_page_numbers: tuple[int, ...],
+) -> tuple[list[tuple[int, str]], list[str], list[int]]:
+    """Cache local CPU OCR by file and page evidence, independent of AI mode."""
+    return recover_local_engineering_drawing_pages(
+        pdf_bytes=pdf_bytes,
+        native_pages=list(native_pages),
+        candidate_page_numbers=list(candidate_page_numbers),
+        # Bound CPU time on very large manuals. Remaining drawings continue
+        # through the normal OCR path, so this cap affects cost only, not coverage.
+        max_pages=max(1, min(12, len(candidate_page_numbers))),
+        dpi=160,
+    )
+
+
+def _drawing_pages_with_continuations(
+    components: pd.DataFrame,
+    selected_page_indexes: list[int] | tuple[int, ...],
+    continuation_count: int = 2,
+) -> list[int]:
+    """Return proven drawing pages plus bounded, unheaded continuation sheets."""
+    if components is None or components.empty:
+        return []
+    drawing_pages = sorted(
+        {
+            int(value)
+            for value in pd.to_numeric(
+                components["FIRST PAGE"], errors="coerce"
+            ).dropna()
+        }
+    )
+    selected_pages = {int(index) + 1 for index in selected_page_indexes}
+    result = set(drawing_pages)
+    for position, page in enumerate(drawing_pages):
+        next_page = (
+            drawing_pages[position + 1]
+            if position + 1 < len(drawing_pages)
+            else page + continuation_count + 1
+        )
+        result.update(
+            candidate
+            for candidate in range(
+                page + 1,
+                min(page + continuation_count + 1, next_page),
+            )
+            if candidate in selected_pages
+        )
+    return sorted(result)
 
 
 def _merge_pdf_context_pages(
@@ -3461,16 +3543,66 @@ if active_workflow_step == "2. OCR":
                     progress_bar.progress(fraction, text=message)
 
                 try:
+                    local_ocr_messages: list[str] = []
+                    local_confirmed_pages: list[int] = []
+                    pre_native_context_pages: list[tuple[int, str]] = []
                     if input_type == "PDF":
                         pdf_bytes = source_file.getvalue()
                         total_pages = pdf_page_count(pdf_bytes)
                         selected_pages = parse_page_spec(page_spec, total_pages)
-                        extracted_pages = ocr_pdf_bytes(
-                            api_key=api_key,
-                            pdf_bytes=pdf_bytes,
+                        progress_bar.progress(
+                            0.0, text="Reading native PDF layout and drawing titles..."
+                        )
+                        pre_native_context_pages = _extract_native_pdf_context_pages(
+                            pdf_bytes,
                             page_indexes=selected_pages,
-                            pages_per_request=int(ocr_pages_per_request),
-                            progress=show_progress,
+                        )
+                        pre_native_components = build_component_drawing_candidates(
+                            pre_native_context_pages,
+                            current_main_row(),
+                            source_document_name=source_file.name,
+                        )
+                        local_candidate_pages = _drawing_pages_with_continuations(
+                            pre_native_components,
+                            selected_pages,
+                        )
+                        local_pages: list[tuple[int, str]] = []
+                        if local_candidate_pages:
+                            progress_bar.progress(
+                                0.0,
+                                text=(
+                                    "Running cached local CPU OCR on "
+                                    f"{len(local_candidate_pages)} proven drawing page(s)..."
+                                ),
+                            )
+                            (
+                                local_pages,
+                                local_ocr_messages,
+                                local_confirmed_pages,
+                            ) = _cached_local_engineering_drawing_pages(
+                                pdf_bytes,
+                                tuple(pre_native_context_pages),
+                                tuple(local_candidate_pages),
+                            )
+
+                        confirmed_set = set(local_confirmed_pages)
+                        paid_page_indexes = [
+                            int(index)
+                            for index in selected_pages
+                            if int(index) + 1 not in confirmed_set
+                        ]
+                        paid_pages: list[tuple[int, str]] = []
+                        if paid_page_indexes:
+                            paid_pages = ocr_pdf_bytes(
+                                api_key=api_key,
+                                pdf_bytes=pdf_bytes,
+                                page_indexes=paid_page_indexes,
+                                pages_per_request=int(ocr_pages_per_request),
+                                progress=show_progress,
+                            )
+                        extracted_pages = _merge_pdf_context_pages(
+                            paid_pages,
+                            local_pages,
                         )
                     elif input_type == "Document URL":
                         progress_bar.progress(0.1, text="Sending document URL to OCR...")
@@ -3510,10 +3642,11 @@ if active_workflow_step == "2. OCR":
                         # and absent from the first OCR pass. Include those exact
                         # drawing pages in orientation rescue instead of limiting the
                         # retry to pages that already looked like spare tables.
-                        pre_native_context_pages = _extract_native_pdf_context_pages(
-                            pdf_bytes,
-                            page_indexes=selected_pages,
-                        )
+                        if not pre_native_context_pages:
+                            pre_native_context_pages = _extract_native_pdf_context_pages(
+                                pdf_bytes,
+                                page_indexes=selected_pages,
+                            )
                         pre_native_components = build_component_drawing_candidates(
                             pre_native_context_pages,
                             current_main_row(),
@@ -3522,38 +3655,15 @@ if active_workflow_step == "2. OCR":
                         rescue_page_numbers = {
                             int(page) for page, _ in pre_structure_pages
                         }
-                        if not pre_native_components.empty:
-                            native_drawing_pages = sorted(
-                                {
-                                    int(value)
-                                    for value in pd.to_numeric(
-                                        pre_native_components["FIRST PAGE"],
-                                        errors="coerce",
-                                    ).dropna()
-                                }
+                        rescue_page_numbers.update(
+                            _drawing_pages_with_continuations(
+                                pre_native_components,
+                                selected_pages,
                             )
-                            rescue_page_numbers.update(native_drawing_pages)
-                            # Include up to two unheaded continuation pages before
-                            # the next detected component. Dense orderable tables can
-                            # sit on a second drawing sheet whose native text exposes
-                            # only another document reference.
-                            selected_page_set = {
-                                int(page) for page in selected_pages
-                            }
-                            for position, drawing_page in enumerate(
-                                native_drawing_pages
-                            ):
-                                next_drawing_page = (
-                                    native_drawing_pages[position + 1]
-                                    if position + 1 < len(native_drawing_pages)
-                                    else drawing_page + 3
-                                )
-                                for continuation_page in range(
-                                    drawing_page + 1,
-                                    min(drawing_page + 3, next_drawing_page),
-                                ):
-                                    if continuation_page in selected_page_set:
-                                        rescue_page_numbers.add(continuation_page)
+                        )
+                        # Locally confirmed source rows already have stronger
+                        # spatial evidence and must not incur a second paid OCR pass.
+                        rescue_page_numbers.difference_update(local_confirmed_pages)
                         extracted_pages, rotated_rescue_messages, rotated_rescued_pages = (
                             recover_rotated_engineering_drawing_pages(
                                 api_key=api_key,
@@ -3594,11 +3704,30 @@ if active_workflow_step == "2. OCR":
                             "into import-ready rows..."
                         ),
                     )
-                    extraction_messages: list[str] = list(rotated_rescue_messages)
+                    extraction_messages: list[str] = list(local_ocr_messages)
+                    extraction_messages.extend(rotated_rescue_messages)
                     profile_messages: list[str] = []
                     document_profile: dict = {}
                     st.session_state.model_run_status = {
-                        "OCR": {"provider": "Mistral", "model": "mistral-ocr-latest", "status": "Completed", "detail": f"Processed {len(extracted_pages)} PDF/image page(s)."},
+                        "Native/local layout recovery": {
+                            "provider": "Local CPU",
+                            "model": "PyMuPDF + RapidOCR",
+                            "status": "Completed" if local_confirmed_pages else "No source-confirmed replacement",
+                            "detail": (
+                                f"Recovered and locally confirmed {len(local_confirmed_pages)} drawing page(s); cached independently of AI mode."
+                                if local_confirmed_pages
+                                else "No page was allowed to bypass the normal OCR path."
+                            ),
+                        },
+                        "OCR": {
+                            "provider": "Mistral",
+                            "model": "mistral-ocr-latest",
+                            "status": "Completed",
+                            "detail": (
+                                f"Prepared {len(extracted_pages)} PDF/image page(s); "
+                                f"{len(local_confirmed_pages)} source-confirmed page(s) were handled locally before paid OCR."
+                            ),
+                        },
                         "Drawing orientation OCR rescue": {
                             "provider": "Mistral",
                             "model": "mistral-ocr-latest",
