@@ -1,10 +1,24 @@
-# Spare Parts OCR Import Builder — drawing legends and embedded article tables 4.18.8
+# Spare Parts OCR Import Builder — headerless drawing variants 4.18.9
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.18.9 headerless drawing variants and taller review pages
+
+- Recovers headerless two-column drawing tables when at least three full article
+  identifiers share one stable family, including values such as `9007170 72/92`,
+  `9007172 63/83`, and `9007168 64/84` beside their English valve descriptions.
+- Preserves the complete printed variant identifier as PART NO/CODE and links it
+  to the exact source-page title-block sub-machinery; a shared family stem is never
+  exported as a substitute code.
+- Extends alternate-orientation and focused-region OCR scoring to recognize these
+  headerless tables, while retaining source-confirmed drawing and unique-code gates.
+- Expands both Step 3 and Step 4 editors to match the selected 10/25/50 rows per
+  page, using the browser page as the scroll surface instead of a fixed 500px grid.
+- Renames the visible fourth workflow tab and heading to **Spares review**.
 
 ### 4.18.8 drawing legends and embedded article tables
 
