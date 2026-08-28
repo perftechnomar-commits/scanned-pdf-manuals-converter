@@ -1,10 +1,56 @@
-# Spare Parts OCR Import Builder — Spares tab label 4.18.10
+# Spare Parts OCR Import Builder — optimized native-first recovery 4.19.1
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.19.1 implementation cleanup
+
+- Consolidates drawing-page and continuation-page selection into one helper used by
+  both local recovery and Mistral orientation rescue.
+- Removes duplicate page-range construction, repeated progress updates, and unused
+  OCR geometry fields without changing extraction or fallback behavior.
+
+### 4.19.0 native-first, cached local drawing recovery
+
+- Adds layout-aware native PDF extraction with PyMuPDF before any paid OCR call.
+- Adds a CPU-only RapidOCR/ONNX rescue for pages already proven to be equipment
+  drawings by source title/code evidence. It reconstructs the embedded Article-No.,
+  headerless variant, and legend rows spatially, including rotated drawing tables.
+- A page bypasses Mistral OCR only after deterministic reconciliation confirms at
+  least three coherent variants, two formal orderable rows, or a multi-entry coded
+  legend. Weak local results fail open to the existing Mistral path.
+- Caches native layout and local OCR by PDF content/page selection so changing an AI
+  model or rerunning Streamlit does not repeat the CPU work.
+- Keeps title-block Document No./Title values at the sub-machinery hierarchy level;
+  exact parent codes remain forbidden from reappearing as spare rows.
+- Adds explicit pipeline diagnostics showing which pages were recovered locally and
+  which continued through Mistral OCR.
+
+### 4.18.12 strict drawing hierarchy and dense-table OCR
+
+- Treats each drawing title block as sub-machinery hierarchy only. The Document No.
+  and Title are no longer copied into Spares as a whole-assembly fallback.
+- Removes historical automatic rows where a spare CODE/PART NO repeats its own
+  sub-machinery code, including rows saved by builds 4.18.4 through 4.18.11.
+- Keeps zero-part drawings visible for review/audit but exports a sub-machinery only
+  after genuine Article No., legend, explicit spare-number, or orderable table rows
+  have been linked to it.
+- Runs focused region OCR for dense Article-No. and headerless variant tables until
+  broader coverage is reached, including the flow-transmitter and valve tables in
+  the MSC ROMA drawing section.
+
+### 4.18.11 title-block document codes
+
+- Corrects native searchable-text page labels such as `9004714_p1` to the actual
+  title-block Document No. `9004714` when the nearby heading confirms a multi-page
+  drawing. The accepted sub-machinery name remains unchanged.
+- Rejects separated `_p1`/`_page1` fragments as machinery-code content while
+  preserving compact codes ending in `P1` when no separator marks pagination.
+- Updates the MSC ROMA regression to require `9004714 / CIP MODULE` and prevent the
+  former contaminated code from returning.
 
 ### 4.18.10 Spares tab label
 
