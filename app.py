@@ -96,7 +96,7 @@ try:
     from tools import (
         apply_authoritative_explicit_spare_rows,
         ensure_component_drawing_detail_spare_rows,
-        ensure_component_assembly_spare_rows,
+        remove_component_assembly_spare_rows,
         linked_machinery_rows_for_export,
         merge_component_candidates_with_native_priority,
         validate_spare_machinery_hierarchy,
@@ -108,10 +108,10 @@ except ImportError:
     def apply_authoritative_explicit_spare_rows(rows, authoritative_rows):
         return list(rows), 0, 0
 
-    def ensure_component_assembly_spare_rows(
-        review_frame, component_candidates, default_unit="PCS"
+    def remove_component_assembly_spare_rows(
+        review_frame, component_candidates
     ):
-        return review_frame.copy(), 0, 0
+        return review_frame.copy(), 0
 
     def ensure_component_drawing_detail_spare_rows(
         review_frame, extracted_pages, component_candidates, default_unit="PCS"
@@ -132,7 +132,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.18.10"
+APP_VERSION = "4.18.12"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1855,10 +1855,11 @@ remain authoritative, and processing safely continues if the analysis call fails
 The app discovers equipment drawings independently from ordinary spare tables so
 source hierarchy is not lost. An explicit drawing title block is authoritative:
 **Document No.** becomes the sub-machinery CODE and the compact **Title** becomes its
-NAME, even when the page/chapter heading is broader. Each valid equipment drawing
-also creates one linked whole-assembly spare row, after which additional parts and
-recommended spares remain children of the same sub-machinery. Codes found only
-inside descriptions or cross-references are ignored for section assignment.
+NAME, even when the page/chapter heading is broader. The title block defines the
+sub-machinery only; it is never copied into the spare table. Only source-backed
+Article No., legend, explicit spare-number, and orderable table entries become
+children of that sub-machinery. Codes found only inside descriptions or
+cross-references are ignored for section assignment.
 
 For older German/English/French catalogues, the app also recognizes simple numbered
 section headings printed inside the table (for example **3. Servo drive for oil
@@ -1879,8 +1880,8 @@ the source text layer. Repeated references are reconciled instead of exported tw
 - The exact printed English title and spare description are kept whenever the multilingual source exposes them clearly; AI paraphrases cannot overwrite that wording.
 - A previous section is carried forward only to an immediately consecutive continuation page with no new header code.
 - **FIRST PAGE / LAST PAGE:** where the detected table section appears.
-- **PARTS FOUND:** number of spare-part rows linked to the proposal, including the
-  source-backed whole-assembly row created from a valid equipment drawing.
+- **PARTS FOUND:** number of genuine source-backed spare-part rows linked to the
+  proposal. The sub-machinery itself is never counted as one of its own spares.
 - **CONFIDENCE:** hierarchy confidence based on source-code/name agreement and supporting spare rows, not merely raw OCR quality.
 - **VARIANTS:** different spellings found in the manual.
 - Maker/model printed in the section override the manually entered main-machinery defaults.
@@ -2980,13 +2981,10 @@ if active_workflow_step == "3. Sub-machineries":
                     st.session_state.get("default_unit", "PCS") or "PCS"
                 ),
             )
-            upgraded_review, drawing_spares_added, drawing_spares_reconciled = (
-                ensure_component_assembly_spare_rows(
+            upgraded_review, repeated_assembly_spares_removed = (
+                remove_component_assembly_spare_rows(
                     detailed_review,
                     component_candidates,
-                    default_unit=str(
-                        st.session_state.get("default_unit", "PCS") or "PCS"
-                    ),
                 )
             )
             review_upgraded = not upgraded_review.equals(previous_review)
@@ -2996,8 +2994,8 @@ if active_workflow_step == "3. Sub-machineries":
                     "Upgraded drawing hierarchy: added "
                     f"{drawing_article_rows_added} embedded Article-No. row(s), "
                     f"{drawing_legend_rows_added} coded legend row(s), "
-                    f"{drawing_spares_added} assembly spare row(s) and reconciled "
-                    f"{drawing_spares_reconciled} existing row(s); skipped "
+                    f"removed {repeated_assembly_spares_removed} repeated "
+                    "sub-machinery-as-spare row(s); skipped "
                     f"{drawing_detail_duplicates_skipped} repeated drawing-detail code(s)."
                 )
                 st.session_state.extraction_log = list(
@@ -3088,8 +3086,8 @@ if active_workflow_step == "3. Sub-machineries":
             )
             st.caption(
                 "Only Export-linked sub-machineries are written to the import workbook. "
-                "A valid equipment drawing receives a linked whole-assembly spare; any "
-                "remaining zero-part candidate stays in this review table and the audit workbook."
+                "A drawing title block defines machinery only; it is never repeated as a spare. "
+                "Any remaining zero-part candidate stays in this review table and the audit workbook."
             )
 
             quick_actions = st.columns([1.15, 1.45, 1.3, 1.1])
@@ -3525,13 +3523,37 @@ if active_workflow_step == "2. OCR":
                             int(page) for page, _ in pre_structure_pages
                         }
                         if not pre_native_components.empty:
-                            rescue_page_numbers.update(
-                                int(value)
-                                for value in pd.to_numeric(
-                                    pre_native_components["FIRST PAGE"],
-                                    errors="coerce",
-                                ).dropna()
+                            native_drawing_pages = sorted(
+                                {
+                                    int(value)
+                                    for value in pd.to_numeric(
+                                        pre_native_components["FIRST PAGE"],
+                                        errors="coerce",
+                                    ).dropna()
+                                }
                             )
+                            rescue_page_numbers.update(native_drawing_pages)
+                            # Include up to two unheaded continuation pages before
+                            # the next detected component. Dense orderable tables can
+                            # sit on a second drawing sheet whose native text exposes
+                            # only another document reference.
+                            selected_page_set = {
+                                int(page) for page in selected_pages
+                            }
+                            for position, drawing_page in enumerate(
+                                native_drawing_pages
+                            ):
+                                next_drawing_page = (
+                                    native_drawing_pages[position + 1]
+                                    if position + 1 < len(native_drawing_pages)
+                                    else drawing_page + 3
+                                )
+                                for continuation_page in range(
+                                    drawing_page + 1,
+                                    min(drawing_page + 3, next_drawing_page),
+                                ):
+                                    if continuation_page in selected_page_set:
+                                        rescue_page_numbers.add(continuation_page)
                         extracted_pages, rotated_rescue_messages, rotated_rescued_pages = (
                             recover_rotated_engineering_drawing_pages(
                                 api_key=api_key,
@@ -3947,18 +3969,18 @@ if active_workflow_step == "2. OCR":
                                 + [drawing_detail_message]
                             )
                         )
-                    combined_review, drawing_spares_added, drawing_spares_reconciled = (
-                        ensure_component_assembly_spare_rows(
+                    combined_review, repeated_assembly_spares_removed = (
+                        remove_component_assembly_spare_rows(
                             combined_review,
                             component_candidates,
-                            default_unit=default_unit,
                         )
                     )
-                    if drawing_spares_added or drawing_spares_reconciled:
+                    if repeated_assembly_spares_removed:
                         drawing_message = (
-                            "Represented source-backed equipment drawings as linked "
-                            f"assembly spare rows: added {drawing_spares_added}, "
-                            f"reconciled {drawing_spares_reconciled}."
+                            "Removed "
+                            f"{repeated_assembly_spares_removed} repeated "
+                            "sub-machinery-as-spare row(s); title blocks now define "
+                            "machinery hierarchy only."
                         )
                         extraction_messages.append(drawing_message)
                         st.session_state.extraction_log = list(
