@@ -19,7 +19,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.19.1"
+TOOLS_VERSION = "4.19.2"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -629,7 +629,7 @@ def _rapidocr_layout_markdown(result: Any) -> str:
     scores = getattr(result, "scores", None)
     if boxes is None or texts is None:
         return ""
-    score_values = list(scores or [1.0] * len(texts))
+    score_values = list(scores) if scores is not None else [1.0] * len(texts)
     items: list[dict[str, Any]] = []
     for box, raw_text, score in zip(boxes, texts, score_values):
         text = clean_text(raw_text)
@@ -688,6 +688,142 @@ def _rapidocr_layout_markdown(result: Any) -> str:
     return "\n".join(lines).strip()
 
 
+_LOCAL_CELL_MARKER = "<!-- LOCAL_ARTICLE_CELLS_V1 "
+
+
+def _local_cell_rows(page_number: int, markdown: str) -> list[dict[str, Any]]:
+    """Read the bounded cell-recognition evidence saved with the OCR page."""
+    rows: list[dict[str, Any]] = []
+    for line in str(markdown).splitlines():
+        if not line.startswith(_LOCAL_CELL_MARKER) or not line.endswith(" -->"):
+            continue
+        try:
+            payload = json.loads(line[len(_LOCAL_CELL_MARKER):-4])
+            if not isinstance(payload, list) or not 2 <= len(payload) <= 240:
+                continue
+            if not all(isinstance(row, dict) and _is_engineering_article_identifier_value(
+                row.get("ident_no", "")
+            ) and clean_text(row.get("description_raw", "")) for row in payload):
+                continue
+            rows.extend({**row, "source_page": int(page_number),
+                         "source_layout": "local ruled article cells"} for row in payload)
+        except (ValueError, TypeError):
+            continue
+    return rows
+
+
+def _read_local_ruled_article_tables(image: Any, engine: Any) -> list[dict[str, Any]]:
+    """Read real grid cells, including bottom headers, without inferring codes.
+
+    Only grids whose first two printed headers identify article/description columns
+    qualify. Incomplete or ambiguous grids fall through to the normal OCR path.
+    OpenCV is loaded here so missing local dependencies remain fail-open.
+    """
+    import cv2
+    import numpy as np
+
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    ink = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)[1]
+    horizontal = cv2.morphologyEx(ink, cv2.MORPH_OPEN,
+                                 np.ones((1, max(30, width // 35)), np.uint8))
+    vertical = cv2.morphologyEx(ink, cv2.MORPH_OPEN,
+                               np.ones((max(20, height // 60), 1), np.uint8))
+    contours, _ = cv2.findContours(horizontal | vertical, cv2.RETR_LIST,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    def boundaries(projection: Any, threshold: float) -> list[int]:
+        indexes = np.flatnonzero(projection > threshold)
+        groups = np.split(indexes, np.where(np.diff(indexes) > 3)[0] + 1)
+        return [int(np.median(group)) for group in groups if len(group)]
+
+    grids: list[tuple[int, int, list[int], list[int]]] = []
+    seen_bounds: set[tuple[int, int, int, int]] = set()
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < width * .15 or h < 60:
+            continue
+        xs = boundaries(np.count_nonzero(vertical[y:y+h, x:x+w], axis=0), h * .7)
+        ys = boundaries(np.count_nonzero(horizontal[y:y+h, x:x+w], axis=1), w * .7)
+        if not (3 <= len(xs) <= 32 and 4 <= len(ys) <= 122):
+            continue
+        # Ignore near-identical inner/outer contours around the same grid.
+        key = (round(x / 8), round(y / 8), round(w / 8), round(h / 8))
+        if key not in seen_bounds:
+            grids.append((x, y, xs, ys))
+            seen_bounds.add(key)
+
+    records: list[dict[str, Any]] = []
+    for x, y, xs, ys in sorted(grids, key=lambda g: (g[1], g[0]))[:4]:
+        cache: dict[tuple[int, int], tuple[str, float]] = {}
+
+        def read_cell(row: int, column: int) -> tuple[str, float]:
+            key = (row, column)
+            if key not in cache:
+                cell = image[y+ys[row]+3:y+ys[row+1]-3,
+                             x+xs[column]+3:x+xs[column+1]-3]
+                if not cell.size:
+                    return "", 0.0
+                points = cv2.findNonZero(cv2.threshold(
+                    cv2.cvtColor(cell, cv2.COLOR_RGB2GRAY), 180, 255,
+                    cv2.THRESH_BINARY_INV)[1])
+                if points is None:
+                    return "", 0.0
+                left, top, w, h = cv2.boundingRect(points)
+                # Tight text bounds are essential: blank padding otherwise makes
+                # the recognizer shrink already-small characters inside the cell.
+                cell = cv2.copyMakeBorder(cell[top:top+h, left:left+w], 2, 2, 2, 2,
+                                          cv2.BORDER_CONSTANT, value=(255, 255, 255))
+                result = engine(cell, use_det=False, use_cls=False, use_rec=True)
+                texts = getattr(result, "txts", None)
+                scores = getattr(result, "scores", None)
+                cache[key] = (
+                    clean_text(texts[0]) if texts is not None and len(texts) else "",
+                    float(scores[0]) if scores is not None and len(scores) else 0.0,
+                )
+            return cache[key]
+
+        header_row = None
+        for candidate in (0, len(ys) - 2):
+            first = _canonical_source_header(read_cell(candidate, 0)[0])
+            second = _canonical_source_header(read_cell(candidate, 1)[0])
+            if first == "ident_no" and second == "description_raw":
+                header_row = candidate
+                break
+        if header_row is None:
+            continue
+        extra_columns = {
+            column: _canonical_source_header(read_cell(header_row, column)[0])
+            for column in range(2, len(xs) - 1)
+        }
+        table: list[dict[str, Any]] = []
+        for row_number in range(len(ys) - 1):
+            if row_number == header_row:
+                continue
+            identifier, id_score = read_cell(row_number, 0)
+            description, desc_score = read_cell(row_number, 1)
+            if (not _is_engineering_article_identifier_value(identifier)
+                    or not re.search(r"[A-Za-z]", description)
+                    or min(id_score, desc_score) < .70):
+                table = []
+                break  # Do not claim complete coverage while dropping a cell.
+            record = {"ident_no": identifier, "description_raw": description,
+                      "confidence": min(id_score, desc_score), "quantity": None,
+                      "item_no": ""}
+            for column, field in extra_columns.items():
+                if field in {"quantity", "unit", "item_no"}:
+                    value, score = read_cell(row_number, column)
+                    record[field] = value
+                    if value:
+                        record["confidence"] = min(record["confidence"], score)
+            table.append(record)
+        keys = [normalize_key(row["ident_no"]) for row in table]
+        if len(table) < 2 or len(set(keys)) != len(keys):
+            return []  # A second unread table must not be hidden by the first.
+        records.extend(table)
+    return records
+
+
 def _local_drawing_evidence(
     page_number: int,
     markdown: str,
@@ -718,11 +854,14 @@ def recover_local_engineering_drawing_pages(
     progress: ProgressCallback | None = None,
     max_pages: int = 40,
     dpi: int = 220,
+    max_full_page_ocr: int = 12,
 ) -> tuple[list[tuple[int, str]], list[str], list[int]]:
     """Recover dense drawing tables locally with CPU OCR, failing open.
 
     Only pages already proven to be equipment drawings by native title/code
-    evidence are rendered.  A page is allowed to replace paid OCR only when the
+    evidence are rendered. Read bounded article grids cell-by-cell at 300 DPI
+    first; limit the slower full-page fallback separately. A page is allowed to
+    replace paid OCR only when the
     result contains at least three coherent orderable rows, two formal source rows,
     or a multi-entry coded legend.  Otherwise the page remains eligible for the
     existing Mistral OCR path.
@@ -760,6 +899,7 @@ def recover_local_engineering_drawing_pages(
 
     recovered: list[tuple[int, str]] = []
     confirmed: list[int] = []
+    full_page_attempts = 0
     try:
         for position, page_number in enumerate(ordered_pages, start=1):
             if progress:
@@ -770,6 +910,41 @@ def recover_local_engineering_drawing_pages(
                 )
             if not 1 <= page_number <= len(document):
                 continue
+            # A narrow cell-recognition pass avoids running the text detector on
+            # the whole drawing. At 300 DPI it preserves small suffixes and slashes.
+            try:
+                cell_pixmap = document[page_number - 1].get_pixmap(
+                    matrix=pymupdf.Matrix(300 / 72, 300 / 72), alpha=False)
+                cell_image = np.frombuffer(cell_pixmap.samples, dtype=np.uint8).reshape(
+                    cell_pixmap.height, cell_pixmap.width, 3)
+                cell_rows = []
+                for turns in (3, 1, 0, 2):
+                    cell_rows = _read_local_ruled_article_tables(
+                        np.rot90(cell_image, turns).copy(), engine)
+                    if cell_rows:
+                        break
+                if cell_rows:
+                    native_text = native_lookup.get(page_number, "").strip()
+                    table_lines = ["| Article No. | Name/Designation |",
+                                   "| --- | --- |"]
+                    table_lines.extend(
+                        f"| {row['ident_no']} | {row['description_raw']} |"
+                        for row in cell_rows)
+                    evidence = json.dumps(cell_rows, ensure_ascii=True)
+                    recovered.append((page_number, native_text + "\n\n"
+                        + "\n".join(table_lines) + "\n"
+                        + _LOCAL_CELL_MARKER + evidence + " -->"))
+                    confirmed.append(page_number)
+                    messages.append(f"Local 300-DPI grid-cell OCR recovered PDF page "
+                                    f"{page_number}: {len(cell_rows)} article rows; "
+                                    "printed headers and every row checked.")
+                    continue
+            except Exception as exc:
+                messages.append(f"Local cell retry bypassed on page {page_number} "
+                                f"({type(exc).__name__}); normal OCR remains available.")
+            if full_page_attempts >= max_full_page_ocr:
+                continue
+            full_page_attempts += 1
             try:
                 scale = max(1.5, min(4.2, float(dpi) / 72.0))
                 pixmap = document[page_number - 1].get_pixmap(
@@ -2208,7 +2383,9 @@ def _representative_profile_pages(
     max_chars_per_page: int = 7000,
 ) -> list[tuple[int, str]]:
     """Select an evenly distributed, bounded sample for one document-level pass."""
-    pages = [(int(page), str(markdown or "")) for page, markdown in extracted_pages]
+    pages = [(int(page), "\n".join(line for line in str(markdown or "").splitlines()
+              if not line.startswith(_LOCAL_CELL_MARKER)))
+             for page, markdown in extracted_pages]
     if len(pages) <= max(1, int(max_pages)):
         selected = pages
     else:
@@ -2684,13 +2861,19 @@ def extract_spare_parts_with_ai(
     If a single page still fails, the local markdown-table parser is used for that
     page so one bad response does not discard the remainder of a large manual.
     """
+    local_pages = [(page, text) for page, text in extracted_pages
+                   if _local_cell_rows(int(page), text)]
+    local_numbers = {int(page) for page, _ in local_pages}
     batches = _page_batches(
-        extracted_pages,
+        [(page, text) for page, text in extracted_pages if int(page) not in local_numbers],
         pages_per_batch=max(1, int(pages_per_batch)),
         max_chars=max(2000, int(max_chars_per_batch)),
     )
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = _direct_table_rows(local_pages)
     messages: list[str] = []
+    if local_pages:
+        messages.append(f"Used {len(rows)} local cell-table row(s) from {len(local_pages)} "
+                        "page(s) without a paid structured-extraction request for those pages.")
     extraction_profile = _document_extraction_profile(extracted_pages)
     profile_hint = _profile_prompt(extraction_profile)
     adaptive_profile_hint = _adaptive_profile_prompt(document_profile)
@@ -5159,6 +5342,14 @@ def _engineering_article_consensus_metadata(
 def _direct_table_rows(extracted_pages: Sequence[tuple[int, str]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for page_number, markdown in extracted_pages:
+        cell_rows = _local_cell_rows(int(page_number), markdown)
+        if cell_rows:
+            metadata = _page_metadata(int(page_number), markdown)
+            rows.extend({**row, "section_code": metadata.get("section_code", ""),
+                         "section_name_english": metadata.get("section_name_english", ""),
+                         "table_title": metadata.get("section_name_raw", "")}
+                        for row in cell_rows)
+            continue  # Never re-parse the same cells as additional fuzzy variants.
         page_row_start = len(rows)
         classic_catalog = _is_multilingual_order_catalog(markdown)
         article_drawing = _is_engineering_article_table(markdown)
@@ -8889,6 +9080,7 @@ def ensure_component_drawing_detail_spare_rows(
             *,
             item_no: Any = "",
             quantity: Any = None,
+            unit_value: Any = "",
             source_kind: str,
             confidence: float,
         ) -> bool:
@@ -8917,7 +9109,7 @@ def ensure_component_drawing_detail_spare_rows(
                     "DESCRIPTION": desc,
                     "CODE": ident,
                     "ITEM NO": clean_text(item_no).upper(),
-                    "UNIT": unit,
+                    "UNIT": normalize_unit(unit_value, unit),
                     "QNT": quantity_to_number(quantity),
                     "SOURCE PAGE": page_number,
                     "SECTION START PAGE": page_number,
@@ -8963,16 +9155,16 @@ def ensure_component_drawing_detail_spare_rows(
                     description,
                     item_no=direct.get("item_no", ""),
                     quantity=direct.get("quantity"),
+                    unit_value=direct.get("unit", ""),
                     source_kind=(
-                        "Headerless drawing variant table"
+                        "Local ruled article cells"
+                        if direct.get("source_layout") == "local ruled article cells"
+                        else "Headerless drawing variant table"
                         if direct.get("source_layout")
                         == "headerless two-column engineering variant table"
                         else "Embedded drawing Article-No. table"
                     ),
-                    confidence=max(
-                        0.90,
-                        clamp_confidence(direct.get("confidence", 0.90)),
-                    ),
+                    confidence=clamp_confidence(direct.get("confidence", 0.90)),
                 ):
                     article_added += 1
             # A genuine Article-No. table is the orderable source for this page;
@@ -9001,6 +9193,79 @@ def ensure_component_drawing_detail_spare_rows(
         legend_added,
         duplicates_skipped,
     )
+
+
+def reconcile_local_drawing_rows(
+    review_frame: pd.DataFrame,
+    extracted_pages: Sequence[tuple[int, str]],
+    component_candidates: pd.DataFrame,
+    default_unit: str = "PCS",
+) -> tuple[pd.DataFrame, list[str]]:
+    """Reconcile *fresh* extraction against fully read local article tables.
+
+    Call before merging with any saved review so manual changes stay untouched.
+    Exact source cells win over AI rewording. Unsupported, same-page alternatives
+    in a uniquely matching family are excluded but kept in the audit, never changed
+    into guessed identifiers. Unrelated families/pages and explicit kits survive.
+    """
+    local_pages = [(page, text) for page, text in extracted_pages
+                   if _local_cell_rows(int(page), text)]
+    if not local_pages:
+        return review_frame.copy(), []
+    source, _, _, _ = ensure_component_drawing_detail_spare_rows(
+        empty_review_dataframe(), local_pages, component_candidates, default_unit)
+    result = review_frame.copy()
+    if source.empty:
+        return result, []
+
+    def family(value: Any) -> str:
+        match = re.fullmatch(r"([A-Z0-9][A-Z0-9._/-]{4,19})[ -]([A-Z0-9./-]{1,6})",
+                             clean_text(value).upper())
+        return normalize_key(match.group(1)) if match else ""
+
+    corrected = excluded = added = 0
+    additions: list[dict[str, Any]] = []
+    for page, source_page in source.groupby("SOURCE PAGE"):
+        source_keys = {normalize_key(row["CODE"]): row for _, row in source_page.iterrows()}
+        source_families = {family(row["CODE"]) for _, row in source_page.iterrows()} - {""}
+        nouns = {clean_text(row["DESCRIPTION"]).upper().split()[0]
+                 for _, row in source_page.iterrows() if clean_text(row["DESCRIPTION"])}
+        page_indexes = result.index[pd.to_numeric(result["SOURCE PAGE"], errors="coerce").eq(page)]
+        seen: set[str] = set()
+        for index in page_indexes:
+            row = result.loc[index]
+            ident = clean_text(row.get("PART NO", "")) or clean_text(row.get("CODE", ""))
+            key = normalize_key(ident)
+            if not bool(row.get("INCLUDE", False)) or "manual" in clean_text(
+                row.get("ASSIGNMENT SOURCE", "")).lower():
+                if key in source_keys:
+                    seen.add(key)
+                continue
+            if key in source_keys and key not in seen:
+                replacement = source_keys[key]
+                result.loc[index, REVIEW_COLUMNS] = replacement[REVIEW_COLUMNS]
+                seen.add(key)
+                corrected += 1
+                continue
+            candidate_family = family(ident)
+            matches = [value for value in source_families if candidate_family and (
+                value == candidate_family or SequenceMatcher(None, value, candidate_family).ratio() >= .70)]
+            description = clean_text(row.get("DESCRIPTION", "")).upper().split()
+            if key in source_keys or (len(matches) == 1 and description and description[0] in nouns):
+                result.at[index, "INCLUDE"] = False
+                result.at[index, "READY"] = False
+                result.at[index, "WARNING"] = (
+            "Source: OCR alternative excluded after complete local cell-table reading; "
+                    f"Source: original value retained for audit (PDF page {int(page)})")
+                excluded += 1
+        additions.extend(row.to_dict() for key, row in source_keys.items() if key not in seen)
+    if additions:
+        added = len(additions)
+        result = pd.concat([result, pd.DataFrame(additions)], ignore_index=True)
+    return result[REVIEW_COLUMNS], [
+        f"Local cell evidence: refreshed {corrected} exact-code row(s), restored {added} "
+        f"source row(s), and retained {excluded} excluded OCR alternative(s) in the audit."
+    ]
 
 
 def remove_component_assembly_spare_rows(
@@ -9931,7 +10196,9 @@ def recalculate_review_status(
     ready_values: list[bool] = []
     for index, row in result.iterrows():
         if not bool(row.get("INCLUDE", False)):
-            warnings.append("Excluded from export")
+            source_notes = [message.strip() for message in clean_text(
+                row.get("WARNING", "")).split(";") if message.strip().startswith("Source:")]
+            warnings.append("; ".join(["Excluded from export", *source_notes]))
             ready_values.append(False)
             continue
         existing_warning = clean_text(row.get("WARNING", ""))
@@ -9946,6 +10213,11 @@ def recalculate_review_status(
         description = clean_text(row.get("DESCRIPTION", ""))
         item_no = clean_text(row.get("ITEM NO", ""))
         unit = clean_text(row.get("UNIT", "")).upper()
+        for field in ("PART NO", "CODE"):
+            value = row.get(field)
+            if isinstance(value, float) and pd.notna(value) and not value.is_integer():
+                row_messages.append(f"{field} is a decimal number; re-enter the printed identifier as text")
+                blocking = True
         if not machinery:
             row_messages.append("Missing sub-machinery")
             blocking = True
@@ -10016,6 +10288,10 @@ def build_benefit_workbook(
     selected = review_frame[
         review_frame["INCLUDE"].astype(bool) & review_frame["READY"].astype(bool)
     ].copy()
+    for field in ("PART NO", "CODE"):
+        if any(isinstance(value, float) and pd.notna(value) and not value.is_integer()
+               for value in selected.get(field, [])):
+            raise ValueError(f"{field} contains a decimal numeric value. Re-enter the source code as text before export.")
     if len(selected) > MAX_SPARE_ROWS:
         raise ValueError(f"Too many spare-parts rows; maximum is {MAX_SPARE_ROWS}.")
 
