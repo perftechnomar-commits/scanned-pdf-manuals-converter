@@ -98,6 +98,7 @@ try:
         ensure_component_drawing_detail_spare_rows,
         extract_positioned_pdf_context_pages,
         recover_local_engineering_drawing_pages,
+        reconcile_local_drawing_rows,
         remove_component_assembly_spare_rows,
         linked_machinery_rows_for_export,
         merge_component_candidates_with_native_priority,
@@ -123,6 +124,9 @@ except ImportError:
     def extract_positioned_pdf_context_pages(pdf_bytes, page_indexes=None):
         return []
 
+    def reconcile_local_drawing_rows(review_frame, extracted_pages, component_candidates, default_unit="PCS"):
+        return review_frame.copy(), []
+
     def recover_local_engineering_drawing_pages(
         pdf_bytes, native_pages, candidate_page_numbers, **kwargs
     ):
@@ -145,7 +149,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.19.1"
+APP_VERSION = "4.19.2"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -1674,7 +1678,8 @@ def _cached_local_engineering_drawing_pages(
         candidate_page_numbers=list(candidate_page_numbers),
         # Bound CPU time on very large manuals. Remaining drawings continue
         # through the normal OCR path, so this cap affects cost only, not coverage.
-        max_pages=max(1, min(12, len(candidate_page_numbers))),
+        max_pages=max(1, min(40, len(candidate_page_numbers))),
+        max_full_page_ocr=12,
         dpi=160,
     )
 
@@ -3430,7 +3435,7 @@ if active_workflow_step == "3. Sub-machineries":
                         width=_content_column_width(page_frame, "PARTS FOUND", 92, 135),
                     ),
                     "CONFIDENCE": st.column_config.ProgressColumn(
-                        "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%",
+                        "CONFIDENCE", min_value=0, max_value=1, format="percent",
                         width=_content_column_width(page_frame, "CONFIDENCE", 95, 135),
                     ),
                     "VARIANTS": None,
@@ -4009,6 +4014,18 @@ if active_workflow_step == "2. OCR":
                                 "with a unique source-PDF record."
                             )
 
+                    # Reconcile fresh rows before merging saved review data. Never
+                    # silently rewrite a user's previous edits or exclusions.
+                    fresh_components = merge_component_candidates_with_native_priority(
+                        build_component_drawing_candidates(ocr_context_pages, current_main_row(),
+                                                           source_document_name=source_document_name),
+                        build_component_drawing_candidates(native_context_pages, current_main_row(),
+                                                           source_document_name=source_document_name),
+                    )
+                    new_review, local_reconciliation_messages = reconcile_local_drawing_rows(
+                        new_review, catalog_context_pages, fresh_components, default_unit)
+                    extraction_messages.extend(local_reconciliation_messages)
+
                     if append_results:
                         st.session_state.extracted_pages = list(catalog_context_pages)
                         st.session_state.ocr_extracted_pages = list(ocr_context_pages)
@@ -4053,22 +4070,9 @@ if active_workflow_step == "2. OCR":
 
                     st.session_state.document_profile = document_profile
 
-                    ocr_component_candidates = build_component_drawing_candidates(
-                        ocr_context_pages,
-                        current_main_row(),
-                        source_document_name=source_document_name,
-                    )
-                    native_component_candidates = build_component_drawing_candidates(
-                        native_context_pages,
-                        current_main_row(),
-                        source_document_name=source_document_name,
-                    )
                     # Native searchable text is authoritative for drawing headings
                     # and document numbers; OCR candidates still recover scans.
-                    component_candidates = merge_component_candidates_with_native_priority(
-                        ocr_component_candidates,
-                        native_component_candidates,
-                    )
+                    component_candidates = fresh_components
                     (
                         combined_review,
                         drawing_article_rows_added,
@@ -4439,12 +4443,17 @@ if active_workflow_step == "4. Review spare parts":
             metric_cols[2].metric("Ready", counts["Ready"])
             metric_cols[3].metric("Needs correction", counts["Needs correction"])
             metric_cols[4].metric("Awaiting verification", int((low_confidence_mask & ~verified_mask).sum()))
-            metric_cols[5].metric("Low confidence", counts["Low confidence"])
+            metric_cols[5].metric("Low OCR confidence", counts["Low confidence"])
 
             verification_actions = st.columns([1.35, 3.65])
+            pending_count = int(pending_verification_mask.sum())
+            verified_low_count = int((low_confidence_mask & verified_mask).sum())
             with verification_actions[0]:
                 if st.button(
-                    "Verify all low-confidence rows",
+                    (f"Verify {pending_count} pending low-confidence rows" if pending_count
+                     else "All low-confidence rows verified" if verified_low_count
+                     else "No low-confidence rows to verify"),
+                    key="verify_all_low_confidence_rows",
                     type="primary",
                     use_container_width=True,
                     disabled=not bool(pending_verification_mask.any()),
@@ -4474,9 +4483,10 @@ if active_workflow_step == "4. Review spare parts":
                     st.rerun()
             with verification_actions[1]:
                 st.caption(
-                    "This clears confidence-related verification blocks across the whole "
-                    "document. Mandatory data checks still apply. Repeated part codes are "
-                    "automatically excluded while their source-page evidence remains in the audit."
+                    f"{verified_low_count} low-confidence row(s) already verified; "
+                    f"{pending_count} awaiting verification. Verification records your review; "
+                    "it does not change OCR scores or repair code typos. Required-field, "
+                    "machinery-link and unique-code checks still apply."
                 )
 
             toolbar = st.columns([1.45, 1.35, 1.0, 0.9, 0.9])
@@ -4768,7 +4778,7 @@ if active_workflow_step == "4. Review spare parts":
                         "SECTION MAKER": None,
                         "SECTION MODEL": None,
                         "CONFIDENCE": st.column_config.ProgressColumn(
-                            "CONFIDENCE", min_value=0, max_value=1, format="%.0f%%",
+                            "CONFIDENCE", min_value=0, max_value=1, format="percent",
                             width=_content_column_width(editor_source, "CONFIDENCE", 95, 135),
                         ),
                         "DETECTED MACHINERY": None,
