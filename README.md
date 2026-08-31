@@ -1,10 +1,70 @@
-# Spare Parts OCR Import Builder — optimized native-first recovery 4.19.1
+# Spare Parts OCR Import Builder — source-cell reconciliation 4.19.2
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.19.2 source-cell reading and clearer verification
+
+- Reads ruled Article No./Name-Designation tables one cell at a time at 300 DPI,
+  including rotated drawings and tables whose headers are at the bottom. This
+  reuses the existing CPU-only RapidOCR installation; no new API is added.
+- Identifies columns from printed headers, retains full part identifiers as text,
+  and keeps dimensions/weight out of quantity. It does not infer missing suffixes
+  from neighbouring codes or use a hard-coded parts catalogue.
+- Bypasses paid OCR and paid row structuring for successfully recovered cell-table
+  pages. Other pages keep the existing Mistral/fallback path. Existing optional
+  document analysis and language checks can still incur their normal API charges.
+- Reconciles fresh extracted rows against those cells before merging saved review
+  data. Exact source rows take priority; unsupported same-page OCR alternatives in
+  a uniquely matching family are excluded with original values retained in the
+  audit. Ambiguous matches remain for review. Raw OCR confidence is not inflated.
+- Keeps explicit CIP/FILTER spare-set extraction and the existing no-parent-as-spare
+  hierarchy. Does not restore a kit that a user deliberately excluded.
+- Shows confidence as a real percentage: a score of 0.95 now displays 95%, not 1%.
+  The verification button distinguishes pending rows from rows already verified.
+  Verification does not raise OCR scores, correct typos, or bypass required fields.
+- Preserves Excel identifiers as text, including `9007174 63/83` and leading zeros.
+  A fractional numeric CODE/PART NO is blocked instead of silently exporting a
+  number. This cannot prevent later manual conversion inside Excel: keep those
+  columns formatted as Text when editing.
+
+### Install this batch
+
+1. Back up the current code and any review/audit data you want to retain.
+2. Replace **both** `app.py` and `tools.py` together. Do not mix releases. Keep
+   your Streamlit Secrets, customised `vessels.csv`, and import template unchanged.
+   Requirements are unchanged from 4.19.1 and are included for completeness.
+3. Reboot the Streamlit app and confirm **Build 4.19.2 / Parser 4.19.2**.
+4. To evaluate the new OCR, use a fresh document job or reset its OCR/review data
+   after saving your reviewed export. Leave **Append** off for this comparison.
+   Old OCR results do not become new high-resolution results merely by reopening
+   a tab. A reset/reprocess replaces that job's review, so save your edits first.
+5. Balanced mode can use this path with the existing settings. Look in the
+   extraction log for `Local 300-DPI grid-cell OCR` and `Local cell evidence`.
+
+### Verification performed
+
+- Release regression covers source reconciliation, excluded/manual rows, ambiguous
+  families, quantities versus dimensions, missing-local-engine fallback, API-call
+  bypass, verification gating, text-code Excel export, and matching imports/builds.
+- On the supplied MSC ROMA PDF, seven problem tables (336, 339–344) recovered
+  **86/86 reference identifiers and descriptions** with correct drawing-parent
+  assignment. Comparisons ignore punctuation/spacing; spelling and numeric tokens
+  must match. Row counts: 33, 13, 13, 10, 3, 10, 4 respectively.
+- The existing hierarchy regression also passed: 22 drawing sub-machineries,
+  nine explicit spare-number rows, removal of legacy parent-as-spare rows, and
+  preservation of the CIP/FILTER spare sets.
+- These are targeted local tests, not a claim of perfect extraction across all
+  503 pages or a live Streamlit Cloud/API end-to-end run. No paid API requests
+  were made by the release tests.
+
+Run `python -m unittest discover -s tests -v` after installing requirements.
+Set the `MSC_ROMA_PDF` environment variable to your local PDF path to include
+the optional seven-page source regression. The small reference fixture is used
+only by tests; the PDF itself, workbooks, OCR weights, and keys are not bundled.
 
 ### 4.19.1 implementation cleanup
 
