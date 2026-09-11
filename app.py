@@ -149,7 +149,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.19.2"
+APP_VERSION = "4.19.4"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -469,13 +469,31 @@ def _content_column_width(
     return max(minimum, min(maximum, 18 + longest * 7))
 
 
-def _paged_editor_height(row_count: int) -> int:
+def _paged_editor_height(row_count: int, show_all: bool = False) -> int:
     """Grow paginated editors with the selected page size.
 
-    The browser page remains the scroll surface. Selecting 25 or 50 rows therefore
-    expands the table instead of trapping those rows inside a fixed 500px editor.
+    The browser page remains the scroll surface. The explicit All items option can
+    therefore render the complete review table instead of forcing page changes.
     """
-    return max(220, min(1800, 48 + 35 * max(0, int(row_count))))
+    maximum = 50000 if show_all else 1800
+    return max(220, min(maximum, 48 + 35 * max(0, int(row_count))))
+
+
+REVIEW_PAGE_SIZE_OPTIONS = [10, 25, 50, "All items"]
+
+
+def _resolved_page_size(choice: object, total_rows: int) -> int:
+    if str(choice).strip().lower() == "all items":
+        return max(1, int(total_rows))
+    try:
+        return max(1, int(choice))
+    except (TypeError, ValueError):
+        return 25
+
+
+def _reset_review_pagination(page_key: str, version_key: str) -> None:
+    st.session_state[page_key] = 1
+    st.session_state[version_key] = int(st.session_state.get(version_key, 0)) + 1
 
 
 def _auto_dataframe_config(
@@ -763,6 +781,7 @@ def initialize_state() -> None:
         "review_page_size": 25,
         "review_page_number": 1,
         "verified_review_rows": [],
+        "force_approved_review_rows": [],
         "source_page_lookup": 1,
         "prepared_email_subject": "",
         "prepared_email_body": "",
@@ -817,7 +836,10 @@ JOB_STATE_FIELDS = [
     "review_confidence_threshold",
     "review_page_size",
     "review_page_number",
+    "review_page_size",
+    "review_page_number",
     "verified_review_rows",
+    "force_approved_review_rows",
     "source_page_lookup",
     "prepared_email_subject",
     "prepared_email_body",
@@ -874,6 +896,7 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "review_page_size": 25,
         "review_page_number": 1,
         "verified_review_rows": [],
+        "force_approved_review_rows": [],
         "source_page_lookup": 1,
         "prepared_email_subject": "",
         "prepared_email_body": "",
@@ -915,6 +938,10 @@ def load_document_job(job_id: str) -> None:
             # Do not leak review decisions from a different document into an older
             # job created before the exclusion ledger existed.
             st.session_state.excluded_submachinery_keys = []
+        elif field == "force_approved_review_rows":
+            # An older job cannot inherit another document's explicit decision to
+            # bypass spare-row readiness warnings.
+            st.session_state.force_approved_review_rows = []
     st.session_state.loaded_job_id = job_id
     st.session_state.active_document_id = job_id
 
@@ -1378,6 +1405,7 @@ def render_processing_mode_controls() -> None:
 
 
 LOW_CONFIDENCE_REVIEW_WARNING = "Low confidence - manual verification required"
+MANUAL_EXPORT_APPROVAL_WARNING = "Manually approved for export despite validation warnings"
 
 
 def _review_row_id(row: pd.Series | dict) -> str:
@@ -1822,6 +1850,7 @@ def recalculate_review_with_verification(
     valid_machinery_names,
     verified_rows,
     confidence_threshold: float = 0.75,
+    approved_rows=None,
 ) -> pd.DataFrame:
     """Consolidate duplicate codes, validate rows, and enforce verification."""
     deduplicated, _ = _consolidate_duplicate_part_codes(frame)
@@ -1882,6 +1911,21 @@ def recalculate_review_with_verification(
             }
         ]
         warning_parts.append(LOW_CONFIDENCE_REVIEW_WARNING)
+        result.at[index, "WARNING"] = "; ".join(dict.fromkeys(warning_parts))
+
+    # This is an explicit user decision, kept separate from OCR confidence and
+    # ordinary manual verification. It bypasses spare-row readiness only for the
+    # exact included rows approved by the user; exclusions remain excluded.
+    approved = _verified_ids(approved_rows)
+    for index in result.index[included]:
+        if _review_row_id(result.loc[index]) not in approved:
+            continue
+        result.at[index, "READY"] = True
+        current_warning = str(result.at[index, "WARNING"] or "").strip()
+        warning_parts = [
+            part.strip() for part in current_warning.split(";") if part.strip()
+        ]
+        warning_parts.append(MANUAL_EXPORT_APPROVAL_WARNING)
         result.at[index, "WARNING"] = "; ".join(dict.fromkeys(warning_parts))
     return result
 
@@ -2222,6 +2266,7 @@ with st.expander("⚙️ Processing & export settings", expanded=False):
             st.session_state.prepared_email_subject = ""
             st.session_state.prepared_email_body = ""
             st.session_state.verified_review_rows = []
+            st.session_state.force_approved_review_rows = []
             st.session_state.review_page_number = 1
             st.session_state.editor_version += 1
             st.session_state.submachinery_editor_version += 1
@@ -2491,6 +2536,7 @@ def _apply_submachinery_changes_to_spares(
         confidence_threshold=float(
             st.session_state.get("review_confidence_threshold", 0.75)
         ),
+        approved_rows=st.session_state.get("force_approved_review_rows", []),
     )
     st.session_state.output = None
     st.session_state.multi_package_output = None
@@ -2620,6 +2666,9 @@ def _autosave_spare_review_page(editor_key: str, target_indexes: list[object]) -
 
     updated_full = st.session_state.spare_review.copy()
     verified = _verified_ids(st.session_state.verified_review_rows)
+    approved = _verified_ids(
+        st.session_state.get("force_approved_review_rows", [])
+    )
     editable_columns = {
         "INCLUDE", "MACHINERY", "PART NO", "DESCRIPTION", "CODE",
         "ITEM NO", "UNIT", "QNT",
@@ -2646,6 +2695,9 @@ def _autosave_spare_review_page(editor_key: str, target_indexes: list[object]) -
         if old_row_id in verified and old_row_id != new_row_id:
             verified.discard(old_row_id)
             verified.add(new_row_id)
+        if old_row_id in approved and old_row_id != new_row_id:
+            approved.discard(old_row_id)
+            approved.add(new_row_id)
 
         if "VERIFIED" in changes:
             if bool(changes["VERIFIED"]):
@@ -2661,12 +2713,14 @@ def _autosave_spare_review_page(editor_key: str, target_indexes: list[object]) -
         return
 
     st.session_state.verified_review_rows = sorted(verified)
+    st.session_state.force_approved_review_rows = sorted(approved)
     valid_machinery_names = current_valid_submachinery_names()
     st.session_state.spare_review = recalculate_review_with_verification(
         updated_full,
         valid_machinery_names=valid_machinery_names,
         verified_rows=st.session_state.verified_review_rows,
         confidence_threshold=float(st.session_state.review_confidence_threshold),
+        approved_rows=st.session_state.get("force_approved_review_rows", []),
     )
     st.session_state.output = None
     st.session_state.multi_package_output = None
@@ -3117,6 +3171,9 @@ if active_workflow_step == "3. Sub-machineries":
                     confidence_threshold=float(
                         st.session_state.review_confidence_threshold
                     ),
+                    approved_rows=st.session_state.get(
+                        "force_approved_review_rows", []
+                    ),
                 )
                 st.session_state.editor_version += 1
                 st.session_state.output = None
@@ -3286,17 +3343,18 @@ if active_workflow_step == "3. Sub-machineries":
                 "automatically return to the main machinery when you save."
             )
 
-            # Render only a small number of rows at a time. This removes the internal
-            # vertical-scroll trap that could prevent the browser page from reaching
-            # the save button and the lower controls.
+            # Keep manageable paging by default while allowing users who prefer
+            # browser scrolling to render the complete table on one page.
             total_submachineries = len(candidate_frame)
             # Keep this aligned with the spare-parts review so users have the
             # same predictable paging choices throughout the workflow.
-            page_size_options = [10, 25, 50]
-            if int(st.session_state.get("submachinery_page_size", 10)) not in page_size_options:
+            page_size_options = REVIEW_PAGE_SIZE_OPTIONS
+            page_size_choice = st.session_state.get("submachinery_page_size", 10)
+            if page_size_choice not in page_size_options:
                 st.session_state.submachinery_page_size = 10
+                page_size_choice = 10
 
-            page_size = int(st.session_state.submachinery_page_size)
+            page_size = _resolved_page_size(page_size_choice, total_submachineries)
             total_pages = max(1, (total_submachineries + page_size - 1) // page_size)
             current_page = max(
                 1,
@@ -3340,20 +3398,24 @@ if active_workflow_step == "3. Sub-machineries":
                 requested_page_size = st.selectbox(
                     "Rows/page",
                     options=page_size_options,
-                    index=page_size_options.index(page_size),
+                    index=page_size_options.index(page_size_choice),
                     key="submachinery_page_size",
+                    on_change=_reset_review_pagination,
+                    args=("submachinery_page_number", "submachinery_editor_version"),
                 )
-                if int(requested_page_size) != page_size:
-                    st.session_state.submachinery_page_number = 1
-                    st.session_state.submachinery_editor_version += 1
-                    st.rerun()
             with page_toolbar[4]:
                 start_row = (current_page - 1) * page_size
                 end_row = min(start_row + page_size, total_submachineries)
-                st.info(
-                    f"Showing rows {start_row + 1}-{end_row} of {total_submachineries} "
-                    f"· page {current_page}/{total_pages}. Select Save below to commit edits."
-                )
+                if page_size_choice == "All items":
+                    st.info(
+                        f"Showing all {total_submachineries} rows on one scrolling page. "
+                        "Select Save below to commit edits."
+                    )
+                else:
+                    st.info(
+                        f"Showing rows {start_row + 1}-{end_row} of {total_submachineries} "
+                        f"· page {current_page}/{total_pages}. Select Save below to commit edits."
+                    )
 
             page_indexes = candidate_frame.index[start_row:end_row].tolist()
             page_frame = candidate_frame.loc[page_indexes].copy()
@@ -3376,7 +3438,9 @@ if active_workflow_step == "3. Sub-machineries":
                 num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
-                height=_paged_editor_height(len(page_frame)),
+                height=_paged_editor_height(
+                    len(page_frame), show_all=page_size_choice == "All items"
+                ),
                 disabled=[
                     "MCH_TP(M/S/U)",
                     "FIRST PAGE",
@@ -4066,6 +4130,7 @@ if active_workflow_step == "2. OCR":
                         previous_candidates = empty_submachinery_review_dataframe()
                         st.session_state.excluded_submachinery_keys = []
                         st.session_state.verified_review_rows = []
+                        st.session_state.force_approved_review_rows = []
                         st.session_state.review_page_number = 1
 
                     st.session_state.document_profile = document_profile
@@ -4154,6 +4219,9 @@ if active_workflow_step == "2. OCR":
                         valid_machinery_names=valid_auto_names,
                         verified_rows=st.session_state.verified_review_rows,
                         confidence_threshold=float(st.session_state.review_confidence_threshold),
+                        approved_rows=st.session_state.get(
+                            "force_approved_review_rows", []
+                        ),
                     )
                     st.session_state.submachinery_review = merged_candidates
                     st.session_state.spare_review = assigned_review
@@ -4366,7 +4434,8 @@ if active_workflow_step == "4. Review spare parts":
         st.subheader("Step 4 — Spares")
         st.caption(
             "Low-confidence records remain blocked until you explicitly mark them as "
-            "verified. The paginated editor renders only one manageable page at a time."
+            "verified or apply the deliberate export override. Choose All items when "
+            "you prefer one browser-scrolling review page."
         )
         st.info(
             f"Main machinery: **{st.session_state.main_name or '-'}**. "
@@ -4407,6 +4476,9 @@ if active_workflow_step == "4. Review spare parts":
                 valid_machinery_names=valid_machinery_names,
                 verified_rows=st.session_state.verified_review_rows,
                 confidence_threshold=threshold,
+                approved_rows=st.session_state.get(
+                    "force_approved_review_rows", []
+                ),
             )
             st.session_state.spare_review = full_status.copy()
 
@@ -4473,6 +4545,9 @@ if active_workflow_step == "4. Review spare parts":
                         valid_machinery_names=valid_machinery_names,
                         verified_rows=st.session_state.verified_review_rows,
                         confidence_threshold=threshold,
+                        approved_rows=st.session_state.get(
+                            "force_approved_review_rows", []
+                        ),
                     )
                     st.session_state.editor_version += 1
                     save_loaded_job_state()
@@ -4488,6 +4563,90 @@ if active_workflow_step == "4. Review spare parts":
                     "it does not change OCR scores or repair code typos. Required-field, "
                     "machinery-link and unique-code checks still apply."
                 )
+
+            approved_ids = _verified_ids(
+                st.session_state.get("force_approved_review_rows", [])
+            )
+            included_row_ids = {
+                _review_row_id(row)
+                for _, row in full_status.loc[included_mask].iterrows()
+            }
+            approved_included_count = len(approved_ids & included_row_ids)
+            approval_actions = st.columns([1.55, 1.65, 1.15, 2.65])
+            with approval_actions[0]:
+                approve_all_confirmed = st.checkbox(
+                    "I accept all current warnings",
+                    key="confirm_force_approve_all_spares",
+                    help=(
+                        "This records an explicit export override for every currently "
+                        "included spare row."
+                    ),
+                )
+            with approval_actions[1]:
+                if st.button(
+                    f"Approve all {int(included_mask.sum())} included rows",
+                    key="force_approve_all_spares",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(not approve_all_confirmed or not bool(included_mask.any())),
+                    help=(
+                        "Allow all currently included spare rows to proceed to export "
+                        "even when ordinary READY validation reports warnings."
+                    ),
+                ):
+                    approved_ids.update(included_row_ids)
+                    st.session_state.force_approved_review_rows = sorted(approved_ids)
+                    st.session_state.spare_review = recalculate_review_with_verification(
+                        full_status,
+                        valid_machinery_names=valid_machinery_names,
+                        verified_rows=st.session_state.verified_review_rows,
+                        confidence_threshold=threshold,
+                        approved_rows=st.session_state.force_approved_review_rows,
+                    )
+                    st.session_state.output = None
+                    st.session_state.multi_package_output = None
+                    st.session_state.editor_version += 1
+                    save_loaded_job_state()
+                    st.session_state.review_flash = (
+                        f"Approved all {len(included_row_ids)} currently included "
+                        "spare-part row(s) for export. Excluded rows remain excluded."
+                    )
+                    st.rerun()
+            with approval_actions[2]:
+                if st.button(
+                    "Remove overrides",
+                    key="remove_force_approved_spares",
+                    use_container_width=True,
+                    disabled=approved_included_count == 0,
+                    help="Restore normal READY validation for all bulk-approved rows.",
+                ):
+                    st.session_state.force_approved_review_rows = []
+                    st.session_state.spare_review = recalculate_review_with_verification(
+                        full_status,
+                        valid_machinery_names=valid_machinery_names,
+                        verified_rows=st.session_state.verified_review_rows,
+                        confidence_threshold=threshold,
+                        approved_rows=[],
+                    )
+                    st.session_state.output = None
+                    st.session_state.multi_package_output = None
+                    st.session_state.editor_version += 1
+                    save_loaded_job_state()
+                    st.session_state.review_flash = (
+                        "Removed all bulk export approvals and restored normal READY validation."
+                    )
+                    st.rerun()
+            with approval_actions[3]:
+                st.caption(
+                    f"{approved_included_count} included row(s) currently have an explicit "
+                    "export override. Excluded rows are never re-included. Machinery hierarchy, "
+                    "template capacity and identifier-format safeguards still apply."
+                )
+
+            review_page_size_choice = st.session_state.get("review_page_size", 25)
+            if review_page_size_choice not in REVIEW_PAGE_SIZE_OPTIONS:
+                st.session_state.review_page_size = 25
+                review_page_size_choice = 25
 
             toolbar = st.columns([1.45, 1.35, 1.0, 0.9, 0.9])
             with toolbar[0]:
@@ -4532,8 +4691,10 @@ if active_workflow_step == "4. Review spare parts":
             with toolbar[3]:
                 st.selectbox(
                     "Rows/page",
-                    [10, 25, 50],
+                    REVIEW_PAGE_SIZE_OPTIONS,
                     key="review_page_size",
+                    on_change=_reset_review_pagination,
+                    args=("review_page_number", "editor_version"),
                 )
             with toolbar[4]:
                 st.write("")
@@ -4600,7 +4761,9 @@ if active_workflow_step == "4. Review spare parts":
                 else:
                     st.info(f"No rows match the {review_filter.lower()} view.")
             else:
-                page_size = int(st.session_state.review_page_size)
+                page_size = _resolved_page_size(
+                    review_page_size_choice, len(visible)
+                )
                 total_pages = max(1, (len(visible) + page_size - 1) // page_size)
                 current_page = max(1, min(int(st.session_state.review_page_number), total_pages))
                 st.session_state.review_page_number = current_page
@@ -4629,10 +4792,15 @@ if active_workflow_step == "4. Review spare parts":
                 with page_controls[3]:
                     start_row = (current_page - 1) * page_size
                     end_row = min(start_row + page_size, len(visible))
-                    st.info(
-                        f"Showing rows {start_row + 1}-{end_row} of {len(visible)} "
-                        f"· page {current_page}/{total_pages}"
-                    )
+                    if review_page_size_choice == "All items":
+                        st.info(
+                            f"Showing all {len(visible)} matching rows on one scrolling page."
+                        )
+                    else:
+                        st.info(
+                            f"Showing rows {start_row + 1}-{end_row} of {len(visible)} "
+                            f"· page {current_page}/{total_pages}"
+                        )
 
                 page_visible = visible.iloc[start_row:end_row].copy()
                 source_pages = sorted(
@@ -4715,7 +4883,10 @@ if active_workflow_step == "4. Review spare parts":
                     num_rows="fixed",
                     use_container_width=True,
                     hide_index=True,
-                    height=_paged_editor_height(len(editor_source)),
+                    height=_paged_editor_height(
+                        len(editor_source),
+                        show_all=review_page_size_choice == "All items",
+                    ),
                     disabled=[
                         "READY",
                         "SOURCE PAGE",
@@ -5000,6 +5171,7 @@ def build_multi_document_package(
                 valid_machinery_names=valid_names,
                 verified_rows=job.get("verified_review_rows", []),
                 confidence_threshold=float(job.get("review_confidence_threshold", 0.75)),
+                approved_rows=job.get("force_approved_review_rows", []),
             )
             included = review[review["INCLUDE"].astype(bool)] if not review.empty else review
             blocked = included[~included["READY"].astype(bool)] if not included.empty else included
@@ -5163,11 +5335,19 @@ if active_workflow_step == "5. Export":
             valid_machinery_names=valid_machinery_names,
             verified_rows=st.session_state.verified_review_rows,
             confidence_threshold=float(st.session_state.review_confidence_threshold),
+            approved_rows=st.session_state.get("force_approved_review_rows", []),
         )
         st.session_state.spare_review = export_review
 
         included = export_review[export_review["INCLUDE"].astype(bool)]
         blocked = included[~included["READY"].astype(bool)]
+        export_approved_ids = _verified_ids(
+            st.session_state.get("force_approved_review_rows", [])
+        )
+        override_export_count = sum(
+            _review_row_id(row) in export_approved_ids
+            for _, row in included.iterrows()
+        )
         machinery_frame = linked_machinery_rows_for_export(
             review_machinery_frame,
             export_review,
@@ -5196,7 +5376,13 @@ if active_workflow_step == "5. Export":
             for error in hierarchy_errors:
                 st.error(error)
         if blocked.empty and not included.empty:
-            st.success(f"{len(included)} included spare-part row(s) are ready.")
+            if override_export_count:
+                st.warning(
+                    f"{len(included)} included spare-part row(s) can be exported; "
+                    f"{override_export_count} proceed under your explicit export override."
+                )
+            else:
+                st.success(f"{len(included)} included spare-part row(s) are ready.")
         elif included.empty:
             st.error(
                 "Include at least one spare-part row. Unlinked machinery/drawing "
