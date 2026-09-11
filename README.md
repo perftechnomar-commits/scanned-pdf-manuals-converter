@@ -1,10 +1,40 @@
-# Spare Parts OCR Import Builder — source-cell reconciliation 4.19.2
+# Spare Parts OCR Import Builder — bulk approval and scrolling review 4.19.4
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
 same locations.
 
 ## What changed
+
+### 4.19.4 bulk export approval and all-items review
+
+- Adds an explicit **Approve all included rows** action in Step 4. After the user
+  confirms that current warnings are accepted, those exact included spare rows can
+  proceed to export even when ordinary READY validation would block them.
+- Keeps bulk approval separate from OCR confidence and normal verification, records
+  the override in each affected row's warning/audit trail, preserves exclusions,
+  and provides a **Remove overrides** action.
+- Keeps hierarchy integrity, template capacity, vessel/machinery requirements and
+  identifier-format safeguards active during an override.
+- Adds **All items** to Rows/page in both Step 3 Sub-machineries and Step 4 Spares.
+  The complete selected view expands onto one browser-scrolling page; the existing
+  10, 25 and 50 row pagination options remain available.
+- Persists bulk approvals and both page-size choices independently for every PDF
+  document job. A fresh non-Append OCR run clears the prior approval decisions.
+
+### 4.19.3 resilient Mistral pacing and rate-limit recovery
+
+- Paces OCR and chat-completion requests across concurrent Streamlit sessions so
+  Balanced mode does not create avoidable request bursts.
+- Honors Mistral's `Retry-After` header and otherwise uses bounded exponential
+  backoff with jitter for HTTP 429 and transient service responses.
+- If a Balanced OCR chunk still receives HTTP 429 after automatic retries, halves
+  only that chunk and retries its smaller page ranges without rerunning earlier
+  successful chunks. Original PDF page numbers are retained.
+- Reports the exact failing stage, model, HTTP status and PDF page range instead of
+  describing every Mistral failure as a generic OCR quota problem.
+- Leaves extraction prompts, deterministic reconciliation, manual overrides,
+  Append behavior, zero-part machinery and Excel export logic unchanged.
 
 ### 4.19.2 source-cell reading and clearer verification
 
