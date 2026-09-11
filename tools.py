@@ -4,13 +4,16 @@ import base64
 import io
 import json
 import os
+import random
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 import requests
@@ -19,7 +22,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.19.2"
+TOOLS_VERSION = "4.19.4"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -93,6 +96,32 @@ MAX_MACHINERY_ROWS = 605  # B5:B609 is the template's named machinery range.
 MAX_SPARE_ROWS = 1438  # Rows 4:1441 in the spare-parts import sheet.
 
 ProgressCallback = Callable[[int, int, str], None]
+
+
+class MistralRequestError(RuntimeError):
+    """Structured Mistral failure that keeps the endpoint stage and model visible."""
+
+    def __init__(
+        self,
+        stage: str,
+        model: str,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.stage = str(stage or "request").strip() or "request"
+        self.model = str(model or "unknown").strip() or "unknown"
+        self.status_code = status_code
+        self.retryable = bool(retryable)
+
+
+# Preserve the coordinator when Streamlit reloads this module during a live run.
+if "_MISTRAL_RATE_LOCK" not in globals():
+    _MISTRAL_RATE_LOCK = threading.Lock()
+if "_MISTRAL_NEXT_REQUEST_AT" not in globals():
+    _MISTRAL_NEXT_REQUEST_AT: dict[str, float] = {}
 
 PAGE_CLASSIFICATION_COLUMNS = [
     "SOURCE PAGE",
@@ -305,12 +334,58 @@ def _safe_api_error_text(value: Any, api_key: str = "") -> str:
     return text[:1200]
 
 
+def _mistral_request_interval(endpoint_kind: str) -> float:
+    """Return a small cross-session pacing interval for one Mistral endpoint."""
+    kind = "OCR" if str(endpoint_kind).strip().upper() == "OCR" else "CHAT"
+    variable = f"MISTRAL_{kind}_MIN_INTERVAL_SECONDS"
+    default = 0.75 if kind == "OCR" else 0.35
+    try:
+        return max(0.0, min(10.0, float(os.getenv(variable, default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _wait_for_mistral_slot(endpoint_kind: str, model: str) -> None:
+    """Pace requests across concurrent Streamlit sessions in this process."""
+    interval = _mistral_request_interval(endpoint_kind)
+    if interval <= 0:
+        return
+    bucket = f"{str(endpoint_kind).strip().upper()}:{str(model).strip().lower()}"
+    now = time.monotonic()
+    with _MISTRAL_RATE_LOCK:
+        scheduled = max(now, _MISTRAL_NEXT_REQUEST_AT.get(bucket, now))
+        _MISTRAL_NEXT_REQUEST_AT[bucket] = scheduled + interval
+    delay = scheduled - now
+    if delay > 0:
+        time.sleep(delay)
+
+
+def _mistral_retry_delay(response: requests.Response | None, attempt: int) -> float:
+    """Honor Retry-After, otherwise use bounded exponential backoff with jitter."""
+    retry_after = response.headers.get("Retry-After", "") if response is not None else ""
+    if retry_after:
+        try:
+            return max(0.5, min(90.0, float(retry_after)))
+        except (TypeError, ValueError):
+            try:
+                retry_time = parsedate_to_datetime(retry_after)
+                if retry_time.tzinfo is None:
+                    retry_time = retry_time.replace(tzinfo=timezone.utc)
+                seconds = (retry_time - datetime.now(timezone.utc)).total_seconds()
+                return max(0.5, min(90.0, seconds))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    base = min(30.0, float(2 ** max(0, attempt - 1)))
+    return base + random.uniform(0.0, min(2.0, base * 0.25))
+
+
 def _mistral_ocr_request(
     api_key: str,
     document: dict[str, str],
     model: str = "mistral-ocr-latest",
     timeout_seconds: int = 600,
     max_retries: int = 5,
+    stage: str = "OCR",
 ) -> dict[str, Any]:
     """Call Mistral's official OCR REST endpoint directly.
 
@@ -331,11 +406,13 @@ def _mistral_ocr_request(
         "Accept": "application/json",
     }
 
-    retryable_statuses = {404, 408, 409, 425, 429, 500, 502, 503, 504}
+    retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
     last_error: Exception | None = None
+    attempts = max(1, int(max_retries))
 
-    for attempt in range(1, max(1, int(max_retries)) + 1):
+    for attempt in range(1, attempts + 1):
         try:
+            _wait_for_mistral_slot("OCR", model)
             response = requests.post(
                 endpoint,
                 headers=headers,
@@ -358,51 +435,67 @@ def _mistral_ocr_request(
                 body_value = response.text
             detail = _safe_api_error_text(body_value, key)
 
-            if response.status_code in retryable_statuses and attempt < max_retries:
-                retry_after = response.headers.get("Retry-After", "")
-                try:
-                    delay = max(1.0, float(retry_after))
-                except (TypeError, ValueError):
-                    delay = min(20.0, float(2 ** (attempt - 1)))
-                time.sleep(delay)
+            if response.status_code in retryable_statuses and attempt < attempts:
+                time.sleep(_mistral_retry_delay(response, attempt))
                 continue
 
             if response.status_code in {401, 403}:
-                raise RuntimeError(
-                    f"Mistral OCR authentication failed (HTTP {response.status_code}). "
+                raise MistralRequestError(
+                    stage,
+                    model,
+                    f"Mistral {stage} failed using model {model} "
+                    f"(HTTP {response.status_code}: authentication/permission). "
                     "Verify the key stored in Streamlit Secrets and its workspace access. "
-                    f"Service response: {detail or 'No additional details.'}"
+                    f"Service response: {detail or 'No additional details.'}",
+                    status_code=response.status_code,
                 )
             if response.status_code == 402:
-                raise RuntimeError(
-                    "Mistral OCR rejected the request because billing or workspace "
-                    f"payment is not enabled (HTTP 402). Service response: {detail}"
+                raise MistralRequestError(
+                    stage,
+                    model,
+                    f"Mistral {stage} failed using model {model} because billing or "
+                    f"workspace payment is not enabled (HTTP 402). Service response: {detail}",
+                    status_code=402,
                 )
             if response.status_code == 429:
-                raise RuntimeError(
-                    "Mistral OCR rate or usage limit reached (HTTP 429). Wait and retry, "
-                    f"or check the workspace Limits and Usage pages. Service response: {detail}"
+                raise MistralRequestError(
+                    stage,
+                    model,
+                    f"Mistral {stage} failed using model {model} after {attempts} "
+                    "rate-limited attempts (HTTP 429). Automatic backoff was exhausted; "
+                    "the caller may reduce the OCR chunk and retry. "
+                    f"Service response: {detail or 'No additional details.'}",
+                    status_code=429,
+                    retryable=True,
                 )
-            raise RuntimeError(
-                f"Mistral OCR request failed (HTTP {response.status_code}). "
-                f"Service response: {detail or 'No additional details.'}"
+            raise MistralRequestError(
+                stage,
+                model,
+                f"Mistral {stage} failed using model {model} "
+                f"(HTTP {response.status_code}). Service response: "
+                f"{detail or 'No additional details.'}",
+                status_code=response.status_code,
+                retryable=response.status_code in retryable_statuses,
             )
         except requests.Timeout as exc:
             last_error = exc
-            if attempt < max_retries:
-                time.sleep(min(20.0, float(2 ** (attempt - 1))))
+            if attempt < attempts:
+                time.sleep(_mistral_retry_delay(None, attempt))
                 continue
         except requests.RequestException as exc:
             last_error = exc
-            if attempt < max_retries:
-                time.sleep(min(20.0, float(2 ** (attempt - 1))))
+            if attempt < attempts:
+                time.sleep(_mistral_retry_delay(None, attempt))
                 continue
-        except RuntimeError:
+        except MistralRequestError:
             raise
 
-    raise RuntimeError(
-        "Mistral OCR could not be reached after repeated attempts: "
-        + _safe_api_error_text(last_error, key)
+    raise MistralRequestError(
+        stage,
+        model,
+        f"Mistral {stage} could not be reached using model {model} after "
+        f"{attempts} attempts: {_safe_api_error_text(last_error, key)}",
+        retryable=True,
     )
 
 
@@ -449,7 +542,67 @@ def ocr_pdf_bytes(
     page_chunks = list(chunks(indexes, pages_per_request))
     extracted: list[tuple[int, str]] = []
 
-    for chunk_number, page_chunk in enumerate(page_chunks, start=1):
+    def process_page_chunk(
+        page_chunk: list[int],
+        chunk_label: str,
+        split_depth: int = 0,
+    ) -> list[tuple[int, str]]:
+        """OCR one chunk and halve it only after persistent HTTP 429 responses."""
+        writer = PdfWriter()
+        for index in page_chunk:
+            writer.add_page(reader.pages[index])
+
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        first_page = page_chunk[0] + 1
+        last_page = page_chunk[-1] + 1
+        try:
+            response = _mistral_ocr_request(
+                api_key=api_key,
+                document={
+                    "type": "document_url",
+                    "document_url": _pdf_data_url(buffer.getvalue()),
+                },
+                stage=f"OCR PDF pages {first_page}-{last_page}",
+            )
+        except MistralRequestError as exc:
+            if exc.status_code == 429 and len(page_chunk) > 1 and split_depth < 2:
+                midpoint = max(1, len(page_chunk) // 2)
+                if progress:
+                    progress(
+                        chunk_number - 1,
+                        len(page_chunks),
+                        f"Rate limit on {chunk_label}; retrying smaller OCR chunks",
+                    )
+                return (
+                    process_page_chunk(
+                        page_chunk[:midpoint], f"{chunk_label}.1", split_depth + 1
+                    )
+                    + process_page_chunk(
+                        page_chunk[midpoint:], f"{chunk_label}.2", split_depth + 1
+                    )
+                )
+            raise
+
+        response_pages = _response_pages(response)
+        if not response_pages:
+            raise RuntimeError(
+                f"OCR {chunk_label} (PDF pages {first_page}-{last_page}) completed "
+                "but returned no pages."
+            )
+
+        chunk_results: list[tuple[int, str]] = []
+        for local_index, page in enumerate(response_pages):
+            if local_index >= len(page_chunk):
+                break
+            original_page = page_chunk[local_index] + 1
+            chunk_results.append(
+                (original_page, clean_markdown(page.get("markdown", "")))
+            )
+        return chunk_results
+
+    for chunk_number, raw_page_chunk in enumerate(page_chunks, start=1):
+        page_chunk = list(raw_page_chunk)
         if progress:
             progress(
                 chunk_number - 1,
@@ -457,31 +610,9 @@ def ocr_pdf_bytes(
                 f"OCR request {chunk_number}/{len(page_chunks)}",
             )
 
-        writer = PdfWriter()
-        for index in page_chunk:
-            writer.add_page(reader.pages[index])
-
-        buffer = io.BytesIO()
-        writer.write(buffer)
-        response = _mistral_ocr_request(
-            api_key=api_key,
-            document={
-                "type": "document_url",
-                "document_url": _pdf_data_url(buffer.getvalue()),
-            },
+        extracted.extend(
+            process_page_chunk(page_chunk, f"request {chunk_number}/{len(page_chunks)}")
         )
-
-        response_pages = _response_pages(response)
-        if not response_pages:
-            raise RuntimeError(
-                f"OCR request {chunk_number}/{len(page_chunks)} completed but returned no pages."
-            )
-
-        for local_index, page in enumerate(response_pages):
-            if local_index >= len(page_chunk):
-                break
-            original_page = page_chunk[local_index] + 1
-            extracted.append((original_page, clean_markdown(page.get("markdown", ""))))
 
         if progress:
             progress(
@@ -501,6 +632,7 @@ def ocr_document_url(api_key: str, document_url: str) -> list[tuple[int, str]]:
             "type": "document_url",
             "document_url": clean_text(document_url),
         },
+        stage="OCR document URL",
     )
     return [
         (index + 1, clean_markdown(page.get("markdown", "")))
@@ -515,6 +647,7 @@ def ocr_image_bytes(api_key: str, image_bytes: bytes, suffix: str) -> list[tuple
             "type": "image_url",
             "image_url": _image_data_url(image_bytes, suffix),
         },
+        stage="OCR uploaded image",
     )
     return [
         (index + 1, clean_markdown(page.get("markdown", "")))
@@ -529,6 +662,7 @@ def ocr_image_url(api_key: str, image_url: str) -> list[tuple[int, str]]:
             "type": "image_url",
             "image_url": clean_text(image_url),
         },
+        stage="OCR image URL",
     )
     return [
         (index + 1, clean_markdown(page.get("markdown", "")))
@@ -1210,6 +1344,10 @@ def _focused_engineering_region_ocr(
                     "type": "document_url",
                     "document_url": _pdf_data_url(crop_bytes),
                 },
+                stage=(
+                    f"focused drawing-region OCR on PDF page {page_number} "
+                    f"({label.lower()})"
+                ),
             )
             response_pages = _response_pages(response)
             region_markdown = (
@@ -1351,6 +1489,10 @@ def recover_rotated_engineering_drawing_pages(
                 response = _mistral_ocr_request(
                     api_key=api_key,
                     document={"type": "document_url", "document_url": _pdf_data_url(buffer.getvalue())},
+                    stage=(
+                        f"drawing-orientation OCR on PDF page {page_number} "
+                        f"({rotation} degrees)"
+                    ),
                 )
                 response_pages = _response_pages(response)
                 rescue_markdown = clean_markdown(response_pages[0].get("markdown", "")) if response_pages else ""
@@ -2124,40 +2266,73 @@ def _mistral_json_request(
     model: str,
     messages: list[dict[str, str]],
     timeout_seconds: int = 300,
-    max_retries: int = 2,
+    max_retries: int = 5,
+    stage: str = "structured extraction",
 ) -> dict[str, Any]:
     endpoint = os.getenv(
         "MISTRAL_CHAT_COMPLETIONS_URL",
         "https://api.mistral.ai/v1/chat/completions",
     )
+    key = _normalize_api_key(api_key)
+    selected_model = clean_text(model) or "mistral-small-latest"
     payload = {
-        "model": model,
+        "model": selected_model,
         "messages": messages,
         "temperature": 0,
         "response_format": {"type": "json_object"},
         "max_tokens": 8192,
     }
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
     last_error: Exception | None = None
-    for attempt in range(max_retries):
+    attempts = max(1, int(max_retries))
+    retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+    for attempt in range(1, attempts + 1):
         try:
+            _wait_for_mistral_slot("CHAT", selected_model)
             response = requests.post(
                 endpoint,
                 headers=headers,
                 json=payload,
                 timeout=timeout_seconds,
             )
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries - 1:
-                time.sleep(2 ** (attempt + 1))
+            if response.status_code in retryable_statuses and attempt < attempts:
+                time.sleep(_mistral_retry_delay(response, attempt))
                 continue
-            response.raise_for_status()
+            if not 200 <= response.status_code < 300:
+                try:
+                    body_value: Any = response.json()
+                except ValueError:
+                    body_value = response.text
+                detail = _safe_api_error_text(body_value, key)
+                if response.status_code == 429:
+                    raise MistralRequestError(
+                        stage,
+                        selected_model,
+                        f"Mistral {stage} failed using model {selected_model} after "
+                        f"{attempts} rate-limited attempts (HTTP 429). Automatic "
+                        "backoff was exhausted. Service response: "
+                        f"{detail or 'No additional details.'}",
+                        status_code=429,
+                        retryable=True,
+                    )
+                raise MistralRequestError(
+                    stage,
+                    selected_model,
+                    f"Mistral {stage} failed using model {selected_model} "
+                    f"(HTTP {response.status_code}). Service response: "
+                    f"{detail or 'No additional details.'}",
+                    status_code=response.status_code,
+                    retryable=response.status_code in retryable_statuses,
+                )
             body = response.json()
             return _parse_json_object(body["choices"][0]["message"]["content"])
+        except MistralRequestError:
+            raise
         except (
             requests.RequestException,
             KeyError,
@@ -2167,10 +2342,16 @@ def _mistral_json_request(
             ValueError,
         ) as exc:
             last_error = exc
-            if attempt < max_retries - 1:
-                time.sleep(1 + attempt)
+            if attempt < attempts:
+                time.sleep(_mistral_retry_delay(None, attempt))
 
-    raise RuntimeError(f"Mistral structured extraction failed: {last_error}")
+    raise MistralRequestError(
+        stage,
+        selected_model,
+        f"Mistral {stage} returned no usable JSON using model {selected_model} "
+        f"after {attempts} attempts: {_safe_api_error_text(last_error, key)}",
+        retryable=True,
+    )
 
 
 DOCUMENT_PROFILE_SYSTEM_PROMPT = """
@@ -2507,6 +2688,7 @@ def analyze_document_profile_with_ai(
         ],
         timeout_seconds=300,
         max_retries=3,
+        stage="document analysis",
     )
     profile = _normalize_document_profile(
         result,
@@ -2914,6 +3096,7 @@ def extract_spare_parts_with_ai(
                         ),
                     },
                 ],
+                stage=f"row extraction for PDF pages {batch[0][0]}-{batch[-1][0]}",
             )
             batch_rows = result.get("spare_parts", [])
             if not isinstance(batch_rows, list):
@@ -2998,6 +3181,10 @@ def extract_spare_parts_with_ai(
                                 ),
                             },
                         ],
+                        stage=(
+                            f"row coverage recovery for PDF pages "
+                            f"{batch[0][0]}-{batch[-1][0]}"
+                        ),
                     )
                     retry_rows = retry.get("spare_parts", [])
                     if isinstance(retry_rows, list):
@@ -3065,6 +3252,10 @@ def extract_spare_parts_with_ai(
                                 ),
                             },
                         ],
+                        stage=(
+                            f"high-accuracy row recovery for PDF pages "
+                            f"{batch[0][0]}-{batch[-1][0]}"
+                        ),
                     )
                     large_rows = large_retry.get("spare_parts", [])
                     if isinstance(large_rows, list):
@@ -3302,6 +3493,7 @@ def enforce_english_only_with_ai(
                 ],
                 timeout_seconds=300,
                 max_retries=3,
+                stage="English description normalization",
             )
             result_items = result.get("items", [])
             if not isinstance(result_items, list):
