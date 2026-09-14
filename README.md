@@ -1,3 +1,15 @@
+# Release 4.19.7 — processing recovery and diagnostics
+
+Deploy the complete package together, including app.py, tools.py, run_monitor.py and requirements.txt; reboot after dependencies install.
+
+- Saves OCR evidence immediately after OCR and candidates immediately after AI extraction, before reconciliation. The active document retains a separate recovery checkpoint without marking unvalidated candidates ready or replacing existing reviewed rows.
+- Download intermediate recovery JSON while processing (without rerunning the app), or from the saved recovery panel after a rerun. Downloaded files survive server/session loss; in-memory checkpoints do not. Recovery JSON is diagnostic evidence, not an importable resume file or approved export.
+- Names and times source checks and drawing reconciliation individually; writes start/end messages to server logs and page progress during PDF safety checks.
+- Adds fonttools for embedded font decoding; improves elapsed-clock contrast.
+- Preserves existing approval override, pagination and filename autofill.
+
+Validation: nine targeted unit tests and Python syntax checks. No live paid API run. The earlier disappearance has not been reproduced or attributed to a confirmed cause; this update improves recovery and observability, and does not promise a speed improvement or automatic restart recovery.
+
 # Spare Parts OCR Import Builder — processing monitor 4.19.6
 
 ### 4.19.6 processing monitor
