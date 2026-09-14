@@ -9,7 +9,7 @@ import re
 import tempfile
 import threading
 import time
-from run_monitor import monitored_sleep
+from run_monitor import monitored_sleep, report_progress
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from difflib import SequenceMatcher
@@ -23,7 +23,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.19.6"
+TOOLS_VERSION = "4.19.7"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -6745,6 +6745,7 @@ def extract_explicit_spares_from_pdf(
     for index in indexes:
         if not 0 <= int(index) < len(reader.pages):
             continue
+        report_progress(f"PDF explicit-spare check: page {int(index) + 1}/{len(reader.pages)}")
         page = reader.pages[int(index)]
         try:
             text = page.extract_text() or page.extract_text(extraction_mode="layout") or ""
@@ -6949,6 +6950,7 @@ def extract_reference_parts_from_pdf(pdf_bytes: bytes) -> tuple[list[dict[str, A
 
     text_pages: list[tuple[int, str]] = []
     for index, page in enumerate(reader.pages):
+        report_progress(f"PDF reference check: page {index + 1}/{len(reader.pages)}")
         try:
             text = page.extract_text(extraction_mode="layout") or page.extract_text() or ""
         except Exception:
