@@ -1,4 +1,20 @@
-# Spare Parts OCR Import Builder — instruction-book autofill 4.19.5
+# Spare Parts OCR Import Builder — processing monitor 4.19.6
+
+### 4.19.6 processing monitor
+
+- Step 2 displays a live elapsed timer, current stage and available batch progress.
+- Records local/native OCR, Mistral OCR, drawing recovery, document analysis,
+  optional OpenAI verification, extraction, English normalization and other work.
+- Separately records Mistral retry count, actual retry waiting and request pacing.
+  Stage durations include these waits; do not add them to total elapsed time.
+- Keeps the last 20 run summaries per document in the existing session job state,
+  including failed runs, mode and selected page range. Download the JSON history
+  for retention across server restarts. No credentials or document text are logged.
+- Optional verifier bypasses remain visible in AI model run status; a timed function
+  returning does not prove its optional API call succeeded. No ETA is inferred.
+- Deploy app.py, tools.py and the new run_monitor.py together. No dependency changes.
+- Tests cover timing, wait counters, exception propagation and context isolation;
+  a live Streamlit Cloud/API run has not been performed in this environment.
 
 ### 4.19.5 instruction-book filename repair
 
