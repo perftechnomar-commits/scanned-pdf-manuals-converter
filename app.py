@@ -152,7 +152,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.19.7"
+APP_VERSION = "4.19.8"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -3568,11 +3568,31 @@ if active_workflow_step == "2. OCR":
             except Exception as exc:
                 st.error(f"Could not read this PDF: {exc}")
 
+        recovery_upload = st.file_uploader("Resume from saved OCR (optional)", type=["json"], key="resume_ocr_file")
+        recovery_data = None
+        if recovery_upload is not None:
+            try:
+                recovery_data = json.loads(recovery_upload.getvalue())
+                pages = recovery_data.get("pages")
+                if not isinstance(pages, list) or not pages or any(
+                    not isinstance(p, list) or len(p) != 2 or not isinstance(p[0], int)
+                    or p[0] < 1 or not isinstance(p[1], str) for p in pages):
+                    raise ValueError("Invalid OCR page records")
+                if len({p[0] for p in pages}) != len(pages):
+                    raise ValueError("Duplicate page numbers")
+                if source_file is not None and recovery_data.get("source") != source_file.name:
+                    raise ValueError("Recovery filename does not match the active manual")
+                st.info(f"Ready to reuse {len(pages)} saved OCR pages. OCR and drawing-image rescue will be skipped; subsequent AI calls may still incur charges.")
+            except (ValueError, TypeError, AttributeError) as exc:
+                st.error(f"Cannot load recovery: {exc}")
+                recovery_data = None
+        skip_native_checks = st.checkbox("Use OCR evidence only (skip additional PDF text-layer checks)",
+            value=False, help="Useful for troubleshooting slow PDF parsing. May reduce recovery of details missed by OCR. Review results carefully.")
         process_button = st.button(
             "Run OCR and extract spare-parts rows",
             type="primary",
             use_container_width=True,
-            disabled=(not main_machinery_is_ready() or VERSION_MISMATCH),
+            disabled=(not main_machinery_is_ready() or VERSION_MISMATCH or (recovery_upload is not None and recovery_data is None)),
             help=(
                 "Replace app.py and tools.py with matching builds and reboot first."
                 if VERSION_MISMATCH
@@ -3657,78 +3677,83 @@ if active_workflow_step == "2. OCR":
                     local_ocr_messages: list[str] = []
                     local_confirmed_pages: list[int] = []
                     pre_native_context_pages: list[tuple[int, str]] = []
-                    if input_type == "PDF":
-                        pdf_bytes = source_file.getvalue()
-                        total_pages = pdf_page_count(pdf_bytes)
-                        selected_pages = parse_page_spec(page_spec, total_pages)
-                        progress_bar.progress(
-                            0.0, text="Reading native PDF layout and drawing titles..."
-                        )
-                        pre_native_context_pages = monitor.call('Native PDF layout', _extract_native_pdf_context_pages, 
-                            pdf_bytes,
-                            page_indexes=selected_pages,
-                        )
-                        pre_native_components = build_component_drawing_candidates(
-                            pre_native_context_pages,
-                            current_main_row(),
-                            source_document_name=source_file.name,
-                        )
-                        local_candidate_pages = _drawing_pages_with_continuations(
-                            pre_native_components,
-                            selected_pages,
-                        )
-                        local_pages: list[tuple[int, str]] = []
-                        if local_candidate_pages:
-                            progress_bar.progress(
-                                0.0,
-                                text=(
-                                    "Running cached local CPU OCR on "
-                                    f"{len(local_candidate_pages)} proven drawing page(s)..."
-                                ),
-                            )
-                            (
-                                local_pages,
-                                local_ocr_messages,
-                                local_confirmed_pages,
-                            ) = monitor.call('Local drawing OCR (cached when available)', _cached_local_engineering_drawing_pages, 
-                                pdf_bytes,
-                                tuple(pre_native_context_pages),
-                                tuple(local_candidate_pages),
-                            )
-
-                        confirmed_set = set(local_confirmed_pages)
-                        paid_page_indexes = [
-                            int(index)
-                            for index in selected_pages
-                            if int(index) + 1 not in confirmed_set
-                        ]
-                        paid_pages: list[tuple[int, str]] = []
-                        if paid_page_indexes:
-                            paid_pages = monitor.call('Mistral OCR', ocr_pdf_bytes, 
-                                api_key=api_key,
-                                pdf_bytes=pdf_bytes,
-                                page_indexes=paid_page_indexes,
-                                pages_per_request=int(ocr_pages_per_request),
-                                progress=show_progress,
-                            )
-                        extracted_pages = _merge_pdf_context_pages(
-                            paid_pages,
-                            local_pages,
-                        )
-                    elif input_type == "Document URL":
-                        progress_bar.progress(0.1, text="Sending document URL to OCR...")
-                        extracted_pages = monitor.call('Mistral OCR', ocr_document_url, api_key, document_url.strip())
-                    elif input_type == "Image":
-                        suffix = Path(source_file.name).suffix or ".png"
-                        progress_bar.progress(0.1, text="Sending image to OCR...")
-                        extracted_pages = monitor.call('Mistral OCR', ocr_image_bytes, 
-                            api_key,
-                            source_file.getvalue(),
-                            suffix,
-                        )
+                    if recovery_data is not None:
+                        extracted_pages = [(int(p), text) for p, text in recovery_data["pages"]]
+                        selected_pages = [p - 1 for p, _ in extracted_pages]
+                        pdf_bytes = source_file.getvalue() if source_file is not None else b""
                     else:
-                        progress_bar.progress(0.1, text="Sending image URL to OCR...")
-                        extracted_pages = monitor.call('Mistral OCR', ocr_image_url, api_key, image_url.strip())
+                        if input_type == "PDF":
+                            pdf_bytes = source_file.getvalue()
+                            total_pages = pdf_page_count(pdf_bytes)
+                            selected_pages = parse_page_spec(page_spec, total_pages)
+                            progress_bar.progress(
+                                0.0, text="Reading native PDF layout and drawing titles..."
+                            )
+                            pre_native_context_pages = monitor.call('Native PDF layout', _extract_native_pdf_context_pages, 
+                                pdf_bytes,
+                                page_indexes=selected_pages,
+                            )
+                            pre_native_components = build_component_drawing_candidates(
+                                pre_native_context_pages,
+                                current_main_row(),
+                                source_document_name=source_file.name,
+                            )
+                            local_candidate_pages = _drawing_pages_with_continuations(
+                                pre_native_components,
+                                selected_pages,
+                            )
+                            local_pages: list[tuple[int, str]] = []
+                            if local_candidate_pages:
+                                progress_bar.progress(
+                                    0.0,
+                                    text=(
+                                        "Running cached local CPU OCR on "
+                                        f"{len(local_candidate_pages)} proven drawing page(s)..."
+                                    ),
+                                )
+                                (
+                                    local_pages,
+                                    local_ocr_messages,
+                                    local_confirmed_pages,
+                                ) = monitor.call('Local drawing OCR (cached when available)', _cached_local_engineering_drawing_pages, 
+                                    pdf_bytes,
+                                    tuple(pre_native_context_pages),
+                                    tuple(local_candidate_pages),
+                                )
+
+                            confirmed_set = set(local_confirmed_pages)
+                            paid_page_indexes = [
+                                int(index)
+                                for index in selected_pages
+                                if int(index) + 1 not in confirmed_set
+                            ]
+                            paid_pages: list[tuple[int, str]] = []
+                            if paid_page_indexes:
+                                paid_pages = monitor.call('Mistral OCR', ocr_pdf_bytes, 
+                                    api_key=api_key,
+                                    pdf_bytes=pdf_bytes,
+                                    page_indexes=paid_page_indexes,
+                                    pages_per_request=int(ocr_pages_per_request),
+                                    progress=show_progress,
+                                )
+                            extracted_pages = _merge_pdf_context_pages(
+                                paid_pages,
+                                local_pages,
+                            )
+                        elif input_type == "Document URL":
+                            progress_bar.progress(0.1, text="Sending document URL to OCR...")
+                            extracted_pages = monitor.call('Mistral OCR', ocr_document_url, api_key, document_url.strip())
+                        elif input_type == "Image":
+                            suffix = Path(source_file.name).suffix or ".png"
+                            progress_bar.progress(0.1, text="Sending image to OCR...")
+                            extracted_pages = monitor.call('Mistral OCR', ocr_image_bytes, 
+                                api_key,
+                                source_file.getvalue(),
+                                suffix,
+                            )
+                        else:
+                            progress_bar.progress(0.1, text="Sending image URL to OCR...")
+                            extracted_pages = monitor.call('Mistral OCR', ocr_image_url, api_key, image_url.strip())
 
                     if not extracted_pages:
                         raise RuntimeError("OCR completed but returned no pages.")
@@ -3737,7 +3762,7 @@ if active_workflow_step == "2. OCR":
 
                     rotated_rescue_messages: list[str] = []
                     rotated_rescued_pages: list[int] = []
-                    if input_type == "PDF" and source_file is not None:
+                    if input_type == "PDF" and source_file is not None and not skip_native_checks and recovery_data is None:
                         # First identify likely table pages from the normal OCR. Engineering
                         # drawings can be embedded sideways inside portrait manual pages,
                         # causing the first pass to see only part of the drawing or the wrong
@@ -3818,6 +3843,8 @@ if active_workflow_step == "2. OCR":
                         ),
                     )
                     extraction_messages: list[str] = list(local_ocr_messages)
+                    if skip_native_checks:
+                        extraction_messages.append("PDF text-layer checks were skipped by user choice; results rely on OCR evidence and require review.")
                     extraction_messages.extend(rotated_rescue_messages)
                     profile_messages: list[str] = []
                     document_profile: dict = {}
@@ -3974,7 +4001,7 @@ if active_workflow_step == "2. OCR":
                     # parts-list sheets. Source rows are prepended so Mistral can
                     # still override a source-text typo when the drawing clearly
                     # proves a distinct callout (for example 03036-38).
-                    if input_type == "PDF" and source_file is not None:
+                    if input_type == "PDF" and source_file is not None and not skip_native_checks:
                         pdf_reference_rows, pdf_reference_messages = (
                             monitor.call('Extract reference parts from pdf', extract_reference_parts_from_pdf, source_file.getvalue())
                         )
@@ -3995,7 +4022,7 @@ if active_workflow_step == "2. OCR":
                         ai_rows = list(explicit_ocr_rows) + list(ai_rows)
                         extraction_messages.extend(explicit_ocr_messages)
 
-                    if input_type == "PDF" and source_file is not None:
+                    if input_type == "PDF" and source_file is not None and not skip_native_checks:
                         explicit_pdf_rows, explicit_pdf_messages = (
                             monitor.call('Extract explicit spares from pdf', extract_explicit_spares_from_pdf, 
                                 source_file.getvalue(),
@@ -4010,7 +4037,7 @@ if active_workflow_step == "2. OCR":
                         input_type, source_file, document_url, image_url
                     )
                     native_context_pages: list[tuple[int, str]] = []
-                    if input_type == "PDF" and source_file is not None:
+                    if input_type == "PDF" and source_file is not None and not skip_native_checks:
                         native_context_pages = monitor.call('Native PDF layout', _extract_native_pdf_context_pages, 
                             source_file.getvalue(),
                             page_indexes=selected_pages,
@@ -4106,7 +4133,7 @@ if active_workflow_step == "2. OCR":
                         default_unit=default_unit,
                     )
                     printed_section_names: dict[str, str] = {}
-                    if input_type == "PDF" and source_file is not None:
+                    if input_type == "PDF" and source_file is not None and not skip_native_checks:
                         new_review, printed_section_names, printed_override_count = (
                             _apply_printed_pdf_overrides(new_review, source_file.getvalue())
                         )
