@@ -1,4 +1,13 @@
-# Spare Parts OCR Import Builder — bulk approval and scrolling review 4.19.4
+# Spare Parts OCR Import Builder — instruction-book autofill 4.19.5
+
+### 4.19.5 instruction-book filename repair
+
+- Restores the active uploaded PDF filename whenever main INSTR.BOOK is blank,
+  including when a previous autofill marker already matches that filename.
+- Preserves nonblank user-entered instruction-book values and saves the repaired
+  value to the active document job. A deliberately blank field is auto-filled.
+- No OCR, parsing, approval, pagination or export rules changed.
+- Replace app.py and tools.py together; confirm Build/Parser 4.19.5.
 
 Replace both deployed `app.py` and `tools.py` with the accompanying revised files.
 Keep `vessels.csv`, the Excel template, Streamlit secrets, and requirements in the
