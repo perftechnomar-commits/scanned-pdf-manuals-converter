@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import copy
+import json
+import streamlit.components.v1 as components
+from run_monitor import RunMonitor
 import hashlib
 import hmac
 import io
@@ -149,7 +152,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.19.5"
+APP_VERSION = "4.19.6"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -743,6 +746,7 @@ def initialize_state() -> None:
         "extraction_log": [],
         "document_profile": {},
         "model_run_status": {},
+        "processing_history": [],
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "excluded_submachinery_keys": [],
@@ -812,6 +816,7 @@ JOB_STATE_FIELDS = [
     "extraction_log",
     "document_profile",
     "model_run_status",
+    "processing_history",
     "spare_review",
     "submachinery_review",
     "excluded_submachinery_keys",
@@ -871,6 +876,7 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "extraction_log": [],
         "document_profile": {},
         "model_run_status": {},
+        "processing_history": [],
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "excluded_submachinery_keys": [],
@@ -938,6 +944,8 @@ def load_document_job(job_id: str) -> None:
             # Do not leak review decisions from a different document into an older
             # job created before the exclusion ledger existed.
             st.session_state.excluded_submachinery_keys = []
+        elif field == "processing_history":
+            st.session_state.processing_history = []
         elif field == "force_approved_review_rows":
             # An older job cannot inherit another document's explicit decision to
             # bypass spare-row readiness warnings.
@@ -3607,10 +3615,24 @@ if active_workflow_step == "2. OCR":
             else:
                 progress_bar = st.progress(0.0, text="Starting OCR...")
 
+                timing_status = st.empty()
+                timer_slot = st.empty()
+                with timer_slot.container():
+                    components.html("""<div style="font:16px sans-serif">Elapsed: <b id="clock">0:00</b></div>
+                    <script>const start=Date.now(); setInterval(()=>{const s=Math.floor((Date.now()-start)/1000);
+                    document.getElementById('clock').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');},1000);</script>""", height=40)
+                monitor = RunMonitor(
+                    notify=timing_status.info,
+                    mode=st.session_state.processing_preset,
+                    page_range=str(page_spec),
+                    source=source_file.name if source_file is not None else input_type,
+                )
                 def show_progress(done: int, total: int, message: str) -> None:
                     fraction = 0.0 if total <= 0 else min(1.0, done / total)
                     progress_bar.progress(fraction, text=message)
+                    timing_status.info(f"{monitor.stage} — {message}")
 
+                run_status = "Interrupted"
                 try:
                     local_ocr_messages: list[str] = []
                     local_confirmed_pages: list[int] = []
@@ -3622,7 +3644,7 @@ if active_workflow_step == "2. OCR":
                         progress_bar.progress(
                             0.0, text="Reading native PDF layout and drawing titles..."
                         )
-                        pre_native_context_pages = _extract_native_pdf_context_pages(
+                        pre_native_context_pages = monitor.call('Native PDF layout', _extract_native_pdf_context_pages, 
                             pdf_bytes,
                             page_indexes=selected_pages,
                         )
@@ -3648,7 +3670,7 @@ if active_workflow_step == "2. OCR":
                                 local_pages,
                                 local_ocr_messages,
                                 local_confirmed_pages,
-                            ) = _cached_local_engineering_drawing_pages(
+                            ) = monitor.call('Local drawing OCR (cached when available)', _cached_local_engineering_drawing_pages, 
                                 pdf_bytes,
                                 tuple(pre_native_context_pages),
                                 tuple(local_candidate_pages),
@@ -3662,7 +3684,7 @@ if active_workflow_step == "2. OCR":
                         ]
                         paid_pages: list[tuple[int, str]] = []
                         if paid_page_indexes:
-                            paid_pages = ocr_pdf_bytes(
+                            paid_pages = monitor.call('Mistral OCR', ocr_pdf_bytes, 
                                 api_key=api_key,
                                 pdf_bytes=pdf_bytes,
                                 page_indexes=paid_page_indexes,
@@ -3675,18 +3697,18 @@ if active_workflow_step == "2. OCR":
                         )
                     elif input_type == "Document URL":
                         progress_bar.progress(0.1, text="Sending document URL to OCR...")
-                        extracted_pages = ocr_document_url(api_key, document_url.strip())
+                        extracted_pages = monitor.call('Mistral OCR', ocr_document_url, api_key, document_url.strip())
                     elif input_type == "Image":
                         suffix = Path(source_file.name).suffix or ".png"
                         progress_bar.progress(0.1, text="Sending image to OCR...")
-                        extracted_pages = ocr_image_bytes(
+                        extracted_pages = monitor.call('Mistral OCR', ocr_image_bytes, 
                             api_key,
                             source_file.getvalue(),
                             suffix,
                         )
                     else:
                         progress_bar.progress(0.1, text="Sending image URL to OCR...")
-                        extracted_pages = ocr_image_url(api_key, image_url.strip())
+                        extracted_pages = monitor.call('Mistral OCR', ocr_image_url, api_key, image_url.strip())
 
                     if not extracted_pages:
                         raise RuntimeError("OCR completed but returned no pages.")
@@ -3712,7 +3734,7 @@ if active_workflow_step == "2. OCR":
                         # drawing pages in orientation rescue instead of limiting the
                         # retry to pages that already looked like spare tables.
                         if not pre_native_context_pages:
-                            pre_native_context_pages = _extract_native_pdf_context_pages(
+                            pre_native_context_pages = monitor.call('Native PDF layout', _extract_native_pdf_context_pages, 
                                 pdf_bytes,
                                 page_indexes=selected_pages,
                             )
@@ -3734,7 +3756,7 @@ if active_workflow_step == "2. OCR":
                         # spatial evidence and must not incur a second paid OCR pass.
                         rescue_page_numbers.difference_update(local_confirmed_pages)
                         extracted_pages, rotated_rescue_messages, rotated_rescued_pages = (
-                            recover_rotated_engineering_drawing_pages(
+                            monitor.call('Drawing orientation / region recovery', recover_rotated_engineering_drawing_pages, 
                                 api_key=api_key,
                                 pdf_bytes=pdf_bytes,
                                 extracted_pages=extracted_pages,
@@ -3827,7 +3849,7 @@ if active_workflow_step == "2. OCR":
                         )
                         try:
                             document_profile, profile_messages = (
-                                analyze_document_profile_with_ai(
+                                monitor.call('Mistral document analysis', analyze_document_profile_with_ai, 
                                     api_key=api_key,
                                     model=analysis_model.strip() or "mistral-large-2512",
                                     extracted_pages=extracted_pages,
@@ -3869,7 +3891,7 @@ if active_workflow_step == "2. OCR":
                         # and malformed replies all return the existing Mistral
                         # profile and a log message instead of stopping this run.
                         document_profile, openai_messages = (
-                            verify_document_profile_with_openai(
+                            monitor.call('Optional OpenAI verification', verify_document_profile_with_openai, 
                                 api_key=openai_api_key,
                                 model=openai_model.strip() or "gpt-5.6-sol",
                                 extracted_pages=extracted_pages,
@@ -3909,7 +3931,7 @@ if active_workflow_step == "2. OCR":
                                 "The deployed extraction helper is an earlier version, so "
                                 "high-accuracy sparse-page recovery was skipped for this run."
                             )
-                        ai_rows, row_extraction_messages = extract_spare_parts_with_ai(
+                        ai_rows, row_extraction_messages = monitor.call('Row extraction', extract_spare_parts_with_ai, 
                             **extraction_kwargs,
                         )
                         extraction_messages.extend(row_extraction_messages)
@@ -3964,7 +3986,7 @@ if active_workflow_step == "2. OCR":
                     )
                     native_context_pages: list[tuple[int, str]] = []
                     if input_type == "PDF" and source_file is not None:
-                        native_context_pages = _extract_native_pdf_context_pages(
+                        native_context_pages = monitor.call('Native PDF layout', _extract_native_pdf_context_pages, 
                             source_file.getvalue(),
                             page_indexes=selected_pages,
                         )
@@ -4031,7 +4053,7 @@ if active_workflow_step == "2. OCR":
                             if adaptive_analysis and document_profile
                             else (extraction_model.strip() or "mistral-small-latest")
                         )
-                        rows, english_messages = enforce_english_only_with_ai(
+                        rows, english_messages = monitor.call('English normalization', enforce_english_only_with_ai, 
                             api_key=api_key,
                             model=language_model,
                             rows=rows,
@@ -4298,12 +4320,41 @@ if active_workflow_step == "2. OCR":
                             st.warning(message)
                         else:
                             st.info(message)
+                    run_status = "Completed"
                 except Exception as exc:
+                    run_status = "Failed"
                     progress_bar.empty()
                     safe_message = str(exc)
                     if api_key:
                         safe_message = safe_message.replace(api_key, "***REDACTED***")
                     st.error(f"Processing failed: {safe_message}")
+
+                finally:
+                    summary = monitor.finish(run_status)
+                    history = list(st.session_state.get("processing_history", []))
+                    history.append(summary)
+                    st.session_state.processing_history = history[-20:]
+                    timer_slot.empty()
+                    timing_status.info(
+                        f"{run_status} in {summary['elapsed_seconds']:.1f}s — "
+                        f"{summary['retries']} retries; "
+                        f"{sum(summary['waits'].values()):.1f}s waiting"
+                    )
+                    save_loaded_job_state()
+
+        history = st.session_state.get("processing_history", [])
+        if history:
+            with st.expander("Processing duration and run history", expanded=True):
+                selected_run = st.selectbox("Run", range(len(history)), index=len(history)-1,
+                    format_func=lambda i: f"{history[i]['started_at']} · {history[i]['mode']} · {history[i]['page_range']} · {history[i]['status']}")
+                measured_run = history[selected_run]
+                st.write(f"Total: {measured_run['elapsed_seconds']:.1f}s | Retries: {measured_run['retries']} | "
+                         f"Retry waiting: {measured_run['waits']['Retry wait']:.1f}s | "
+                         f"Request pacing: {measured_run['waits']['Request pacing']:.1f}s")
+                st.dataframe(pd.DataFrame(measured_run['stages']), hide_index=True, use_container_width=True)
+                st.caption("Stage times include waits. Returned means the function finished; optional AI may have been bypassed. Check AI model run status. The progress bar applies to the current stage, not overall completion.")
+                st.download_button("Download timing history", json.dumps(history, indent=2),
+                                   file_name="processing_timing.json", mime="application/json")
 
         if st.session_state.extracted_pages:
             saved_profile = st.session_state.get("document_profile", {})
