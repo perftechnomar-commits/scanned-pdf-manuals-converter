@@ -1,3 +1,15 @@
+# 4.19.8 — performance repair and recovery import
+
+Deploy all files together and reboot. Confirm Build/Parser 4.19.8.
+
+In Process, upload ocr_recovery.json under Resume from saved OCR after selecting the matching original PDF. This skips OCR and orientation rescue. Later AI calls still run and can incur charges. All checkpoint pages are used, regardless of the page-range field. Candidate rows in a checkpoint are not reused. Verify the PDF revision yourself: version-1 recovery files have no content hash.
+
+Optional OCR-evidence-only mode skips additional native PDF checks; OFF by default. It can reduce detail recovery, so review output carefully.
+
+Fix: cache repeated section-header normalization; use literal matching instead of repeatedly compiling regexes. Matching preserves ASCII boundary rules.
+
+Validation: 2,005 equivalence cases and syntax checks passed. Local prepare_benefit_rows on 306 saved OCR pages with no AI rows returned 1,086 candidate rows in 4.8 seconds. No live API or deployed end-to-end test. This addresses an observed reconciliation bottleneck, but the session reset cause remains unconfirmed.
+
 # Release 4.19.7 — processing recovery and diagnostics
 
 Deploy the complete package together, including app.py, tools.py, run_monitor.py and requirements.txt; reboot after dependencies install.
