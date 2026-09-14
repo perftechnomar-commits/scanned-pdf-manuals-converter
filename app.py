@@ -149,7 +149,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.19.4"
+APP_VERSION = "4.19.5"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -2342,11 +2342,11 @@ if st.session_state.document_jobs:
 if (
     input_type == "PDF"
     and source_file is not None
-    and not st.session_state.main_instruction_book
-    and st.session_state.auto_instruction_book_source != source_file.name
+    and not str(st.session_state.main_instruction_book or "").strip()
 ):
     st.session_state.main_instruction_book = source_file.name
     st.session_state.auto_instruction_book_source = source_file.name
+    save_loaded_job_state()
 
 
 def selected_vessel_names() -> list[str]:
