@@ -23,7 +23,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.19.7"
+TOOLS_VERSION = "4.19.8"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -7331,6 +7331,9 @@ def build_section_catalog(
             ]
         )
 
+    from functools import lru_cache
+
+    @lru_cache(maxsize=8192)
     def normalized_code_text(value: Any) -> str:
         text_value = clean_text(value).upper()
         return re.sub(r"\s*([./_-])\s*", r"\1", text_value)
@@ -7340,12 +7343,20 @@ def build_section_catalog(
         source_text = normalized_code_text(header_text)
         if not alias_text or not source_text:
             return False
-        return bool(
-            re.search(
-                rf"(?<![A-Z0-9]){re.escape(alias_text)}(?![A-Z0-9])",
-                source_text,
-            )
-        )
+        # Literal search preserves the old ASCII boundary rule without compiling
+        # thousands of distinct regexes or repeatedly normalizing page headers.
+        start = 0
+        while True:
+            position = source_text.find(alias_text, start)
+            if position < 0:
+                return False
+            end = position + len(alias_text)
+            def word(c):
+                return "A" <= c <= "Z" or "0" <= c <= "9"
+            if (position == 0 or not word(source_text[position - 1])) and (end == len(source_text) or not word(source_text[end])):
+                return True
+            start = position + 1
+
 
     parts_pages = {
         int(page)
