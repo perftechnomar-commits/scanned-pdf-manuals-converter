@@ -2,6 +2,12 @@
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import time
+import logging
+
+LOGGER = logging.getLogger('processing_progress')
+LOGGER.setLevel(logging.INFO)
+if not LOGGER.handlers:
+    LOGGER.addHandler(logging.StreamHandler())
 
 ACTIVE = ContextVar('processing_monitor', default=None)
 
@@ -21,6 +27,7 @@ class RunMonitor:
     def call(self, stage, function, *args, **kwargs):
         previous = self.stage
         self.stage = stage
+        LOGGER.info('Processing stage started: %s', stage)
         self.notify(stage)
         start = time.monotonic()
         status = 'Returned'
@@ -30,12 +37,14 @@ class RunMonitor:
             status = 'Interrupted / failed'
             raise
         finally:
+            LOGGER.info('Processing stage ended: %s; %.2fs; %s', stage, time.monotonic()-start, status)
             self.rows.append({'Stage': stage, 'Seconds': round(time.monotonic()-start, 2), 'Status': status})
             self.stage = previous
             self.notify(previous)
 
     def finish(self, status):
         elapsed = time.monotonic()-self.started
+        LOGGER.info('Processing run ended: %s; %.2fs', status, elapsed)
         ACTIVE.reset(self.token)
         measured = sum(row['Seconds'] for row in self.rows)
         return dict(self.metadata, started_at=self.started_at, status=status,
@@ -43,6 +52,13 @@ class RunMonitor:
                     waits=self.waits.copy(), stages=self.rows + [{
                         'Stage': 'Other processing / reconciliation',
                         'Seconds': round(max(0, elapsed-measured), 2), 'Status': status}])
+
+
+def report_progress(message):
+    monitor = ACTIVE.get()
+    if monitor is not None:
+        monitor.notify(f'{monitor.stage} — {message}')
+    LOGGER.info('%s', message)
 
 
 def monitored_sleep(seconds, retry=False):
