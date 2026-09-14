@@ -9,6 +9,7 @@ import re
 import tempfile
 import threading
 import time
+from run_monitor import monitored_sleep
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 from difflib import SequenceMatcher
@@ -22,7 +23,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.generic import RectangleObject
 
 
-TOOLS_VERSION = "4.19.5"
+TOOLS_VERSION = "4.19.6"
 
 MACHINERY_SHEET = "1.Machineries|Sub|Units"
 SPARE_PARTS_SHEET = "2.Spare Parts"
@@ -357,7 +358,7 @@ def _wait_for_mistral_slot(endpoint_kind: str, model: str) -> None:
         _MISTRAL_NEXT_REQUEST_AT[bucket] = scheduled + interval
     delay = scheduled - now
     if delay > 0:
-        time.sleep(delay)
+        monitored_sleep(delay)
 
 
 def _mistral_retry_delay(response: requests.Response | None, attempt: int) -> float:
@@ -436,7 +437,7 @@ def _mistral_ocr_request(
             detail = _safe_api_error_text(body_value, key)
 
             if response.status_code in retryable_statuses and attempt < attempts:
-                time.sleep(_mistral_retry_delay(response, attempt))
+                monitored_sleep(_mistral_retry_delay(response, attempt), retry=True)
                 continue
 
             if response.status_code in {401, 403}:
@@ -480,12 +481,12 @@ def _mistral_ocr_request(
         except requests.Timeout as exc:
             last_error = exc
             if attempt < attempts:
-                time.sleep(_mistral_retry_delay(None, attempt))
+                monitored_sleep(_mistral_retry_delay(None, attempt), retry=True)
                 continue
         except requests.RequestException as exc:
             last_error = exc
             if attempt < attempts:
-                time.sleep(_mistral_retry_delay(None, attempt))
+                monitored_sleep(_mistral_retry_delay(None, attempt), retry=True)
                 continue
         except MistralRequestError:
             raise
@@ -2301,7 +2302,7 @@ def _mistral_json_request(
                 timeout=timeout_seconds,
             )
             if response.status_code in retryable_statuses and attempt < attempts:
-                time.sleep(_mistral_retry_delay(response, attempt))
+                monitored_sleep(_mistral_retry_delay(response, attempt), retry=True)
                 continue
             if not 200 <= response.status_code < 300:
                 try:
@@ -2343,7 +2344,7 @@ def _mistral_json_request(
         ) as exc:
             last_error = exc
             if attempt < attempts:
-                time.sleep(_mistral_retry_delay(None, attempt))
+                monitored_sleep(_mistral_retry_delay(None, attempt), retry=True)
 
     raise MistralRequestError(
         stage,
