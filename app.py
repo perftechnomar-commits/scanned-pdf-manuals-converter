@@ -152,7 +152,7 @@ except ImportError:
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_PATH = APP_DIR / "Spare parts template last version.xlsx"
-APP_VERSION = "4.19.6"
+APP_VERSION = "4.19.7"
 
 DEFAULT_VESSEL_PATH = APP_DIR / "vessels.csv"
 
@@ -747,6 +747,7 @@ def initialize_state() -> None:
         "document_profile": {},
         "model_run_status": {},
         "processing_history": [],
+        "recovery_checkpoint": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "excluded_submachinery_keys": [],
@@ -817,6 +818,7 @@ JOB_STATE_FIELDS = [
     "document_profile",
     "model_run_status",
     "processing_history",
+    "recovery_checkpoint",
     "spare_review",
     "submachinery_review",
     "excluded_submachinery_keys",
@@ -877,6 +879,7 @@ def _empty_job_state(file_name: str, pdf_path: str, file_hash: str, size_bytes: 
         "document_profile": {},
         "model_run_status": {},
         "processing_history": [],
+        "recovery_checkpoint": {},
         "spare_review": empty_review_dataframe(),
         "submachinery_review": empty_submachinery_review_dataframe(),
         "excluded_submachinery_keys": [],
@@ -944,6 +947,8 @@ def load_document_job(job_id: str) -> None:
             # Do not leak review decisions from a different document into an older
             # job created before the exclusion ledger existed.
             st.session_state.excluded_submachinery_keys = []
+        elif field == "recovery_checkpoint":
+            st.session_state.recovery_checkpoint = {}
         elif field == "processing_history":
             st.session_state.processing_history = []
         elif field == "force_approved_review_rows":
@@ -3618,7 +3623,7 @@ if active_workflow_step == "2. OCR":
                 timing_status = st.empty()
                 timer_slot = st.empty()
                 with timer_slot.container():
-                    components.html("""<div style="font:16px sans-serif">Elapsed: <b id="clock">0:00</b></div>
+                    components.html("""<div style="font:16px sans-serif;color:#888">Elapsed: <b id="clock">0:00</b></div>
                     <script>const start=Date.now(); setInterval(()=>{const s=Math.floor((Date.now()-start)/1000);
                     document.getElementById('clock').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');},1000);</script>""", height=40)
                 monitor = RunMonitor(
@@ -3632,6 +3637,21 @@ if active_workflow_step == "2. OCR":
                     progress_bar.progress(fraction, text=message)
                     timing_status.info(f"{monitor.stage} — {message}")
 
+                checkpoint_slot = st.empty()
+                def save_checkpoint(stage, pages, candidate_rows=None):
+                    checkpoint = {
+                        "version": 1, "stage": stage,
+                        "source": source_file.name if source_file is not None else input_type,
+                        "page_range": str(page_spec), "mode": st.session_state.processing_preset,
+                        "pages": list(pages), "candidate_rows": list(candidate_rows or []),
+                        "notice": "Intermediate evidence only; not approved for export.",
+                    }
+                    st.session_state.recovery_checkpoint = checkpoint
+                    save_loaded_job_state()
+                    with checkpoint_slot.container():
+                        st.download_button("Download intermediate recovery data", json.dumps(checkpoint),
+                            file_name="ocr_recovery.json", mime="application/json", on_click="ignore",
+                            key="live_recovery_download_" + stage)
                 run_status = "Interrupted"
                 try:
                     local_ocr_messages: list[str] = []
@@ -3712,6 +3732,8 @@ if active_workflow_step == "2. OCR":
 
                     if not extracted_pages:
                         raise RuntimeError("OCR completed but returned no pages.")
+
+                    save_checkpoint("OCR completed", extracted_pages)
 
                     rotated_rescue_messages: list[str] = []
                     rotated_rescued_pages: list[int] = []
@@ -3941,6 +3963,9 @@ if active_workflow_step == "2. OCR":
                     else:
                         ai_rows = []
 
+                    save_checkpoint("AI extraction completed", extracted_pages, ai_rows)
+                    progress_bar.progress(0.0, text="Reconciling source evidence — AI batches completed")
+
                     pdf_reference_rows: list[dict] = []
                     explicit_pdf_rows: list[dict] = []
 
@@ -3951,7 +3976,7 @@ if active_workflow_step == "2. OCR":
                     # proves a distinct callout (for example 03036-38).
                     if input_type == "PDF" and source_file is not None:
                         pdf_reference_rows, pdf_reference_messages = (
-                            extract_reference_parts_from_pdf(source_file.getvalue())
+                            monitor.call('Extract reference parts from pdf', extract_reference_parts_from_pdf, source_file.getvalue())
                         )
                         if pdf_reference_rows:
                             ai_rows = list(pdf_reference_rows) + list(ai_rows)
@@ -3964,7 +3989,7 @@ if active_workflow_step == "2. OCR":
                     # supports scanned PDFs/images; the PDF text-layer path improves
                     # precision when selectable source text is available.
                     explicit_ocr_rows, explicit_ocr_messages = (
-                        extract_explicit_spare_number_rows(extracted_pages)
+                        monitor.call('Extract explicit spare number rows', extract_explicit_spare_number_rows, extracted_pages)
                     )
                     if explicit_ocr_rows:
                         ai_rows = list(explicit_ocr_rows) + list(ai_rows)
@@ -3972,7 +3997,7 @@ if active_workflow_step == "2. OCR":
 
                     if input_type == "PDF" and source_file is not None:
                         explicit_pdf_rows, explicit_pdf_messages = (
-                            extract_explicit_spares_from_pdf(
+                            monitor.call('Extract explicit spares from pdf', extract_explicit_spares_from_pdf, 
                                 source_file.getvalue(),
                                 page_indexes=selected_pages,
                             )
@@ -4016,7 +4041,7 @@ if active_workflow_step == "2. OCR":
                         ocr_context_pages,
                         native_context_pages,
                     )
-                    rows, automation_messages = prepare_benefit_rows(
+                    rows, automation_messages = monitor.call('Prepare benefit rows', prepare_benefit_rows, 
                         ai_rows=ai_rows,
                         extracted_pages=catalog_context_pages,
                         source_document_name=source_document_name,
@@ -4063,7 +4088,7 @@ if active_workflow_step == "2. OCR":
 
                     if explicit_pdf_rows:
                         rows, replaced_explicit, restored_explicit = (
-                            apply_authoritative_explicit_spare_rows(
+                            monitor.call('Apply authoritative explicit spare rows', apply_authoritative_explicit_spare_rows, 
                                 rows,
                                 explicit_pdf_rows,
                             )
@@ -4103,12 +4128,12 @@ if active_workflow_step == "2. OCR":
                     # Reconcile fresh rows before merging saved review data. Never
                     # silently rewrite a user's previous edits or exclusions.
                     fresh_components = merge_component_candidates_with_native_priority(
-                        build_component_drawing_candidates(ocr_context_pages, current_main_row(),
+                        monitor.call('Build component drawing candidates', build_component_drawing_candidates, ocr_context_pages, current_main_row(),
                                                            source_document_name=source_document_name),
-                        build_component_drawing_candidates(native_context_pages, current_main_row(),
+                        monitor.call('Build component drawing candidates', build_component_drawing_candidates, native_context_pages, current_main_row(),
                                                            source_document_name=source_document_name),
                     )
-                    new_review, local_reconciliation_messages = reconcile_local_drawing_rows(
+                    new_review, local_reconciliation_messages = monitor.call('Reconcile local drawing rows', reconcile_local_drawing_rows, 
                         new_review, catalog_context_pages, fresh_components, default_unit)
                     extraction_messages.extend(local_reconciliation_messages)
 
@@ -4165,7 +4190,7 @@ if active_workflow_step == "2. OCR":
                         drawing_article_rows_added,
                         drawing_legend_rows_added,
                         drawing_detail_duplicates_skipped,
-                    ) = ensure_component_drawing_detail_spare_rows(
+                    ) = monitor.call('Ensure component drawing detail spare rows', ensure_component_drawing_detail_spare_rows, 
                         combined_review,
                         catalog_context_pages,
                         component_candidates,
@@ -4342,6 +4367,14 @@ if active_workflow_step == "2. OCR":
                     )
                     save_loaded_job_state()
 
+        recovery = st.session_state.get("recovery_checkpoint", {})
+        if recovery:
+            with st.expander("Intermediate recovery data", expanded=False):
+                st.caption(f"Saved stage: {recovery['stage']}. These candidates have not completed validation.")
+                st.download_button("Download saved OCR and candidates", json.dumps(recovery),
+                    file_name="ocr_recovery.json", mime="application/json", on_click="ignore",
+                    key="saved_recovery_download")
+                st.caption("Download to retain this evidence across a server restart. This file is diagnostic data, not an export workbook.")
         history = st.session_state.get("processing_history", [])
         if history:
             with st.expander("Processing duration and run history", expanded=True):
